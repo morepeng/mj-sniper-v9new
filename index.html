@@ -3720,7 +3720,7 @@ function drawCandleChartOn(canvasId, tipId, allBars, tech, patterns){
 
   // ─── HOVER TOOLTIP + 縮放 + 拖動 ──────────────────────────
   const tip = document.getElementById(tipId);
-  const isPriceCanvas2 = canvasId === 'priceCanvas2'; // 只有 K線頁才加縮放
+  // isPriceCanvas2 已在上方宣告
 
   function getBarAt(mx){
     return Math.round((mx - PAD.l) / cw - 0.5);
