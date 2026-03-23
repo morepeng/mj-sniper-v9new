@@ -329,12 +329,17 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   background: var(--bg2);
   border-top: 1px solid var(--border);
   z-index: 9999;
-  justify-content: space-around;
+  /* 橫向滾動，容納9個 tab */
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  white-space: nowrap;
+  scrollbar-width: none; /* Firefox */
   align-items: stretch;
 }
+.mob-tabbar::-webkit-scrollbar { display: none; } /* Chrome/Safari */
 .mob-tab {
-  flex: 1;
-  display: flex;
+  display: inline-flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
@@ -347,10 +352,19 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   cursor: pointer;
   border-top: 2px solid transparent;
   transition: all .15s;
-  padding: 6px 4px;
+  padding: 6px 10px;
+  min-width: 60px;
+  flex-shrink: 0;
+  white-space: nowrap;
+  height: 100%;
+  vertical-align: top;
 }
-.mob-tab.active { color: var(--cyan); border-top-color: var(--cyan); }
-.mob-tab-icon { font-size: 18px; line-height: 1; }
+.mob-tab.active {
+  color: var(--cyan);
+  border-top-color: var(--cyan);
+  background: rgba(0,212,255,.05);
+}
+.mob-tab-icon { font-size: 16px; line-height: 1; }
 
 @media (max-width: 768px) {
   *, *::before, *::after { box-sizing: border-box !important; }
@@ -389,7 +403,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   .nav { display: none !important; }
 
   /* 內容區留底部 tab bar 空間 */
-  .wrap { padding: 12px 10px 70px 10px !important; }
+  .wrap { padding: 12px 10px 72px 10px !important; }
 
   /* Cards */
   .g2 { grid-template-columns: 1fr !important; }
@@ -717,9 +731,19 @@ async function tryFetchJSON(url, ms=9000){
       const r = await fetchWithTimeout(mk(url), {}, Math.min(ms+3000, 15000));
       if(r.ok){
         const txt = await r.text();
-        let d; try{ d=JSON.parse(txt); }catch(_){ continue; }
-        if(d?.contents) try{ d=JSON.parse(d.contents); }catch(_){}
-        return d;
+        if(!txt || txt.length < 5) continue;
+        let d;
+        try{ d = JSON.parse(txt); }catch(_){ continue; }
+        // allorigins 包裝格式
+        if(d?.contents){
+          try{ d = JSON.parse(d.contents); }catch(_){ continue; }
+        }
+        // 確認是有效的 JSON 數據（非錯誤頁面）
+        if(d && (d.chart || d.quoteSummary || d.Symbol || d.metric || d['50DayMovingAverage'])){
+          return d;
+        }
+        // 台股等其他格式
+        if(d && typeof d === 'object' && Object.keys(d).length > 2) return d;
       }
     }catch(_){}
   }
@@ -811,10 +835,12 @@ async function _fetchAlphaVantage(ticker){
 const FUND_MODULES = 'financialData,defaultKeyStatistics,summaryDetail,price';
 function _yfChartURLs(t, range, interval, mods=true){
   const b = `range=${range}&interval=${interval}&includePrePost=false`;
+  // 注意：modules 參數在 HTTPS 環境有時被 Yahoo 拒絕，v10 quoteSummary 更可靠
   const m = mods ? `&modules=${FUND_MODULES}` : '';
   return [
     `https://query1.finance.yahoo.com/v8/finance/chart/${t}?${b}${m}`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${t}?${b}${m}`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${t}?${b}`,
+    `https://query1.finance.yahoo.com/v8/finance/chart/${t}?${b}`,
   ];
 }
 
@@ -991,6 +1017,54 @@ function _mergeFund(primary, secondary){
 
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
 async function fetchFundamentals(ticker, chartJson){
+  // ── 0. Yahoo Finance quoteSummary（最可靠的免費基本面 API，台股/美股均支援）
+  try{
+    const sym = encodeURIComponent(ticker);
+    const mods = 'financialData,defaultKeyStatistics,summaryDetail,price,assetProfile';
+    const qsURLs = [
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${sym}?modules=${mods}`,
+      `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${sym}?modules=${mods}`,
+    ];
+    for(const url of qsURLs){
+      const d = await tryFetchJSON(url, 8000);
+      const r = d?.quoteSummary?.result?.[0];
+      if(r){
+        const rv = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
+        const fd = r.financialData||{}, ks = r.defaultKeyStatistics||{};
+        const sd = r.summaryDetail||{}, pr = r.price||{};
+        const extracted = {
+          _src: 'yahoo_quoteSummary',
+          pe:        rv(ks.trailingPE)         ?? rv(sd.trailingPE) ?? null,
+          forwardPE: rv(ks.forwardPE)          ?? rv(pr.forwardPE)  ?? null,
+          pb:        rv(ks.priceToBook)        ?? null,
+          peg:       rv(ks.pegRatio)           ?? null,
+          evEbitda:  rv(ks.enterpriseToEbitda) ?? null,
+          eps:       rv(ks.trailingEps)        ?? null,
+          bv:        rv(ks.bookValue)          ?? null,
+          mktCap:    rv(pr.marketCap) ?? rv(sd.marketCap) ?? null,
+          roe:       rv(fd.returnOnEquity)     ?? null,
+          profitMgn: rv(fd.profitMargins)      ?? null,
+          grossMgn:  rv(fd.grossMargins)       ?? null,
+          opMgn:     rv(fd.operatingMargins)   ?? null,
+          revGr:     rv(fd.revenueGrowth)      ?? null,
+          debtEq:    rv(fd.debtToEquity)       ?? null,
+          currRatio: rv(fd.currentRatio)       ?? null,
+          divY:      rv(sd.dividendYield)      ?? rv(sd.trailingAnnualDividendYield) ?? null,
+          beta:      rv(sd.beta)               ?? rv(ks.beta) ?? null,
+          hi52:      rv(sd.fiftyTwoWeekHigh)   ?? null,
+          lo52:      rv(sd.fiftyTwoWeekLow)    ?? null,
+          shortRatio:rv(ks.shortRatio)         ?? null,
+        };
+        const hasData = Object.entries(extracted).some(([k,v])=>!k.startsWith('_')&&v!=null);
+        if(hasData){
+          console.log(`✅ [Fund] ${ticker}: Yahoo quoteSummary`);
+          extracted._count = Object.values(extracted).filter(v=>v!=null&&!String(v).startsWith('_')).length;
+          return extracted;
+        }
+      }
+    }
+  }catch(e){ console.warn('[Fund] quoteSummary 失敗:', e.message); }
+
   // ── 1. 本機代理 /funddata/<TICKER>（最可靠，Python 後端呼叫 Finnhub+AV+YF）
   try{
     const r = await fetchWithTimeout(`${LOCAL_PROXY}/funddata/${encodeURIComponent(ticker)}`,{},8000);
@@ -2558,7 +2632,7 @@ function renderFactors(d){
                     (d._fundSource||'').includes('finnhub') ? '🟢 Finnhub' :
                     (d._fundSource||'').includes('av')      ? '🔵 Alpha Vantage' : '🟡 YF Modules'
                   } · ${loadedCount}/${totalCount} 項已載入`
-                : `⚠️ 取數失敗 (0/${totalCount})`}
+                : `⚠️ 基本面載入中… 請稍後重新分析`}
             </span>
           </span>
           <button onclick="testFundAPIs('${d.ticker||''}')"
@@ -3581,28 +3655,40 @@ function wySig(l,active,type){
 }
 </script>
 
-<!-- ══ 手機底部 Tab 導航 ══ -->
+<!-- ══ 手機底部 Tab 導航（滑動式，支援全部9個面板）══ -->
 <nav class="mob-tabbar" id="mobTabbar">
-  <button class="mob-tab active" id="mtab-overview" onclick="mobSwitch('overview')">
+  <button class="mob-tab active" id="mtab-overview"  onclick="mobSwitch('overview')">
     <span class="mob-tab-icon">📊</span><span>總覽</span>
   </button>
-  <button class="mob-tab" id="mtab-kline" onclick="mobSwitch('kline')">
+  <button class="mob-tab" id="mtab-kline"   onclick="mobSwitch('kline')">
     <span class="mob-tab-icon">📈</span><span>K線</span>
   </button>
-  <button class="mob-tab" id="mtab-tech" onclick="mobSwitch('tech')">
+  <button class="mob-tab" id="mtab-tech"    onclick="mobSwitch('tech')">
     <span class="mob-tab-icon">⚙️</span><span>技術</span>
   </button>
   <button class="mob-tab" id="mtab-factors" onclick="mobSwitch('factors')">
     <span class="mob-tab-icon">🎯</span><span>因子</span>
   </button>
-  <button class="mob-tab" id="mtab-scan" onclick="mobSwitch('scan')">
+  <button class="mob-tab" id="mtab-dow"     onclick="mobSwitch('dow')">
+    <span class="mob-tab-icon">📚</span><span>道氏</span>
+  </button>
+  <button class="mob-tab" id="mtab-smc"     onclick="mobSwitch('smc')">
+    <span class="mob-tab-icon">🏦</span><span>SMC</span>
+  </button>
+  <button class="mob-tab" id="mtab-leading" onclick="mobSwitch('leading')">
+    <span class="mob-tab-icon">📡</span><span>先行</span>
+  </button>
+  <button class="mob-tab" id="mtab-risk"    onclick="mobSwitch('risk')">
+    <span class="mob-tab-icon">⚠️</span><span>風控</span>
+  </button>
+  <button class="mob-tab" id="mtab-scan"    onclick="mobSwitch('scan')">
     <span class="mob-tab-icon">🔍</span><span>掃描</span>
   </button>
 </nav>
 
 <script>
 /* ── 手機 Tab 切換 ── */
-const _MOB_TABS = ['overview','kline','tech','factors','scan'];
+const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan'];
 let _curMobTab = 'overview';
 
 function mobSwitch(tab){
@@ -3612,14 +3698,23 @@ function mobSwitch(tab){
     const btn = document.getElementById('mtab-'+t);
     if(btn) btn.classList.toggle('active', t===tab);
   });
+  // 滾動到 active tab（橫向滾動 tab bar）
+  const activeBtn = document.getElementById('mtab-'+tab);
+  if(activeBtn){
+    activeBtn.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
+  }
   // 觸發原有 panel 切換（同步 ntab）
-  const ntab = document.querySelector(`.ntab[data-tab="${tab}"]`);
-  if(ntab) ntab.click();
-  else {
+  const ntab = document.querySelector('.ntab[data-tab="'+tab+'"]');
+  if(ntab){
+    ntab.click();
+  } else {
     // fallback：直接切換 panel
     document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));
+    document.querySelectorAll('.ntab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
     if(typeof D !== 'undefined' && D) renderTab(tab,D);
   }
+  // 滾回頁面頂部
+  window.scrollTo({top:0, behavior:'smooth'});
 }
 
 // 攔截 showPanel 以同步手機 tab
