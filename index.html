@@ -1027,152 +1027,162 @@ function _mergeFund(primary, secondary){
 
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
 async function fetchFundamentals(ticker, chartJson){
-  const t   = encodeURIComponent(ticker);
-  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'').toUpperCase();
+  const t      = encodeURIComponent(ticker);
+  const sym    = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'').toUpperCase();
+  const isTW   = /\.(TW|TWO)$/i.test(ticker);
+  const isUS   = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
+  const isHK   = /\.HK$/i.test(ticker);
 
-  // ─────────────────────────────────────────────────────────
-  // 路徑 0：Yahoo Finance v7 + v10 並行（台股/美股通用）
-  // v7 quote → 52W/PE/EPS/Beta/市值
-  // v10 quoteSummary financialData → ROE/毛利率/負債比
-  // ─────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // 工具函數
+  // ═══════════════════════════════════════════════════════
+  const rv    = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
+  const num   = v => (v!=null&&v!=='None'&&v!=='-'&&!isNaN(+v))?+v:null;
+  function countFund(f){ return Object.entries(f).filter(([k,v])=>!k.startsWith('_')&&v!=null).length; }
+  function mergeFund(a, b){ // b 補充 a 的空值
+    if(!a) return b||{};
+    const m={...a};
+    for(const k in b){ if(m[k]==null && !k.startsWith('_')) m[k]=b[k]; }
+    return m;
+  }
+
+  let bestFund = null;
+
+  // ═══════════════════════════════════════════════════════
+  // 路徑 A：Yahoo v10 quoteSummary（全模組，台股/美股均支援）
+  //  - financialData       → ROE, 毛利率, 負債比, 流動比
+  //  - defaultKeyStatistics → PE, EPS, P/B, PEG
+  //  - summaryDetail       → 52W, Beta, 股息
+  //  - incomeStatementHistory → 淨利 → 計算 EPS
+  //  - balanceSheetHistory  → 資產/負債
+  // ═══════════════════════════════════════════════════════
   try{
-    const allFields = [
+    const mods = 'financialData,defaultKeyStatistics,summaryDetail,price,'+
+                 'incomeStatementHistory,balanceSheetHistory';
+    const urls = [
+      'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+'?modules='+mods,
+      'https://query2.finance.yahoo.com/v10/finance/quoteSummary/'+t+'?modules='+mods,
+    ];
+    for(const url of urls){
+      const d = await tryFetchJSON(url, 12000);
+      const r = d?.quoteSummary?.result?.[0];
+      if(!r) continue;
+
+      const fd  = r.financialData        || {};
+      const ks  = r.defaultKeyStatistics || {};
+      const sd  = r.summaryDetail        || {};
+      const pr  = r.price                || {};
+      const is_ = r.incomeStatementHistory?.incomeStatementHistory?.[0] || {};
+      const bs_ = r.balanceSheetHistory?.balanceSheetHistory?.[0]       || {};
+
+      // EPS 計算：netIncome / sharesOutstanding（台股用）
+      const netIncome   = rv(is_.netIncome);
+      const sharesOut   = rv(ks.sharesOutstanding);
+      const epsCalc     = (netIncome&&sharesOut&&sharesOut>0) ? netIncome/sharesOut : null;
+      const priceNow    = rv(pr.regularMarketPrice) || null;
+      const peCalc      = (epsCalc&&epsCalc>0&&priceNow) ? priceNow/epsCalc : null;
+
+      const f = {
+        _src: 'yahoo_v10_full',
+        pe:        rv(ks.trailingPE) ?? rv(sd.trailingPE) ?? peCalc ?? null,
+        forwardPE: rv(ks.forwardPE)  ?? null,
+        pb:        rv(ks.priceToBook) ?? null,
+        peg:       rv(ks.pegRatio)    ?? null,
+        evEbitda:  rv(ks.enterpriseToEbitda) ?? null,
+        eps:       rv(ks.trailingEps) ?? epsCalc ?? null,
+        bv:        rv(ks.bookValue)   ?? null,
+        mktCap:    rv(pr.marketCap)   ?? rv(sd.marketCap) ?? null,
+        roe:       rv(fd.returnOnEquity)    ?? null,
+        profitMgn: rv(fd.profitMargins)     ?? null,
+        grossMgn:  rv(fd.grossMargins)      ?? null,
+        opMgn:     rv(fd.operatingMargins)  ?? null,
+        revGr:     rv(fd.revenueGrowth)     ?? null,
+        epsGr:     rv(ks.earningsGrowth)    ?? null,
+        debtEq:    rv(fd.debtToEquity)      ?? null,
+        currRatio: rv(fd.currentRatio)      ?? null,
+        divY:      rv(sd.dividendYield) ?? rv(sd.trailingAnnualDividendYield) ?? null,
+        beta:      rv(sd.beta) ?? rv(ks.beta) ?? null,
+        hi52:      rv(sd.fiftyTwoWeekHigh)  ?? null,
+        lo52:      rv(sd.fiftyTwoWeekLow)   ?? null,
+        shortRatio:rv(ks.shortRatio)        ?? null,
+        // 額外計算 P/B（若直接值為 null）
+        pb_calc:   (priceNow&&rv(ks.bookValue)&&rv(ks.bookValue)>0)
+                     ? priceNow/rv(ks.bookValue) : null,
+      };
+      if(f.pb==null && f.pb_calc) f.pb = f.pb_calc;
+      f._count = countFund(f);
+      if(f._count >= 2){
+        console.log('✅ [Fund] Yahoo v10 full:', ticker,
+          '| PE:'+f.pe, 'EPS:'+f.eps, 'ROE:'+f.roe, '共'+f._count+'項');
+        bestFund = f;
+        break;
+      }
+    }
+  }catch(e){ console.warn('[Fund] v10 full 失敗:', e.message); }
+
+  // ═══════════════════════════════════════════════════════
+  // 路徑 B：Yahoo v7 quote（快，補充 v10 沒有的欄位）
+  // ═══════════════════════════════════════════════════════
+  try{
+    const fields = [
       'trailingPE','forwardPE','priceToBook','trailingEps','epsTrailingTwelveMonths',
       'bookValue','marketCap','returnOnEquity','profitMargins','grossMargins',
-      'operatingMargins','revenueGrowth','debtToEquity','currentRatio','dividendYield',
+      'operatingMargins','revenueGrowth','debtToEquity','currentRatio',
       'trailingAnnualDividendYield','beta','fiftyTwoWeekHigh','fiftyTwoWeekLow',
-      'pegRatio','enterpriseToEbitda','shortRatio','earningsGrowth',
-      'priceEpsCurrentYear','priceToSalesTrailingTwelveMonths'
+      'pegRatio','enterpriseToEbitda','shortRatio','earningsGrowth'
     ].join(',');
-
-    // 同時發出 v7 + v10 兩個請求
-    const [v7res, v10res] = await Promise.allSettled([
-      tryFetchJSON(
-        'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+'&fields='+allFields,
-        10000
-      ),
-      tryFetchJSON(
-        'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+
-        '?modules=financialData,defaultKeyStatistics,summaryDetail,price',
-        10000
-      ),
-    ]);
-
-    const q  = v7res.status==='fulfilled'  ? v7res.value?.quoteResponse?.result?.[0] : null;
-    const qs = v10res.status==='fulfilled' ? v10res.value?.quoteSummary?.result?.[0] : null;
-
-    // 如果 v7 有回傳（即使 PE 為空，只要有 result 就繼續）
+    const d7 = await tryFetchJSON(
+      'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+'&fields='+fields, 10000);
+    const q = d7?.quoteResponse?.result?.[0];
     if(q){
-      const rv = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
-      const fd = qs?.financialData        || {};
-      const ks = qs?.defaultKeyStatistics || {};
-      const sd = qs?.summaryDetail        || {};
-
-      const fund = {
-        _src: 'yahoo_v7+v10',
-        // 估值：v7 優先，v10 補充
-        pe:        q.trailingPE                                ?? rv(ks.trailingPE) ?? rv(sd.trailingPE) ?? null,
-        forwardPE: q.forwardPE                                 ?? rv(ks.forwardPE)  ?? null,
-        pb:        q.priceToBook                               ?? rv(ks.priceToBook)    ?? null,
-        peg:       q.pegRatio                                  ?? rv(ks.pegRatio)       ?? null,
-        evEbitda:  q.enterpriseToEbitda                        ?? rv(ks.enterpriseToEbitda) ?? null,
-        // 每股數據：epsTrailingTwelveMonths 是台股正確欄位名
-        eps:       q.epsTrailingTwelveMonths ?? q.trailingEps  ?? rv(ks.trailingEps) ?? null,
-        bv:        q.bookValue                                 ?? rv(ks.bookValue)   ?? null,
-        mktCap:    q.marketCap                                 ?? rv(sd.marketCap)   ?? null,
-        // 獲利能力：v10 financialData 有台股數據
-        roe:       rv(fd.returnOnEquity)   ?? q.returnOnEquity    ?? null,
-        profitMgn: rv(fd.profitMargins)    ?? q.profitMargins     ?? null,
-        grossMgn:  rv(fd.grossMargins)     ?? q.grossMargins      ?? null,
-        opMgn:     rv(fd.operatingMargins) ?? q.operatingMargins  ?? null,
-        revGr:     rv(fd.revenueGrowth)    ?? q.revenueGrowth     ?? null,
-        epsGr:     q.earningsGrowth        ?? null,
-        // 財務健康
-        debtEq:    rv(fd.debtToEquity)     ?? q.debtToEquity      ?? null,
-        currRatio: rv(fd.currentRatio)     ?? q.currentRatio      ?? null,
-        divY:      q.trailingAnnualDividendYield ?? q.dividendYield ?? rv(sd.dividendYield) ?? null,
-        beta:      q.beta                                      ?? rv(sd.beta)    ?? null,
-        // 價格區間
-        hi52:      q.fiftyTwoWeekHigh      ?? rv(sd.fiftyTwoWeekHigh) ?? null,
-        lo52:      q.fiftyTwoWeekLow       ?? rv(sd.fiftyTwoWeekLow)  ?? null,
-        shortRatio:q.shortRatio            ?? rv(ks.shortRatio)  ?? null,
+      const f7 = {
+        _src:'yahoo_v7',
+        pe:        q.trailingPE ?? null,
+        forwardPE: q.forwardPE  ?? null,
+        pb:        q.priceToBook ?? null,
+        peg:       q.pegRatio    ?? null,
+        evEbitda:  q.enterpriseToEbitda ?? null,
+        eps:       q.epsTrailingTwelveMonths ?? q.trailingEps ?? null,
+        bv:        q.bookValue   ?? null,
+        mktCap:    q.marketCap   ?? null,
+        roe:       q.returnOnEquity   ?? null,
+        profitMgn: q.profitMargins    ?? null,
+        grossMgn:  q.grossMargins     ?? null,
+        opMgn:     q.operatingMargins ?? null,
+        revGr:     q.revenueGrowth    ?? null,
+        epsGr:     q.earningsGrowth   ?? null,
+        debtEq:    q.debtToEquity     ?? null,
+        currRatio: q.currentRatio     ?? null,
+        divY:      q.trailingAnnualDividendYield ?? q.dividendYield ?? null,
+        beta:      q.beta             ?? null,
+        hi52:      q.fiftyTwoWeekHigh ?? null,
+        lo52:      q.fiftyTwoWeekLow  ?? null,
       };
-      fund._count = Object.values(fund).filter(v=>v!=null&&typeof v!=='string').length;
-      // 只要有任意欄位就返回（52W也算）
-      if(fund._count > 0){
-        console.log('✅ [Fund] Yahoo v7+v10:', ticker, fund._count+'個指標',
-                    '| PE:'+fund.pe, 'EPS:'+fund.eps, 'ROE:'+fund.roe);
-        return fund;
-      }
+      f7._count = countFund(f7);
+      bestFund = bestFund ? mergeFund(bestFund, f7) : (f7._count>=2 ? f7 : bestFund);
     }
-  }catch(e){ console.warn('[Fund] Yahoo v7+v10 失敗:', e.message); }
+  }catch(e){ console.warn('[Fund] v7 失敗:', e.message); }
 
-  // ─────────────────────────────────────────────────────────
-  // 路徑 1：Yahoo quoteSummary v10（模組化基本面，備援）
-  // ─────────────────────────────────────────────────────────
-  try{
-    const mods = 'financialData,defaultKeyStatistics,summaryDetail,price';
-    for(const base of ['query1','query2']){
-      const url = `https://${base}.finance.yahoo.com/v10/finance/quoteSummary/${t}?modules=${mods}`;
-      const d = await tryFetchJSON(url, 10000);
-      const r = d?.quoteSummary?.result?.[0];
-      if(r){
-        const rv = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
-        const fd=r.financialData||{}, ks=r.defaultKeyStatistics||{};
-        const sd=r.summaryDetail||{}, pr=r.price||{};
-        const fund = {
-          _src:'yahoo_quoteSummary',
-          pe:        rv(ks.trailingPE)         ?? rv(sd.trailingPE) ?? null,
-          forwardPE: rv(ks.forwardPE)          ?? rv(pr.forwardPE)  ?? null,
-          pb:        rv(ks.priceToBook)        ?? null,
-          peg:       rv(ks.pegRatio)           ?? null,
-          evEbitda:  rv(ks.enterpriseToEbitda) ?? null,
-          eps:       rv(ks.trailingEps)        ?? null,
-          bv:        rv(ks.bookValue)          ?? null,
-          mktCap:    rv(pr.marketCap) ?? rv(sd.marketCap) ?? null,
-          roe:       rv(fd.returnOnEquity)     ?? null,
-          profitMgn: rv(fd.profitMargins)      ?? null,
-          grossMgn:  rv(fd.grossMargins)       ?? null,
-          opMgn:     rv(fd.operatingMargins)   ?? null,
-          revGr:     rv(fd.revenueGrowth)      ?? null,
-          debtEq:    rv(fd.debtToEquity)       ?? null,
-          currRatio: rv(fd.currentRatio)       ?? null,
-          divY:      rv(sd.dividendYield)      ?? null,
-          beta:      rv(sd.beta)               ?? rv(ks.beta) ?? null,
-          hi52:      rv(sd.fiftyTwoWeekHigh)   ?? null,
-          lo52:      rv(sd.fiftyTwoWeekLow)    ?? null,
-        };
-        const hasData = Object.entries(fund).some(([k,v])=>!k.startsWith('_')&&v!=null);
-        if(hasData){
-          fund._count = Object.values(fund).filter(v=>v!=null&&typeof v!=='string').length;
-          console.log('✅ [Fund] Yahoo quoteSummary:', ticker);
-          return fund;
-        }
-      }
-    }
-  }catch(e){ console.warn('[Fund] quoteSummary 失敗:', e.message); }
-
-  // ─────────────────────────────────────────────────────────
-  // 路徑 2：Finnhub metrics（美股最詳細）
-  // ─────────────────────────────────────────────────────────
-  const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
-  if(isUS){
+  // ═══════════════════════════════════════════════════════
+  // 路徑 C：Finnhub（美股詳細基本面）
+  // ═══════════════════════════════════════════════════════
+  if(isUS && (!bestFund || bestFund._count < 5)){
     try{
-      const [metricsRes, profileRes] = await Promise.allSettled([
-        tryFetchJSON(`https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${FINNHUB_KEY}`, 8000),
-        tryFetchJSON(`https://finnhub.io/api/v1/stock/profile2?symbol=${sym}&token=${FINNHUB_KEY}`, 5000),
+      const [mR, pR] = await Promise.allSettled([
+        tryFetchJSON('https://finnhub.io/api/v1/stock/metric?symbol='+sym+'&metric=all&token='+FINNHUB_KEY, 8000),
+        tryFetchJSON('https://finnhub.io/api/v1/stock/profile2?symbol='+sym+'&token='+FINNHUB_KEY, 5000),
       ]);
-      const m = metricsRes.status==='fulfilled' ? metricsRes.value?.metric : null;
-      const p = profileRes.status==='fulfilled'  ? profileRes.value        : null;
+      const m = mR.status==='fulfilled' ? mR.value?.metric : null;
+      const p = pR.status==='fulfilled' ? pR.value        : null;
       if(m && Object.keys(m).length > 5){
-        const v2 = (a,b) => m[a]??m[b]??null;
         const pct = v => v!=null ? v/100 : null;
-        const fund = {
-          _src: 'finnhub',
+        const v2  = (a,b) => m[a]??m[b]??null;
+        const fh = {
+          _src:'finnhub',
           pe:        v2('peTTM','peBasicExclExtraTTM'),
-          forwardPE: m.forwardPE ?? null,
+          forwardPE: m.forwardPE??null,
           pb:        v2('pbAnnual','pbQuarterly'),
-          peg:       m.pegRatio ?? null,
+          peg:       m.pegRatio??null,
           evEbitda:  v2('evEbitdaAnnual','evEbitdaTTM'),
           eps:       v2('epsNormalizedAnnual','epsBasicExclExtraItemsAnnual'),
           bv:        v2('bookValuePerShareAnnual','bookValuePerShareQuarterly'),
@@ -1182,76 +1192,81 @@ async function fetchFundamentals(ticker, chartJson){
           grossMgn:  pct(v2('grossMarginAnnual','grossMarginTTM')),
           opMgn:     pct(v2('operatingMarginAnnual','operatingMarginTTM')),
           revGr:     pct(v2('revenueGrowthAnnual','revenueGrowthQuarterlyYoy')),
-          epsGr:     pct(v2('epsGrowthAnnual','epsGrowthTTMYoy')),
           debtEq:    v2('totalDebt/totalEquityAnnual','totalDebt/totalEquityQuarterly'),
           currRatio: v2('currentRatioAnnual','currentRatioQuarterly'),
           divY:      pct(m.dividendYieldIndicatedAnnual??null),
-          beta:      m.beta ?? null,
-          hi52:      m['52WeekHigh'] ?? null,
-          lo52:      m['52WeekLow']  ?? null,
+          beta:      m.beta??null, hi52:m['52WeekHigh']??null, lo52:m['52WeekLow']??null,
         };
-        const hasData = Object.entries(fund).some(([k,v])=>!k.startsWith('_')&&v!=null);
-        if(hasData){
-          fund._count = Object.values(fund).filter(v=>v!=null&&typeof v!=='string').length;
-          console.log('✅ [Fund] Finnhub:', ticker, fund._count + '項');
-          return fund;
+        fh._count = countFund(fh);
+        if(fh._count >= 3){
+          bestFund = bestFund ? mergeFund(bestFund, fh) : fh;
+          console.log('✅ [Fund] Finnhub merge:', ticker, fh._count+'項');
         }
       }
     }catch(e){ console.warn('[Fund] Finnhub 失敗:', e.message); }
+  }
 
-    // ─────────────────────────────────────────────────────────
-    // 路徑 3：Alpha Vantage OVERVIEW（美股備援）
-    // ─────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // 路徑 D：Alpha Vantage（美股備援）
+  // ═══════════════════════════════════════════════════════
+  if(isUS && (!bestFund || bestFund._count < 5)){
     try{
-      const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${sym}&apikey=${AV_KEY}`;
-      const d = await tryFetchJSON(url, 12000);
-      if(d && d['Symbol']){
-        const num = v => (v&&v!=='None'&&v!=='-') ? parseFloat(v) : null;
-        const fund = {
-          _src:      'alpha_vantage',
-          pe:        num(d['TrailingPE'])        ?? num(d['PERatio']),
-          forwardPE: num(d['ForwardPE']),
-          pb:        num(d['PriceToBookRatio']),
-          peg:       num(d['PEGRatio']),
-          evEbitda:  num(d['EVToEBITDA']),
-          eps:       num(d['EPS']),
-          bv:        num(d['BookValue']),
-          mktCap:    num(d['MarketCapitalization']),
-          roe:       num(d['ReturnOnEquityTTM']),
-          profitMgn: num(d['ProfitMargin']),
-          grossMgn:  num(d['GrossProfitTTM']) && num(d['RevenueTTM'])
-                       ? num(d['GrossProfitTTM'])/num(d['RevenueTTM']) : null,
-          opMgn:     num(d['OperatingMarginTTM']),
-          revGr:     num(d['QuarterlyRevenueGrowthYOY']),
-          epsGr:     num(d['QuarterlyEarningsGrowthYOY']),
-          debtEq:    null, currRatio: null,
-          divY:      num(d['DividendYield']),
-          beta:      num(d['Beta']),
+      const d = await tryFetchJSON(
+        'https://www.alphavantage.co/query?function=OVERVIEW&symbol='+sym+'&apikey='+AV_KEY, 12000);
+      if(d?.Symbol){
+        const fa = {
+          _src:'alpha_vantage',
+          pe:        num(d.TrailingPE)    ?? num(d.PERatio),
+          forwardPE: num(d.ForwardPE),
+          pb:        num(d.PriceToBookRatio),
+          peg:       num(d.PEGRatio),
+          evEbitda:  num(d.EVToEBITDA),
+          eps:       num(d.EPS),
+          bv:        num(d.BookValue),
+          mktCap:    num(d.MarketCapitalization),
+          roe:       num(d.ReturnOnEquityTTM),
+          profitMgn: num(d.ProfitMargin),
+          grossMgn:  num(d.GrossProfitTTM)&&num(d.RevenueTTM) ? num(d.GrossProfitTTM)/num(d.RevenueTTM) : null,
+          opMgn:     num(d.OperatingMarginTTM),
+          revGr:     num(d.QuarterlyRevenueGrowthYOY),
+          epsGr:     num(d.QuarterlyEarningsGrowthYOY),
+          divY:      num(d.DividendYield),
+          beta:      num(d.Beta),
           hi52:      num(d['52WeekHigh']),
           lo52:      num(d['52WeekLow']),
         };
-        const hasData = Object.entries(fund).some(([k,v])=>!k.startsWith('_')&&v!=null);
-        if(hasData){
-          fund._count = Object.values(fund).filter(v=>v!=null&&typeof v!=='string').length;
-          console.log('✅ [Fund] Alpha Vantage:', ticker, fund._count + '項');
-          return fund;
+        fa._count = countFund(fa);
+        if(fa._count >= 3){
+          bestFund = bestFund ? mergeFund(bestFund, fa) : fa;
+          console.log('✅ [Fund] Alpha Vantage merge:', ticker, fa._count+'項');
         }
       }
-    }catch(e){ console.warn('[Fund] Alpha Vantage 失敗:', e.message); }
+    }catch(e){ console.warn('[Fund] AV 失敗:', e.message); }
   }
 
-  // ─────────────────────────────────────────────────────────
-  // 路徑 4：從 chart JSON 的 modules 提取（最後保底）
-  // ─────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════
+  // 路徑 E：Yahoo chart modules（保底，從 chartJson 提取）
+  // ═══════════════════════════════════════════════════════
   try{
     const yfMod = _extractYFModules(chartJson);
-    const hasData = Object.entries(yfMod).some(([k,v])=>!k.startsWith('_')&&v!=null);
-    if(hasData){
-      yfMod._count = Object.values(yfMod).filter(v=>v!=null&&typeof v!=='string').length;
-      console.log('✅ [Fund] YF chart modules（保底）:', ticker);
-      return yfMod;
+    const mCount = countFund(yfMod);
+    if(mCount >= 2){
+      bestFund = bestFund ? mergeFund(bestFund, yfMod) : yfMod;
+      if(!bestFund || bestFund._count < 2)
+        console.log('✅ [Fund] YF modules 保底:', ticker, mCount+'項');
     }
   }catch(_){}
+
+  // ═══════════════════════════════════════════════════════
+  // 最終結果
+  // ═══════════════════════════════════════════════════════
+  if(bestFund && bestFund._count >= 1){
+    bestFund._count = countFund(bestFund);
+    console.log('📊 [Fund Final]', ticker, bestFund._count+'項',
+      '| PE:'+bestFund.pe, 'EPS:'+bestFund.eps, 'ROE:'+bestFund.roe,
+      '| src:'+bestFund._src);
+    return bestFund;
+  }
 
   console.warn('⚠️ [Fund]', ticker, '：所有來源均無數據');
   return { _src:'none', _count:0 };
@@ -3899,49 +3914,45 @@ function drawRadar(factors){
    API DIAGNOSTIC TOOL
 ═══════════════════════════════════════════════ */
 async function testFundAPIs(ticker){
-  if(!ticker) ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'AAPL';
-  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'');
-  const log = [];
-  log.push(`🔍 診斷 API 連線 — ${ticker} (${new Date().toLocaleTimeString()})`);
-  log.push(`🌐 頁面協議: ${location.protocol}  (需 http:// 才能直連)`);
+  if(!ticker) ticker = document.getElementById('tickerInput')?.value?.trim()?.toUpperCase() || '2330.TW';
+  const t = encodeURIComponent(ticker);
+  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ)$/i,'');
+  const log = ['🔍 API診斷 — '+ticker+' ('+new Date().toLocaleTimeString()+')',
+               '🌐 '+location.origin, ''];
 
-  // Test Finnhub
-  try{
-    const r = await fetchWithTimeout(
-      `https://finnhub.io/api/v1/stock/profile2?symbol=${sym}&token=${FINNHUB_KEY}`,{mode:'cors'},5000);
-    const d = await r.json();
-    log.push(`✅ Finnhub 直連: ${d.name||JSON.stringify(d).slice(0,60)}`);
-  }catch(e){ log.push(`❌ Finnhub 直連失敗: ${e.message.slice(0,60)}`); }
+  async function test(name, url){
+    try{
+      const d = await tryFetchJSON(url, 10000);
+      if(!d){ log.push('⚠️ '+name+': null'); return null; }
+      log.push('✅ '+name+': '+JSON.stringify(d).slice(0,120));
+      return d;
+    }catch(e){ log.push('❌ '+name+': '+e.message?.slice(0,60)); return null; }
+  }
 
-  // Test Finnhub via proxy
-  try{
-    const url = `https://finnhub.io/api/v1/stock/profile2?symbol=${sym}&token=${FINNHUB_KEY}`;
-    const r = await fetchWithTimeout(CORS_PROXIES[0](url),{},8000);
-    const d = await r.json();
-    const inner = d?.contents ? JSON.parse(d.contents) : d;
-    log.push(`✅ Finnhub+Proxy: ${inner.name||JSON.stringify(inner).slice(0,60)}`);
-  }catch(e){ log.push(`❌ Finnhub+Proxy 失敗: ${e.message.slice(0,60)}`); }
+  const d10 = await test('Yahoo v10 quoteSummary',
+    'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+
+    '?modules=financialData,defaultKeyStatistics,summaryDetail,incomeStatementHistory');
+  if(d10?.quoteSummary?.result?.[0]){
+    const r=d10.quoteSummary.result[0];
+    const pe=r.defaultKeyStatistics?.trailingPE;
+    const roe=r.financialData?.returnOnEquity;
+    const ni=r.incomeStatementHistory?.incomeStatementHistory?.[0]?.netIncome;
+    log.push('  PE='+JSON.stringify(pe)+' ROE='+JSON.stringify(roe)+' NetIncome='+JSON.stringify(ni));
+  }
 
-  // Test Alpha Vantage
-  try{
-    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${sym}&apikey=${AV_KEY}`;
-    const r = await fetchWithTimeout(url,{mode:'cors'},8000);
-    const d = await r.json();
-    if(d['Symbol']) log.push(`✅ Alpha Vantage 直連: PE=${d['TrailingPE']} ROE=${d['ReturnOnEquityTTM']}`);
-    else log.push(`⚠️ Alpha Vantage 直連回傳: ${JSON.stringify(d).slice(0,80)}`);
-  }catch(e){ log.push(`❌ Alpha Vantage 直連失敗: ${e.message.slice(0,60)}`); }
+  const d7 = await test('Yahoo v7 quote',
+    'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+
+    '&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh');
+  if(d7?.quoteResponse?.result?.[0]){
+    const q=d7.quoteResponse.result[0];
+    log.push('  PE='+q.trailingPE+' EPS='+q.epsTrailingTwelveMonths+' ROE='+q.returnOnEquity);
+  }
 
-  // Test Alpha Vantage via proxy
-  try{
-    const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${sym}&apikey=${AV_KEY}`;
-    const r = await fetchWithTimeout(CORS_PROXIES[0](url),{},10000);
-    const txt = await r.text();
-    const d = JSON.parse(txt?.startsWith('{')?txt:(JSON.parse(txt)?.contents||txt));
-    if(d['Symbol']) log.push(`✅ AV+Proxy: PE=${d['TrailingPE']} ROE=${d['ReturnOnEquityTTM']}`);
-    else log.push(`⚠️ AV+Proxy 回傳: ${JSON.stringify(d).slice(0,80)}`);
-  }catch(e){ log.push(`❌ AV+Proxy 失敗: ${e.message.slice(0,60)}`); }
+  await test('Finnhub metrics',
+    'https://finnhub.io/api/v1/stock/metric?symbol='+sym+'&metric=all&token='+FINNHUB_KEY);
+  await test('AV OVERVIEW',
+    'https://www.alphavantage.co/query?function=OVERVIEW&symbol='+sym+'&apikey='+AV_KEY);
 
-  // Show result in alert dialog
   alert(log.join('\n'));
   console.log('[MJ API Diagnostic]', log.join('\n'));
 }
