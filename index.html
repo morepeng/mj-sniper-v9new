@@ -672,14 +672,18 @@ setInterval(tick,1000); tick();
 /* ═══════════════════════════════════════════════
    TABS
 ═══════════════════════════════════════════════ */
+// ── 面板切換函數（全域可用，mobile tab 也呼叫）──
+function showPanel(id){
+  activeTab = id;
+  document.querySelectorAll('.ntab').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+id));
+  document.querySelectorAll('.mob-tab').forEach(b=>b.classList.toggle('active',b.id==='mtab-'+id));
+  if(D) renderTab(id, D);
+}
+
 document.querySelectorAll('.ntab').forEach(btn=>{
   btn.addEventListener('click',()=>{
-    activeTab = btn.dataset.tab;
-    document.querySelectorAll('.ntab').forEach(b=>b.classList.toggle('active',b===btn));
-    document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+activeTab));
-    if(D) renderTab(activeTab,D);
-    // 同步手機底部 Tab
-    document.querySelectorAll('.mob-tab').forEach(b=>b.classList.toggle('active',b.id==='mtab-'+activeTab));
+    showPanel(btn.dataset.tab);
   });
 });
 
@@ -3548,7 +3552,11 @@ function renderKLine(d){
   </div>`;
 
   // Draw the K-line chart (larger version)
-  setTimeout(()=>drawCandleChartOn('priceCanvas2','chartTip2', bars, d.technical, d.patterns||[]), 50);
+  setTimeout(()=>{
+    // 確保使用最新 kline 數據（15m/日/週線）
+    const klineBars = D?._klineData || bars;
+    drawCandleChartOn('priceCanvas2','chartTip2', klineBars, d.technical||{}, d.patterns||[]);
+  }, 50);
 }
 
 /* ═══════════════════════════════════════════════
@@ -3867,7 +3875,8 @@ function drawCandleChartOn(canvasId, tipId, allBars, tech, patterns){
   // ── 觸控支援（手機捏合縮放 + 滑動）──
   let _touchStartDist = 0, _touchStartCTF = CTF;
   let _touchStartX = 0, _touchStartOffset = 0;
-  canvas.addEventListener('touchstart', e => {
+  // 用 on-property（非 addEventListener）避免每次重繪時重複綁定
+  canvas.ontouchstart = e => {
     e.preventDefault();
     if(e.touches.length === 2){
       const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -3878,12 +3887,11 @@ function drawCandleChartOn(canvasId, tipId, allBars, tech, patterns){
       _touchStartX = e.touches[0].clientX;
       _touchStartOffset = _CV.offset;
     }
-  },{passive:false});
-  canvas.addEventListener('touchmove', e => {
+  };
+  canvas.ontouchmove = e => {
     e.preventDefault();
     if(!isPriceCanvas2) return;
     if(e.touches.length === 2){
-      // 捏合縮放
       const dx = e.touches[0].clientX - e.touches[1].clientX;
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const dist = Math.hypot(dx, dy);
@@ -3891,15 +3899,14 @@ function drawCandleChartOn(canvasId, tipId, allBars, tech, patterns){
       CTF = Math.max(10, Math.min(allBars.length, Math.round(_touchStartCTF / scale)));
       _redrawKLine();
     } else if(e.touches.length === 1){
-      // 單指拖動
       const dx = e.touches[0].clientX - _touchStartX;
       const barsPerPx = n / (W - PAD.l - PAD.r);
       _CV.offset = Math.round(_touchStartOffset - dx * barsPerPx);
       _CV.offset = Math.max(0, Math.min(allBars.length - CTF, _CV.offset));
       _redrawKLine();
     }
-  },{passive:false});
-  canvas.addEventListener('touchend', ()=>{ _CV.isDragging = false; });
+  };
+  canvas.ontouchend = () => { _CV.isDragging = false; };
   // 設定預設 cursor
   if(isPriceCanvas2) canvas.style.cursor = 'crosshair';
 }
@@ -3966,56 +3973,57 @@ async function testFundAPIs(ticker){
   if(!ticker) ticker = document.getElementById('tickerInput')?.value?.trim()?.toUpperCase() || '2330.TW';
   const t = encodeURIComponent(ticker);
   const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ)$/i,'');
+  // rv: 提取 Yahoo {raw:X, fmt:"X"} 物件的數值
+  const rv = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
   const log = ['🔍 API診斷 — '+ticker+' ('+new Date().toLocaleTimeString()+')',
                '🌐 '+location.origin, ''];
 
   async function test(name, url){
     try{
       const d = await tryFetchJSON(url, 10000);
-      if(!d){ log.push('⚠️ '+name+': null'); return null; }
-      log.push('✅ '+name+'：');
+      if(!d){ log.push('⚠️ '+name+': null/offline'); return null; }
+      if(d.error) { log.push('⚠️ '+name+': error='+d.error); return null; }
+      log.push('✅ '+name);
       return d;
     }catch(e){ log.push('❌ '+name+': '+e.message?.slice(0,50)); return null; }
   }
 
-  // Yahoo v10 quoteSummary（台/港/美）
-  const d10 = await test('Yahoo v10', 'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+'?modules=financialData,defaultKeyStatistics,summaryDetail,incomeStatementHistory,balanceSheetHistory');
+  // Yahoo v10 (台/港/美全支援)
+  const d10 = await test('Yahoo v10',
+    'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+
+    '?modules=financialData,defaultKeyStatistics,summaryDetail,incomeStatementHistory,balanceSheetHistory');
   if(d10?.quoteSummary?.result?.[0]){
-    const r=d10.quoteSummary.result[0];
-    const pe=r.defaultKeyStatistics?.trailingPE;
-    const roe=r.financialData?.returnOnEquity;
-    const ni=r.incomeStatementHistory?.incomeStatementHistory?.[0]?.netIncome;
-    const so=r.defaultKeyStatistics?.sharesOutstanding;
-    const gr=r.financialData?.grossMargins;
-    const bv=r.defaultKeyStatistics?.bookValue;
-    log.push('  PE='+JSON.stringify(pe)+' ROE='+JSON.stringify(roe));
-    log.push('  NetIncome='+JSON.stringify(ni)+' Shares='+JSON.stringify(so));
-    log.push('  GrossMargin='+JSON.stringify(gr)+' BookValue='+JSON.stringify(bv));
+    const r = d10.quoteSummary.result[0];
+    const ks = r.defaultKeyStatistics||{}, fd = r.financialData||{};
+    const sd = r.summaryDetail||{}, is0 = r.incomeStatementHistory?.incomeStatementHistory?.[0]||{};
+    const sharesOut = rv(ks.sharesOutstanding);
+    const netInc    = rv(is0.netIncome);
+    const price     = rv(r.price?.regularMarketPrice);
+    const epsCalc   = (netInc&&sharesOut) ? (netInc/sharesOut).toFixed(2) : null;
+    const peCalc    = epsCalc&&+epsCalc>0&&price ? (price/+epsCalc).toFixed(1) : null;
+    log.push('  PE直接值='+rv(ks.trailingPE)+' ROE='+rv(fd.returnOnEquity));
+    log.push('  NetIncome='+netInc+' Shares='+sharesOut);
+    log.push('  EPS計算='+epsCalc+' PE計算='+peCalc);
+    log.push('  GrossMgn='+rv(fd.grossMargins)+' 52H='+rv(sd.fiftyTwoWeekHigh));
   }
 
   // Yahoo v7 quote
-  const d7 = await test('Yahoo v7', 'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+'&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh,profitMargins,grossMargins,bookValue');
+  const d7 = await test('Yahoo v7',
+    'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+
+    '&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh,grossMargins,bookValue');
   if(d7?.quoteResponse?.result?.[0]){
-    const q=d7.quoteResponse.result[0];
-    log.push('  PE='+q.trailingPE+' EPS='+q.epsTrailingTwelveMonths);
-    log.push('  ROE='+q.returnOnEquity+' GrossMgn='+q.grossMargins+' BV='+q.bookValue);
+    const q = d7.quoteResponse.result[0];
+    log.push('  PE='+q.trailingPE+' EPS='+q.epsTrailingTwelveMonths+' ROE='+q.returnOnEquity);
+    log.push('  GrossMgn='+q.grossMargins+' BV='+q.bookValue+' 52H='+q.fiftyTwoWeekHigh);
   }
 
-  // Yahoo Search
-  const ds = await test('Yahoo Search', 'https://query1.finance.yahoo.com/v1/finance/search?q='+t+'&quotesCount=1&newsCount=0');
-  if(ds?.quotes?.[0]){
-    const q=ds.quotes[0];
-    log.push('  PE='+q.trailingPE+' EPS='+q.epsTrailingTwelveMonths+' MktCap='+q.marketCap);
-  }
-
-  // Finnhub（美股）
   if(!/\.(TW|TWO|HK|SS|SZ)/i.test(ticker)){
     await test('Finnhub', 'https://finnhub.io/api/v1/stock/metric?symbol='+sym+'&metric=all&token='+FINNHUB_KEY);
-    await test('AV OVERVIEW', 'https://www.alphavantage.co/query?function=OVERVIEW&symbol='+sym+'&apikey='+AV_KEY);
+    await test('AV', 'https://www.alphavantage.co/query?function=OVERVIEW&symbol='+sym+'&apikey='+AV_KEY);
   }
 
   alert(log.join('\n'));
-  console.log('[MJ API Diagnostic]', log.join('\n'));
+  console.log('[MJ Diag]', log.join('\n'));
 }
 
 function fp(v){ return (v==null?'—':(+v).toFixed(2)); }
@@ -4098,16 +4106,8 @@ function mobSwitch(tab){
   if(activeBtn){
     activeBtn.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
   }
-  // 觸發原有 panel 切換（同步 ntab）
-  const ntab = document.querySelector('.ntab[data-tab="'+tab+'"]');
-  if(ntab){
-    ntab.click();
-  } else {
-    // fallback：直接切換 panel
-    document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+tab));
-    document.querySelectorAll('.ntab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-    if(typeof D !== 'undefined' && D) renderTab(tab,D);
-  }
+  // 用全域 showPanel 切換（統一入口）
+  showPanel(tab);
   // 滾回頁面頂部
   window.scrollTo({top:0, behavior:'smooth'});
 }
