@@ -744,13 +744,19 @@ async function tryFetchJSON(url, ms=9000){
     return d;
   }
   const isYahoo = url.includes('yahoo.com');
-  const reqHdrs = isYahoo ? {
-    'Accept': 'application/json, */*',
-    'Accept-Language': 'en-US,en;q=0.9',
-  } : {};
-  // ① 直連
+  // cache:'no-store' 強制繞過 Service Worker 快取攔截
+  const fetchOpts = {
+    mode: 'cors',
+    credentials: 'omit',
+    cache: 'no-store',   // ← 關鍵：繞過 SW
+    headers: isYahoo ? {
+      'Accept': 'application/json, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+    } : {},
+  };
+  // ① 直連（含 no-store）
   try{
-    const r = await fetchWithTimeout(url, {mode:'cors', credentials:'omit', headers:reqHdrs}, ms);
+    const r = await fetchWithTimeout(url, fetchOpts, ms);
     if(r.ok){
       const d = unwrap(await r.text());
       if(d) return d;
@@ -759,7 +765,7 @@ async function tryFetchJSON(url, ms=9000){
   // ② 三個 CORS 代理並發（最快成功者回傳）
   const proxyResults = await Promise.allSettled(
     CORS_PROXIES.map(mk =>
-      fetchWithTimeout(mk(url), {}, Math.min(ms+5000, 20000))
+      fetchWithTimeout(mk(url), {cache:'no-store'}, Math.min(ms+5000, 20000))
         .then(r => r.ok ? r.text() : Promise.reject('HTTP '+r.status))
         .then(txt => { const d=unwrap(txt); if(!d) throw new Error('parse fail'); return d; })
     )
@@ -2274,9 +2280,11 @@ async function doAnalyze(){
     showError(err.message);
   } finally {
     btn.disabled=false; btn.textContent='分 析';
-    // 顯示診斷按鈕（方便除錯）
-    const diagBtn = document.getElementById('diagBtn');
-    if(diagBtn) diagBtn.style.display = 'inline-block';
+    // 顯示診斷/清除按鈕
+    ['diagBtn','swClearBtn'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(el) el.style.display = 'inline-block';
+    });
   }
 }
 
@@ -4015,6 +4023,22 @@ function drawRadar(factors){
 /* ═══════════════════════════════════════════════
    API DIAGNOSTIC TOOL
 ═══════════════════════════════════════════════ */
+
+// ── 清除 Service Worker 快取（解決估值 null/offline 問題）──
+async function clearSWCache(){
+  try{
+    if('serviceWorker' in navigator){
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for(const reg of regs) await reg.unregister();
+    }
+    const keys = await caches.keys();
+    await Promise.all(keys.map(k => caches.delete(k)));
+    alert('✅ SW 快取已清除！\n請重新整理頁面（長按重整）後再分析。');
+  }catch(e){
+    alert('❌ 清除失敗：'+e.message);
+  }
+}
+
 async function testFundAPIs(ticker){
   if(!ticker) ticker = document.getElementById('tickerInput')?.value?.trim()?.toUpperCase() || '2330.TW';
   const t = encodeURIComponent(ticker);
@@ -4168,8 +4192,17 @@ const _origShowPanel = typeof showPanel !== 'undefined' ? showPanel : null;
 if('serviceWorker' in navigator){
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('./sw.js')
-      .then(r => console.log('[SW] 已登記:', r.scope))
+      .then(reg => {
+        console.log('[SW] 已登記:', reg.scope);
+        // 強制更新 SW（避免舊版攔截 API 請求）
+        reg.update();
+        if(reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
+      })
       .catch(e => console.warn('[SW] 登記失敗:', e));
+    // 監聽新 SW 啟用
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      console.log('[SW] 新版 SW 已接管');
+    });
   });
 }
 
