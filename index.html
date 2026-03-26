@@ -1043,176 +1043,191 @@ function _mergeFund(primary, secondary){
 
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
 async function fetchFundamentals(ticker, chartJson){
-  const t      = encodeURIComponent(ticker);
-  const sym    = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'').toUpperCase();
+  const t   = encodeURIComponent(ticker);
+  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'').toUpperCase();
   const isUS   = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
   const isAsia = !isUS;
 
   const rv  = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
   const num = v => (v!=null&&v!=='None'&&v!=='-'&&!isNaN(+v))?+v:null;
-  function cntF(f){ return Object.entries(f).filter(([k,v])=>!k.startsWith('_')&&v!=null&&typeof v!=='object').length; }
+  function cntF(f){
+    return Object.entries(f).filter(([k,v])=>!k.startsWith('_')&&v!=null&&typeof v!=='object').length;
+  }
   function merge(a,b){
-    if(!a) return b||{};
-    const m={...a};
+    if(!a) return b||{}; const m={...a};
     for(const k in b){ if(m[k]==null&&!k.startsWith('_')&&typeof b[k]!=='object') m[k]=b[k]; }
     return m;
-  }
-  function mkFund(src, pe,fPE,pb,peg,evE,eps,bv,mktCap,roe,pMgn,gMgn,oMgn,rGr,eGr,dEq,cR,divY,beta,h52,l52,sR){
-    const f={_src:src,pe,forwardPE:fPE,pb,peg,evEbitda:evE,eps,bv,mktCap,roe,profitMgn:pMgn,grossMgn:gMgn,opMgn:oMgn,revGr:rGr,epsGr:eGr,debtEq:dEq,currRatio:cR,divY,beta,hi52:h52,lo52:l52,shortRatio:sR};
-    f._count=cntF(f); return f;
   }
 
   let best = null;
 
   // ═══════════════════════════════════════════════════════
-  // 路徑0：從已抓取的 chartJson 提取（台/港股最可靠！）
-  //   fetchYF 抓 K 線時已帶 modules，直接用現有數據
+  // 路徑0：從已有的 chartJson 提取（台/港股最可靠起點）
+  //   fetchYF 已帶 modules，直接讀 meta + modules
   // ═══════════════════════════════════════════════════════
   try{
-    if(chartJson?.chart?.result?.[0]){
-      const res = chartJson.chart.result[0];
-      const fd=res.financialData||{}, ks=res.defaultKeyStatistics||{};
-      const sd=res.summaryDetail||{}, pr=res.price||{}, mt=res.meta||{};
-      const priceNow = rv(pr.regularMarketPrice)||mt.regularMarketPrice||null;
-      const sharesOut= rv(ks.sharesOutstanding)||null;
+    const res = chartJson?.chart?.result?.[0];
+    if(res){
+      const meta= res.meta||{};
+      const fd  = res.financialData||{};
+      const ks  = res.defaultKeyStatistics||{};
+      const sd  = res.summaryDetail||{};
+      const pr  = res.price||{};
 
-      // EPS 計算
-      const epsYF  = rv(ks.trailingEps);
-      const epsCalc= null; // chartJson 通常無 incomeStatement
-      const eps    = epsYF ?? epsCalc ?? null;
-      const peCalc = (eps&&eps>0&&priceNow)?priceNow/eps:null;
+      const priceNow  = rv(pr.regularMarketPrice)||meta.regularMarketPrice||meta.chartPreviousClose||null;
+      const sharesOut = rv(ks.sharesOutstanding)||rv(pr.sharesOutstanding)||null;
+      const epsYF     = rv(ks.trailingEps);
+      const mktCap    = rv(pr.marketCap)||rv(sd.marketCap)||(priceNow&&sharesOut?priceNow*sharesOut:null);
 
-      const f0 = mkFund('chart_modules',
-        rv(ks.trailingPE)??rv(sd.trailingPE)??peCalc,
-        rv(ks.forwardPE), rv(ks.priceToBook), rv(ks.pegRatio), rv(ks.enterpriseToEbitda),
-        eps, rv(ks.bookValue),
-        rv(pr.marketCap)??rv(sd.marketCap)??(priceNow&&sharesOut?priceNow*sharesOut:null),
-        rv(fd.returnOnEquity), rv(fd.profitMargins), rv(fd.grossMargins), rv(fd.operatingMargins),
-        rv(fd.revenueGrowth), rv(ks.earningsGrowth), rv(fd.debtToEquity), rv(fd.currentRatio),
-        rv(sd.dividendYield)??rv(sd.trailingAnnualDividendYield),
-        rv(sd.beta)??rv(ks.beta), rv(sd.fiftyTwoWeekHigh), rv(sd.fiftyTwoWeekLow), rv(ks.shortRatio)
-      );
-      if(f0._count>=1){
+      // 計算 PE
+      const peYF   = rv(ks.trailingPE)||rv(sd.trailingPE);
+      const peCalc = (epsYF&&epsYF>0&&priceNow)?priceNow/epsYF:null;
+
+      // P/B
+      const pbYF   = rv(ks.priceToBook);
+      const bvYF   = rv(ks.bookValue);
+
+      // 52W — 先從 summaryDetail 找，再從 meta 找
+      const hi52 = rv(sd.fiftyTwoWeekHigh)||meta.fiftyTwoWeekHigh||null;
+      const lo52 = rv(sd.fiftyTwoWeekLow) ||meta.fiftyTwoWeekLow||null;
+
+      const f0 = {
+        _src:'chart_json',
+        pe:        peYF??peCalc,
+        forwardPE: rv(ks.forwardPE),
+        pb:        pbYF,
+        peg:       rv(ks.pegRatio),
+        evEbitda:  rv(ks.enterpriseToEbitda),
+        eps:       epsYF,
+        bv:        bvYF,
+        mktCap,
+        roe:       rv(fd.returnOnEquity),
+        profitMgn: rv(fd.profitMargins),
+        grossMgn:  rv(fd.grossMargins),
+        opMgn:     rv(fd.operatingMargins),
+        revGr:     rv(fd.revenueGrowth),
+        epsGr:     rv(ks.earningsGrowth),
+        debtEq:    rv(fd.debtToEquity),
+        currRatio: rv(fd.currentRatio),
+        divY:      rv(sd.dividendYield)||rv(sd.trailingAnnualDividendYield),
+        beta:      rv(sd.beta)||rv(ks.beta),
+        hi52, lo52,
+        shortRatio:rv(ks.shortRatio),
+      };
+      f0._count = cntF(f0);
+      if(f0._count >= 1){
         best = f0;
-        console.log(`✅ [Fund0] ${ticker}: chart_modules ${f0._count}項 | PE=${f0.pe} EPS=${f0.eps} 52H=${f0.hi52}`);
+        console.log(`✅ [Fund0] ${ticker}: chart_json ${f0._count}項 | PE=${f0.pe} EPS=${f0.eps} 52H=${f0.hi52}`);
       }
     }
-  }catch(e){ console.warn('[Fund0] chartJson 失敗:',e.message); }
+  }catch(e){ console.warn('[Fund0]',e.message); }
 
   // ═══════════════════════════════════════════════════════
-  // 路徑A：v8 chart + modules（專為台/港/亞股設計）
-  //   v8 chart API 對台股的 modules 支援度 > v10 quoteSummary
+  // 路徑A：Yahoo v7 quote — 不帶 fields（台股最穩定）
+  //   不帶 fields 讓 Yahoo 回傳預設欄位，避免被拒絕
   // ═══════════════════════════════════════════════════════
-  if(!best || best._count < 5){
+  if(!best || best.hi52==null || best._count < 5){
     try{
-      const mods = 'financialData,defaultKeyStatistics,summaryDetail,price';
-      const chartURLs = [
-        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}&includePrePost=false`,
-        `https://query2.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}&includePrePost=false`,
-        // 1y 範圍也試試（部分模組只在有歷史數據時才出現）
-        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${mods}`,
+      // 方法1：不帶 fields（台股穩定）
+      // 方法2：帶精簡 fields（美股更多數據）
+      const urls = isAsia ? [
+        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${t}`,
+        `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${t}`,
+      ] : [
+        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=trailingPE,forwardPE,priceToBook,trailingEps,bookValue,marketCap,returnOnEquity,profitMargins,grossMargins,operatingMargins,revenueGrowth,debtToEquity,currentRatio,trailingAnnualDividendYield,beta,fiftyTwoWeekHigh,fiftyTwoWeekLow,pegRatio,enterpriseToEbitda,earningsGrowth`,
+        `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=trailingPE,forwardPE,priceToBook,trailingEps,bookValue,marketCap,returnOnEquity,profitMargins,grossMargins,beta,fiftyTwoWeekHigh,fiftyTwoWeekLow`,
       ];
-      for(const url of chartURLs){
-        const d = await tryFetchJSON(url, 10000);
-        const res = d?.chart?.result?.[0];
-        if(!res) continue;
-
-        const fd=res.financialData||{}, ks=res.defaultKeyStatistics||{};
-        const sd=res.summaryDetail||{}, pr=res.price||{}, mt=res.meta||{};
-        const priceNow = rv(pr.regularMarketPrice)||mt.regularMarketPrice||null;
-        const sharesOut= rv(ks.sharesOutstanding)||null;
-        const epsYF    = rv(ks.trailingEps);
-        const peCalc   = (epsYF&&epsYF>0&&priceNow)?priceNow/epsYF:null;
-
-        const fa = mkFund('v8_chart_mods',
-          rv(ks.trailingPE)??rv(sd.trailingPE)??peCalc,
-          rv(ks.forwardPE), rv(ks.priceToBook), rv(ks.pegRatio), rv(ks.enterpriseToEbitda),
-          epsYF, rv(ks.bookValue),
-          rv(pr.marketCap)??rv(sd.marketCap)??(priceNow&&sharesOut?priceNow*sharesOut:null),
-          rv(fd.returnOnEquity), rv(fd.profitMargins), rv(fd.grossMargins), rv(fd.operatingMargins),
-          rv(fd.revenueGrowth), rv(ks.earningsGrowth), rv(fd.debtToEquity), rv(fd.currentRatio),
-          rv(sd.dividendYield)??rv(sd.trailingAnnualDividendYield),
-          rv(sd.beta)??rv(ks.beta), rv(sd.fiftyTwoWeekHigh), rv(sd.fiftyTwoWeekLow), rv(ks.shortRatio)
-        );
+      for(const url of urls){
+        const d = await tryFetchJSON(url, 8000);
+        const q = d?.quoteResponse?.result?.[0];
+        if(!q||Object.keys(q).length<3) continue;
+        const p = q.regularMarketPrice||null;
+        const e = q.epsTrailingTwelveMonths??q.trailingEps??null;
+        const peV = q.trailingPE??(e&&e>0&&p?p/e:null);
+        const fa = {
+          _src:'v7_quote',
+          pe:peV, forwardPE:q.forwardPE??null, pb:q.priceToBook??null,
+          peg:q.pegRatio??null, evEbitda:q.enterpriseToEbitda??null,
+          eps:e, bv:q.bookValue??null,
+          mktCap:q.marketCap??null,
+          roe:q.returnOnEquity??null, profitMgn:q.profitMargins??null,
+          grossMgn:q.grossMargins??null, opMgn:q.operatingMargins??null,
+          revGr:q.revenueGrowth??null, epsGr:q.earningsGrowth??null,
+          debtEq:q.debtToEquity??null, currRatio:q.currentRatio??null,
+          divY:q.trailingAnnualDividendYield??q.dividendYield??null,
+          beta:q.beta??null,
+          hi52:q.fiftyTwoWeekHigh??null, lo52:q.fiftyTwoWeekLow??null,
+          shortRatio:q.shortRatio??null,
+        };
+        fa._count = cntF(fa);
         if(fa._count>=1){
           best = best ? merge(best,fa) : fa;
-          console.log(`✅ [FundA] ${ticker}: v8_chart ${fa._count}項 | PE=${fa.pe} EPS=${fa.eps} 52H=${fa.hi52}`);
+          console.log(`✅ [FundA] ${ticker}: v7 ${fa._count}項 | PE=${fa.pe} 52H=${fa.hi52}`);
           break;
         }
       }
-    }catch(e){ console.warn('[FundA] v8_chart 失敗:',e.message); }
+    }catch(e){ console.warn('[FundA] v7:',e.message); }
   }
 
   // ═══════════════════════════════════════════════════════
-  // 路徑B：Yahoo v7 quote（快速補充）
+  // 路徑B：Yahoo v8 chart + modules（再試一次帶 1y 歷史）
   // ═══════════════════════════════════════════════════════
-  if(!best || best._count < 8){
+  if(!best || best._count < 5){
     try{
-      // 台股：用精簡欄位避免 Yahoo 拒絕，query1+query2 都試
-      const f1 = 'trailingPE,forwardPE,priceToBook,trailingEps,epsTrailingTwelveMonths,bookValue,marketCap';
-      const f2 = 'returnOnEquity,profitMargins,grossMargins,operatingMargins,revenueGrowth';
-      const f3 = 'debtToEquity,currentRatio,trailingAnnualDividendYield,beta,fiftyTwoWeekHigh,fiftyTwoWeekLow,pegRatio';
-      let q = null;
+      const mods='financialData,defaultKeyStatistics,summaryDetail,price';
       for(const base of ['query1','query2']){
-        for(const fields of [`${f1},${f2},${f3}`, f1, `${f1},${f3}`]){
-          const d7 = await tryFetchJSON(
-            `https://${base}.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=${fields}`, 8000);
-          const r = d7?.quoteResponse?.result?.[0];
-          if(r && Object.keys(r).length > 2){ q = r; break; }
-        }
-        if(q) break;
+        const url=`https://${base}.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${mods}`;
+        const d = await tryFetchJSON(url,10000);
+        const res = d?.chart?.result?.[0];
+        if(!res) continue;
+        const fd=res.financialData||{},ks=res.defaultKeyStatistics||{};
+        const sd=res.summaryDetail||{},pr=res.price||{},mt=res.meta||{};
+        const priceNow=rv(pr.regularMarketPrice)||mt.regularMarketPrice||null;
+        const epsYF=rv(ks.trailingEps);
+        const fb={
+          _src:'v8_chart',
+          pe:rv(ks.trailingPE)||rv(sd.trailingPE)||(epsYF&&priceNow?priceNow/epsYF:null),
+          forwardPE:rv(ks.forwardPE), pb:rv(ks.priceToBook), peg:rv(ks.pegRatio),
+          evEbitda:rv(ks.enterpriseToEbitda), eps:epsYF, bv:rv(ks.bookValue),
+          mktCap:rv(pr.marketCap)||rv(sd.marketCap)||(priceNow&&rv(ks.sharesOutstanding)?priceNow*rv(ks.sharesOutstanding):null),
+          roe:rv(fd.returnOnEquity), profitMgn:rv(fd.profitMargins),
+          grossMgn:rv(fd.grossMargins), opMgn:rv(fd.operatingMargins),
+          revGr:rv(fd.revenueGrowth), epsGr:rv(ks.earningsGrowth),
+          debtEq:rv(fd.debtToEquity), currRatio:rv(fd.currentRatio),
+          divY:rv(sd.dividendYield)||rv(sd.trailingAnnualDividendYield),
+          beta:rv(sd.beta)||rv(ks.beta),
+          hi52:rv(sd.fiftyTwoWeekHigh)||mt.fiftyTwoWeekHigh||null,
+          lo52:rv(sd.fiftyTwoWeekLow)||mt.fiftyTwoWeekLow||null,
+        };
+        fb._count=cntF(fb);
+        if(fb._count>=1){ best=best?merge(best,fb):fb; break; }
       }
-      if(q){
-        const p = q.regularMarketPrice||null;
-        const e = q.epsTrailingTwelveMonths ?? q.trailingEps ?? null;
-        const fb = mkFund('v7_quote',
-          q.trailingPE??(e&&e>0&&p?p/e:null), q.forwardPE, q.priceToBook, q.pegRatio, q.enterpriseToEbitda,
-          e, q.bookValue, q.marketCap,
-          q.returnOnEquity, q.profitMargins, q.grossMargins, q.operatingMargins,
-          q.revenueGrowth, q.earningsGrowth, q.debtToEquity, q.currentRatio,
-          q.trailingAnnualDividendYield??q.dividendYield,
-          q.beta, q.fiftyTwoWeekHigh, q.fiftyTwoWeekLow, q.shortRatio
-        );
-        if(fb._count>=1){
-          best = best ? merge(best,fb) : fb;
-          console.log(`✅ [FundB] ${ticker}: v7 ${fb._count}項 | PE=${fb.pe} 52H=${fb.hi52}`);
-        }
-      }
-    }catch(e){ console.warn('[FundB] v7 失敗:',e.message); }
+    }catch(e){ console.warn('[FundB] v8:',e.message); }
   }
 
   // ═══════════════════════════════════════════════════════
-  // 路徑C：v10 quoteSummary（美股 + 部分亞股）
+  // 路徑C：v10 quoteSummary (輕量，只要 price+summaryDetail)
   // ═══════════════════════════════════════════════════════
-  if(!best || best._count < 8){
+  if(!best || best.hi52==null){
     try{
-      // 分批：避免太多模組回傳 null
-      for(const mods of ['summaryDetail,price,defaultKeyStatistics','financialData,incomeStatementHistory']){
-        const d = await tryFetchJSON(
-          `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${t}?modules=${mods}`, 8000);
-        const r = d?.quoteSummary?.result?.[0];
+      for(const mods of ['price,summaryDetail','price','summaryDetail']){
+        const d=await tryFetchJSON(
+          `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${t}?modules=${mods}`,7000);
+        const r=d?.quoteSummary?.result?.[0];
         if(!r) continue;
-        const fd=r.financialData||{}, ks=r.defaultKeyStatistics||{};
         const sd=r.summaryDetail||{}, pr=r.price||{};
-        const is0=r.incomeStatementHistory?.incomeStatementHistory?.[0]||{};
-        const priceNow=rv(pr.regularMarketPrice)||null;
-        const sharesOut=rv(ks.sharesOutstanding)||null;
-        const netInc=rv(is0.netIncome), epsC=(netInc&&sharesOut)?netInc/sharesOut:null;
-        const epsYF=rv(ks.trailingEps); const eps=epsYF??epsC;
-        const fc = mkFund('v10_qs',
-          rv(ks.trailingPE)??rv(sd.trailingPE)??(eps&&eps>0&&priceNow?priceNow/eps:null),
-          rv(ks.forwardPE), rv(ks.priceToBook), rv(ks.pegRatio), rv(ks.enterpriseToEbitda),
-          eps, rv(ks.bookValue),
-          rv(pr.marketCap)??rv(sd.marketCap)??(priceNow&&sharesOut?priceNow*sharesOut:null),
-          rv(fd.returnOnEquity), rv(fd.profitMargins), rv(fd.grossMargins), rv(fd.operatingMargins),
-          rv(fd.revenueGrowth), rv(ks.earningsGrowth), rv(fd.debtToEquity), rv(fd.currentRatio),
-          rv(sd.dividendYield)??rv(sd.trailingAnnualDividendYield),
-          rv(sd.beta)??rv(ks.beta), rv(sd.fiftyTwoWeekHigh), rv(sd.fiftyTwoWeekLow), rv(ks.shortRatio)
-        );
-        if(fc._count>=1){ best = best ? merge(best,fc) : fc; }
+        const fc={
+          _src:'v10_price',
+          pe:rv(sd.trailingPE)||rv(pr.trailingPE)||null,
+          mktCap:rv(pr.marketCap)||rv(sd.marketCap)||null,
+          divY:rv(sd.dividendYield)||rv(sd.trailingAnnualDividendYield)||null,
+          beta:rv(sd.beta)||null,
+          hi52:rv(sd.fiftyTwoWeekHigh)||null, lo52:rv(sd.fiftyTwoWeekLow)||null,
+        };
+        fc._count=cntF(fc);
+        if(fc._count>=1){ best=best?merge(best,fc):fc; break; }
       }
-      if(best?._src==='v10_qs') console.log(`✅ [FundC] ${ticker}: v10 ${best._count}項`);
-    }catch(e){ console.warn('[FundC] v10 失敗:',e.message); }
+    }catch(e){ console.warn('[FundC] v10:',e.message); }
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1228,23 +1243,28 @@ async function fetchFundamentals(ticker, chartJson){
       const p=pR.status==='fulfilled'?pR.value:null;
       if(m&&Object.keys(m).length>5){
         const pct=v=>v!=null?v/100:null, v2=(a,b)=>m[a]??m[b]??null;
-        const fd=mkFund('finnhub',
-          v2('peTTM','peBasicExclExtraTTM'),m.forwardPE??null,v2('pbAnnual','pbQuarterly'),m.pegRatio??null,
-          v2('evEbitdaAnnual','evEbitdaTTM'),v2('epsNormalizedAnnual','epsBasicExclExtraItemsAnnual'),
-          v2('bookValuePerShareAnnual','bookValuePerShareQuarterly'),
-          p?.marketCapitalization?p.marketCapitalization*1e6:null,
-          pct(v2('roeTTM','roeRfy')),pct(v2('netProfitMarginAnnual','netProfitMarginTTM')),
-          pct(v2('grossMarginAnnual','grossMarginTTM')),pct(v2('operatingMarginAnnual','operatingMarginTTM')),
-          pct(v2('revenueGrowthAnnual','revenueGrowthQuarterlyYoy')),
-          pct(v2('epsGrowthAnnual','epsGrowthTTMYoy')),
-          v2('totalDebt/totalEquityAnnual','totalDebt/totalEquityQuarterly'),
-          v2('currentRatioAnnual','currentRatioQuarterly'),
-          pct(m.dividendYieldIndicatedAnnual??null),
-          m.beta??null,m['52WeekHigh']??null,m['52WeekLow']??null,null
-        );
-        if(fd._count>=3){ best=best?merge(best,fd):fd; console.log(`✅ [FundD] Finnhub ${fd._count}項`); }
+        const fd={_src:'finnhub',
+          pe:v2('peTTM','peBasicExclExtraTTM'), forwardPE:m.forwardPE??null,
+          pb:v2('pbAnnual','pbQuarterly'), peg:m.pegRatio??null,
+          evEbitda:v2('evEbitdaAnnual','evEbitdaTTM'),
+          eps:v2('epsNormalizedAnnual','epsBasicExclExtraItemsAnnual'),
+          bv:v2('bookValuePerShareAnnual','bookValuePerShareQuarterly'),
+          mktCap:p?.marketCapitalization?p.marketCapitalization*1e6:null,
+          roe:pct(v2('roeTTM','roeRfy')), profitMgn:pct(v2('netProfitMarginAnnual','netProfitMarginTTM')),
+          grossMgn:pct(v2('grossMarginAnnual','grossMarginTTM')),
+          opMgn:pct(v2('operatingMarginAnnual','operatingMarginTTM')),
+          revGr:pct(v2('revenueGrowthAnnual','revenueGrowthQuarterlyYoy')),
+          epsGr:pct(v2('epsGrowthAnnual','epsGrowthTTMYoy')),
+          debtEq:v2('totalDebt/totalEquityAnnual','totalDebt/totalEquityQuarterly'),
+          currRatio:v2('currentRatioAnnual','currentRatioQuarterly'),
+          divY:pct(m.dividendYieldIndicatedAnnual??null),
+          beta:m.beta??null, hi52:m['52WeekHigh']??null, lo52:m['52WeekLow']??null,
+        };
+        fd._count=cntF(fd);
+        if(fd._count>=3){ best=best?merge(best,fd):fd;
+          console.log(`✅ [FundD] Finnhub ${fd._count}項`); }
       }
-    }catch(e){ console.warn('[FundD] Finnhub 失敗:',e.message); }
+    }catch(e){ console.warn('[FundD] Finnhub:',e.message); }
   }
 
   // ═══════════════════════════════════════════════════════
@@ -1255,27 +1275,33 @@ async function fetchFundamentals(ticker, chartJson){
       const d=await tryFetchJSON(
         `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${sym}&apikey=${AV_KEY}`,12000);
       if(d?.Symbol){
-        const fe=mkFund('alpha_vantage',
-          num(d.TrailingPE)??num(d.PERatio),num(d.ForwardPE),num(d.PriceToBookRatio),num(d.PEGRatio),
-          num(d.EVToEBITDA),num(d.EPS),num(d.BookValue),num(d.MarketCapitalization),
-          num(d.ReturnOnEquityTTM),num(d.ProfitMargin),
-          num(d.GrossProfitTTM)&&num(d.RevenueTTM)?num(d.GrossProfitTTM)/num(d.RevenueTTM):null,
-          num(d.OperatingMarginTTM),num(d.QuarterlyRevenueGrowthYOY),num(d.QuarterlyEarningsGrowthYOY),
-          null,null,num(d.DividendYield),num(d.Beta),num(d['52WeekHigh']),num(d['52WeekLow']),null
-        );
-        if(fe._count>=3){ best=best?merge(best,fe):fe; console.log(`✅ [FundE] AV ${fe._count}項`); }
+        const fe={_src:'alpha_vantage',
+          pe:num(d.TrailingPE)??num(d.PERatio), forwardPE:num(d.ForwardPE),
+          pb:num(d.PriceToBookRatio), peg:num(d.PEGRatio), evEbitda:num(d.EVToEBITDA),
+          eps:num(d.EPS), bv:num(d.BookValue), mktCap:num(d.MarketCapitalization),
+          roe:num(d.ReturnOnEquityTTM), profitMgn:num(d.ProfitMargin),
+          grossMgn:num(d.GrossProfitTTM)&&num(d.RevenueTTM)?num(d.GrossProfitTTM)/num(d.RevenueTTM):null,
+          opMgn:num(d.OperatingMarginTTM),
+          revGr:num(d.QuarterlyRevenueGrowthYOY), epsGr:num(d.QuarterlyEarningsGrowthYOY),
+          divY:num(d.DividendYield), beta:num(d.Beta),
+          hi52:num(d['52WeekHigh']), lo52:num(d['52WeekLow']),
+        };
+        fe._count=cntF(fe);
+        if(fe._count>=3){ best=best?merge(best,fe):fe;
+          console.log(`✅ [FundE] AV ${fe._count}項`); }
       }
-    }catch(e){ console.warn('[FundE] AV 失敗:',e.message); }
+    }catch(e){ console.warn('[FundE] AV:',e.message); }
   }
 
   if(best&&best._count>=1){
     best._count=cntF(best);
-    console.log(`📊 [Fund Final] ${ticker}: ${best._count}項 src=${best._src} | PE=${best.pe} EPS=${best.eps} ROE=${best.roe} 52H=${best.hi52}`);
+    console.log(`📊 [Fund Final] ${ticker}: ${best._count}項 src=${best._src} | PE=${best.pe} EPS=${best.eps} 52H=${best.hi52} Beta=${best.beta}`);
     return best;
   }
   console.warn(`⚠️ [Fund] ${ticker}: 所有來源均無數據`);
   return { _src:'none', _count:0 };
 }
+
 
 
 
@@ -3961,82 +3987,48 @@ async function clearSWCache(){
 }
 
 async function testFundAPIs(ticker){
-  if(!ticker) ticker = document.getElementById('tickerInput')?.value?.trim()?.toUpperCase() || '2330.TW';
+  if(!ticker) ticker = document.getElementById('tickerInput')?.value?.trim()?.toUpperCase()||'2330.TW';
   const t = encodeURIComponent(ticker);
-  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ)$/i,'');
-  // rv: 提取 Yahoo {raw:X, fmt:"X"} 物件的數值
   const rv = o => (o&&typeof o==='object')?(o.raw??null):(o??null);
-  const log = ['🔍 API診斷 — '+ticker+' ('+new Date().toLocaleTimeString()+')',
-               '🌐 '+location.origin, ''];
+  const log = ['🔍 API診斷 — '+ticker, '🌐 '+location.origin, ''];
 
   async function test(name, url){
     try{
-      const d = await tryFetchJSON(url, 10000);
+      const d = await tryFetchJSON(url, 8000);
       if(!d){ log.push('⚠️ '+name+': null/offline'); return null; }
-      if(d.error) { log.push('⚠️ '+name+': error='+d.error); return null; }
-      log.push('✅ '+name);
-      return d;
+      if(d.error){ log.push('⚠️ '+name+': error='+d.error); return null; }
+      log.push('✅ '+name); return d;
     }catch(e){ log.push('❌ '+name+': '+e.message?.slice(0,50)); return null; }
   }
 
-  // Yahoo v10 (台/港/美全支援)
-  // 路徑0：chartJson 內嵌數據
-  if(typeof D !== 'undefined' && D?.chart_data){
-    log.push('📊 chartJson 內嵌: PE='+(D.factors?.value?.details?.['P/E (trailing)']||'N/A')+
-             ' EPS='+(D.factors?.value?.details?.EPS||'N/A'));
+  // 路徑0：chartJson
+  if(typeof D!=='undefined'&&D){
+    const res=D.chart_data&&window._lastChartJson?.chart?.result?.[0];
+    log.push('📊 chartJson: PE='+(res?.defaultKeyStatistics?.trailingPE?.raw||'N/A')+
+             ' 52H='+(res?.summaryDetail?.fiftyTwoWeekHigh?.raw||res?.meta?.fiftyTwoWeekHigh||'N/A'));
   }
 
-  // 路徑A：v8 chart + modules（台股最可靠）
-  const dv8 = await test('Yahoo v8 chart+modules',
-    'https://query1.finance.yahoo.com/v8/finance/chart/'+t+
-    '?range=1d&interval=1d&modules=financialData,defaultKeyStatistics,summaryDetail,price');
+  // 路徑A：v7 無 fields（台股）
+  const dv7 = await test('Yahoo v7 (無fields)', `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${t}`);
+  if(dv7?.quoteResponse?.result?.[0]){
+    const q=dv7.quoteResponse.result[0];
+    const all=Object.entries(q).filter(([k,v])=>v!=null&&typeof v!=='object').slice(0,12);
+    log.push('  有值: '+all.map(([k,v])=>k.replace(/([A-Z])/g,' $1').trim()+'='+v).join(' | '));
+  } else { log.push('  result=null'); }
+
+  // 路徑B：v7 帶 fields
+  const dv7f = await test('Yahoo v7 (帶fields)', `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=trailingPE,trailingEps,fiftyTwoWeekHigh,marketCap,beta,trailingAnnualDividendYield`);
+  if(dv7f?.quoteResponse?.result?.[0]){
+    const q=dv7f.quoteResponse.result[0];
+    log.push('  PE='+q.trailingPE+' EPS='+q.trailingEps+' 52H='+q.fiftyTwoWeekHigh+' Beta='+q.beta);
+  } else { log.push('  result=null'); }
+
+  // v8 chart
+  const dv8 = await test('Yahoo v8 chart',
+    `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=summaryDetail,defaultKeyStatistics`);
   if(dv8?.chart?.result?.[0]){
-    const res=dv8.chart.result[0];
-    const ks=res.defaultKeyStatistics||{}, sd=res.summaryDetail||{}, fd=res.financialData||{};
-    log.push('  PE='+rv(ks.trailingPE)+' EPS='+rv(ks.trailingEps)+' 52H='+rv(sd.fiftyTwoWeekHigh));
-    log.push('  ROE='+rv(fd.returnOnEquity)+' GrossMgn='+rv(fd.grossMargins));
-  } else { log.push('  → result=null'); }
-
-  // 台股分批診斷 (v10)
-  const d10a = await test('Yahoo v10 批1(summaryDetail)',
-    'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+'?modules=summaryDetail,price,defaultKeyStatistics');
-  if(d10a?.quoteSummary?.result?.[0]){
-    const r=d10a.quoteSummary.result[0];
-    const ks=r.defaultKeyStatistics||{}, sd=r.summaryDetail||{};
-    log.push('  PE='+rv(sd.trailingPE)||rv(ks.trailingPE)+' EPS='+rv(ks.trailingEps));
-    log.push('  Beta='+rv(sd.beta)+' DivY='+rv(sd.dividendYield));
-    log.push('  52H='+rv(sd.fiftyTwoWeekHigh)+' 52L='+rv(sd.fiftyTwoWeekLow));
-    log.push('  Shares='+rv(ks.sharesOutstanding)+' MktCap='+rv(sd.marketCap));
-  } else { log.push('  → result 為 null！(可能模組不支援)'); }
-
-  const d10b = await test('Yahoo v10 批2(financialData)',
-    'https://query1.finance.yahoo.com/v10/finance/quoteSummary/'+t+'?modules=financialData,incomeStatementHistory');
-  if(d10b?.quoteSummary?.result?.[0]){
-    const r=d10b.quoteSummary.result[0];
-    const fd=r.financialData||{}, is0=r.incomeStatementHistory?.incomeStatementHistory?.[0]||{};
-    log.push('  ROE='+rv(fd.returnOnEquity)+' GrossMgn='+rv(fd.grossMargins));
-    log.push('  NetIncome='+rv(is0.netIncome));
-  } else { log.push('  → result 為 null'); }
-
-  // Yahoo v7 quote
-  // v7 quote - 顯示完整回應結構
-  const d7 = await test('Yahoo v7',
-    'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+
-    '&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh,'+
-    'fiftyTwoWeekLow,marketCap,bookValue,grossMargins,trailingAnnualDividendYield,beta');
-  if(!d7){ log.push('  → 完全失敗'); }
-  else if(!d7.quoteResponse){ log.push('  → 無 quoteResponse，keys='+Object.keys(d7).join(',')); }
-  else if(!d7.quoteResponse.result?.[0]){ log.push('  → result 為 null/empty, error='+JSON.stringify(d7.quoteResponse.error)); }
-  else {
-    const q = d7.quoteResponse.result[0];
-    // 印出所有非null欄位
-    const vals = Object.entries(q).filter(([k,v])=>v!=null&&typeof v!=='object').slice(0,15);
-    log.push('  有值欄位: '+vals.map(([k,v])=>k+'='+v).join(' | '));
-  }
-
-  if(!/\.(TW|TWO|HK|SS|SZ)/i.test(ticker)){
-    await test('Finnhub', 'https://finnhub.io/api/v1/stock/metric?symbol='+sym+'&metric=all&token='+FINNHUB_KEY);
-    await test('AV', 'https://www.alphavantage.co/query?function=OVERVIEW&symbol='+sym+'&apikey='+AV_KEY);
+    const r=dv8.chart.result[0];
+    log.push('  52H='+rv(r.summaryDetail?.fiftyTwoWeekHigh)+' PE='+rv(r.defaultKeyStatistics?.trailingPE)+' meta52H='+r.meta?.fiftyTwoWeekHigh);
   }
 
   alert(log.join('\n'));
