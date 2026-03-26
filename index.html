@@ -1107,8 +1107,10 @@ async function fetchFundamentals(ticker, chartJson){
     try{
       const mods = 'financialData,defaultKeyStatistics,summaryDetail,price';
       const chartURLs = [
-        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}`,
-        `https://query2.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}`,
+        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}&includePrePost=false`,
+        `https://query2.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=${mods}&includePrePost=false`,
+        // 1y 範圍也試試（部分模組只在有歷史數據時才出現）
+        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${mods}`,
       ];
       for(const url of chartURLs){
         const d = await tryFetchJSON(url, 10000);
@@ -1146,15 +1148,23 @@ async function fetchFundamentals(ticker, chartJson){
   // ═══════════════════════════════════════════════════════
   if(!best || best._count < 8){
     try{
-      const fields=['trailingPE','forwardPE','priceToBook','trailingEps','epsTrailingTwelveMonths',
-        'bookValue','marketCap','returnOnEquity','profitMargins','grossMargins','operatingMargins',
-        'revenueGrowth','debtToEquity','currentRatio','trailingAnnualDividendYield',
-        'beta','fiftyTwoWeekHigh','fiftyTwoWeekLow','pegRatio','enterpriseToEbitda','earningsGrowth'].join(',');
-      const d7 = await tryFetchJSON(
-        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=${fields}`, 8000);
-      const q = d7?.quoteResponse?.result?.[0];
+      // 台股：用精簡欄位避免 Yahoo 拒絕，query1+query2 都試
+      const f1 = 'trailingPE,forwardPE,priceToBook,trailingEps,epsTrailingTwelveMonths,bookValue,marketCap';
+      const f2 = 'returnOnEquity,profitMargins,grossMargins,operatingMargins,revenueGrowth';
+      const f3 = 'debtToEquity,currentRatio,trailingAnnualDividendYield,beta,fiftyTwoWeekHigh,fiftyTwoWeekLow,pegRatio';
+      let q = null;
+      for(const base of ['query1','query2']){
+        for(const fields of [`${f1},${f2},${f3}`, f1, `${f1},${f3}`]){
+          const d7 = await tryFetchJSON(
+            `https://${base}.finance.yahoo.com/v7/finance/quote?symbols=${t}&fields=${fields}`, 8000);
+          const r = d7?.quoteResponse?.result?.[0];
+          if(r && Object.keys(r).length > 2){ q = r; break; }
+        }
+        if(q) break;
+      }
       if(q){
-        const p=q.regularMarketPrice, e=q.epsTrailingTwelveMonths??q.trailingEps;
+        const p = q.regularMarketPrice||null;
+        const e = q.epsTrailingTwelveMonths ?? q.trailingEps ?? null;
         const fb = mkFund('v7_quote',
           q.trailingPE??(e&&e>0&&p?p/e:null), q.forwardPE, q.priceToBook, q.pegRatio, q.enterpriseToEbitda,
           e, q.bookValue, q.marketCap,
@@ -1165,7 +1175,7 @@ async function fetchFundamentals(ticker, chartJson){
         );
         if(fb._count>=1){
           best = best ? merge(best,fb) : fb;
-          console.log(`✅ [FundB] ${ticker}: v7 ${fb._count}項`);
+          console.log(`✅ [FundB] ${ticker}: v7 ${fb._count}項 | PE=${fb.pe} 52H=${fb.hi52}`);
         }
       }
     }catch(e){ console.warn('[FundB] v7 失敗:',e.message); }
@@ -4009,13 +4019,19 @@ async function testFundAPIs(ticker){
   } else { log.push('  → result 為 null'); }
 
   // Yahoo v7 quote
+  // v7 quote - 顯示完整回應結構
   const d7 = await test('Yahoo v7',
     'https://query1.finance.yahoo.com/v7/finance/quote?symbols='+t+
-    '&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh,grossMargins,bookValue');
-  if(d7?.quoteResponse?.result?.[0]){
+    '&fields=trailingPE,epsTrailingTwelveMonths,returnOnEquity,fiftyTwoWeekHigh,'+
+    'fiftyTwoWeekLow,marketCap,bookValue,grossMargins,trailingAnnualDividendYield,beta');
+  if(!d7){ log.push('  → 完全失敗'); }
+  else if(!d7.quoteResponse){ log.push('  → 無 quoteResponse，keys='+Object.keys(d7).join(',')); }
+  else if(!d7.quoteResponse.result?.[0]){ log.push('  → result 為 null/empty, error='+JSON.stringify(d7.quoteResponse.error)); }
+  else {
     const q = d7.quoteResponse.result[0];
-    log.push('  PE='+q.trailingPE+' EPS='+q.epsTrailingTwelveMonths+' ROE='+q.returnOnEquity);
-    log.push('  GrossMgn='+q.grossMargins+' BV='+q.bookValue+' 52H='+q.fiftyTwoWeekHigh);
+    // 印出所有非null欄位
+    const vals = Object.entries(q).filter(([k,v])=>v!=null&&typeof v!=='object').slice(0,15);
+    log.push('  有值欄位: '+vals.map(([k,v])=>k+'='+v).join(' | '));
   }
 
   if(!/\.(TW|TWO|HK|SS|SZ)/i.test(ticker)){
