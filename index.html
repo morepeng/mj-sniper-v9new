@@ -657,6 +657,223 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 </div><!-- /wrap -->
 
 <script>
+// ═══════════════════════════════════════════════════════════════
+//  ICT / SMC 純 JavaScript 引擎
+//  對應 Python ICT_SMC_Strategy 類別
+//  包含：FVG / OB / BOS / CHOCH / PO3 / Silver Bullet / OTE Fibonacci
+// ═══════════════════════════════════════════════════════════════
+
+function calcFVG(bars){
+  // 公平價值缺口 (Fair Value Gap)
+  const n = bars.length;
+  const fvg = new Array(n).fill(0);
+  const FVG_MIN = 0.004;
+  for(let i=2; i<n; i++){
+    const gap1 = bars[i-1].low - bars[i-2].high;
+    const gap2 = bars[i-2].low - bars[i-1].high;
+    if(gap1 > FVG_MIN * bars[i-2].close) fvg[i] = gap1;      // 多頭 FVG
+    else if(gap2 > FVG_MIN * bars[i-2].close) fvg[i] = -gap2; // 空頭 FVG
+  }
+  return fvg;
+}
+
+function calcOrderBlock(bars, atrArr){
+  // 訂單塊 (Order Block)
+  const n = bars.length;
+  const ob = new Array(n).fill(0);
+  for(let i=3; i<n; i++){
+    const atr = atrArr[i-1] || (bars[i-1].high - bars[i-1].low);
+    const bodySize = Math.abs(bars[i-1].close - bars[i-1].open);
+    if(bodySize < 0.5 * atr) continue;
+    if(bars[i].close > bars[i-3].close && bars[i-1].close < bars[i-1].open){
+      ob[i-1] = bars[i-1].high; // 多頭 OB（看跌K棒後強勢上漲）
+    } else if(bars[i].close < bars[i-3].close && bars[i-1].close > bars[i-1].open){
+      ob[i-1] = bars[i-1].low;  // 空頭 OB（看漲K棒後強勢下跌）
+    }
+  }
+  return ob;
+}
+
+function calcBOSCHOCH(bars){
+  // 結構突破 (BOS) 和 趨勢轉換 (CHOCH)
+  const n = bars.length;
+  const bos   = new Array(n).fill(false);
+  const choch = new Array(n).fill(false);
+  const WIN = 5;
+  
+  for(let i=WIN*2; i<n; i++){
+    // 計算前5根的擺動高低點
+    let swingHigh = -Infinity, swingLow = Infinity;
+    for(let j=i-WIN*2; j<i-WIN; j++){
+      if(bars[j].high > swingHigh) swingHigh = bars[j].high;
+      if(bars[j].low  < swingLow)  swingLow  = bars[j].low;
+    }
+    // BOS：突破擺動高低點
+    if(bars[i].high > swingHigh && bars[i].close > bars[i-1].close) bos[i] = true;
+    if(bars[i].low  < swingLow  && bars[i].close < bars[i-1].close) bos[i] = true;
+    // CHOCH：趨勢轉換（先前空頭後突破高點，或先前多頭後跌破低點）
+    const prevClose = bars[i-1].close;
+    if(bars[i].close > swingHigh && prevClose < swingLow) choch[i] = true;
+    if(bars[i].close < swingLow  && prevClose > swingHigh) choch[i] = true;
+  }
+  return { bos, choch };
+}
+
+function calcPO3Phases(bars, volMA, fvg, ob){
+  // Power of Three (PO3) 三阶段：累積 → 操縱 → 分配
+  const n = bars.length;
+  const phases = new Array(n).fill('None');
+  for(let i=20; i<n; i++){
+    const bodyRatio = Math.abs(bars[i].high - bars[i].low) / bars[i].close;
+    const vol = bars[i].volume;
+    const vma = volMA[i] || vol;
+    const obVal = ob[i-1] || 0;
+    // 累積：窄幅盤整 + 低量
+    if(bodyRatio < 0.008 && vol < 0.8 * vma){
+      phases[i] = 'Accumulation';
+    // 操縱：價格靠近 OB
+    } else if(obVal !== 0 && (Math.abs(bars[i].high - obVal) < 0.005 * bars[i].close ||
+                               Math.abs(bars[i].low  - obVal) < 0.005 * bars[i].close)){
+      phases[i] = 'Manipulation';
+    // 分配：FVG 出現 + 高量
+    } else if(fvg[i] !== 0 && vol > 1.5 * vma){
+      phases[i] = 'Distribution';
+    }
+  }
+  return phases;
+}
+
+function calcOTEFibZone(bars){
+  // OTE (Optimal Trade Entry) 最佳進場點：61.8% ~ 78.6% 斐波回檔
+  const n = bars.length;
+  const oteZone = new Array(n).fill(0);
+  const WIN = 20;
+  const FIB_LO = 0.618, FIB_HI = 0.786;
+  
+  for(let i=WIN*2; i<n; i++){
+    // 找區間高低點
+    let swingH = -Infinity, swingL = Infinity;
+    for(let j=i-WIN; j<i; j++){
+      if(bars[j].high > swingH) swingH = bars[j].high;
+      if(bars[j].low  < swingL) swingL = bars[j].low;
+    }
+    const impulse = swingH - swingL;
+    if(impulse <= 0) continue;
+    const price = bars[i].close;
+    
+    // 多頭 OTE：從高點回檔至 61.8%~78.6%
+    const oteUpperBull = swingH - impulse * FIB_LO;
+    const oteLowerBull = swingH - impulse * FIB_HI;
+    if(oteLowerBull <= price && price <= oteUpperBull) oteZone[i] = 1;
+    
+    // 空頭 OTE：從低點反彈至 61.8%~78.6%
+    const oteLowerBear = swingL + impulse * FIB_LO;
+    const oteUpperBear = swingL + impulse * FIB_HI;
+    if(oteLowerBear <= price && price <= oteUpperBear) oteZone[i] = -1;
+  }
+  return oteZone;
+}
+
+function calcSilverBulletKillzone(bars, ticker){
+  // Silver Bullet Killzone（台股/美股自動切換）
+  const isTW = /\.(TW|TWO)/i.test(ticker);
+  const n = bars.length;
+  const inKZ = new Array(n).fill(false);
+  for(let i=0; i<n; i++){
+    const d = bars[i].date || '';
+    // 如果有時間資訊才判斷
+    if(d.length > 10){
+      const timePart = d.slice(11,16);
+      const [h, m] = timePart.split(':').map(Number);
+      const t = h * 60 + m;
+      if(isTW){
+        // 台股 killzone: 09:00-10:30 / 13:30-14:30
+        if((t >= 9*60 && t <= 10*60+30) || (t >= 13*60+30 && t <= 14*60+30)) inKZ[i] = true;
+      } else {
+        // 美股 NY killzone: 10:00-11:00 (EST)
+        if(t >= 10*60 && t <= 11*60) inKZ[i] = true;
+      }
+    } else {
+      inKZ[i] = true; // 日線以上：不限制時段
+    }
+  }
+  return inKZ;
+}
+
+function calcICTSMCScore(bars, ticker, atrArr){
+  // 計算完整 ICT/SMC 因子分數 (0~100)
+  const n = bars.length;
+  const closes = bars.map(b=>b.close);
+  const vols   = bars.map(b=>b.volume);
+  
+  // 計算各指標
+  const fvg     = calcFVG(bars);
+  const ob      = calcOrderBlock(bars, atrArr);
+  const { bos, choch } = calcBOSCHOCH(bars);
+  const volMA   = sma(vols, 20);
+  const po3     = calcPO3Phases(bars, volMA, fvg, ob);
+  const killzone= calcSilverBulletKillzone(bars, ticker);
+  const ote     = calcOTEFibZone(bars);
+  
+  // 當前 bar 的評分
+  const i = n - 1;
+  let score = 0;
+  
+  // SMC 核心 (40%)：FVG + OB
+  if(fvg[i] !== 0)  score += 20;
+  if(ob[i]  !== 0)  score += 20;
+  // ICT 結構確認 (30%)：BOS + CHOCH
+  if(bos[i])   score += 15;
+  if(choch[i]) score += 15;
+  // PO3 + Silver Bullet (20%)
+  if(po3[i] === 'Distribution') score += 10;
+  if(killzone[i])               score += 10;
+  // OTE 斐波確認 (10%)
+  if(ote[i] !== 0)  score += 10;
+  
+  score = Math.min(100, Math.max(0, score));
+  
+  // 訊號方向
+  const hasBuySignal  = score > 70 && fvg[i] > 0 && ote[i] === 1 && killzone[i];
+  const hasSellSignal = score > 70 && fvg[i] < 0 && ote[i] === -1 && killzone[i];
+  
+  // 最近幾根 K 線的統計
+  const recent = 10;
+  let fvgCnt=0, obCnt=0, bosCnt=0, chochCnt=0, distCnt=0;
+  for(let j=Math.max(0,n-recent); j<n; j++){
+    if(fvg[j]!==0) fvgCnt++;
+    if(ob[j]!==0)  obCnt++;
+    if(bos[j])     bosCnt++;
+    if(choch[j])   chochCnt++;
+    if(po3[j]==='Distribution') distCnt++;
+  }
+  
+  return {
+    score,
+    fvg: fvg[i],
+    ob: ob[i],
+    bos: bos[i],
+    choch: choch[i],
+    po3: po3[i],
+    killzone: killzone[i],
+    ote: ote[i],
+    signal: hasBuySignal ? 'BUY' : hasSellSignal ? 'SELL' : 'NEUTRAL',
+    fvg_count:   fvgCnt,
+    ob_count:    obCnt,
+    bos_count:   bosCnt,
+    choch_count: chochCnt,
+    dist_count:  distCnt,
+    // 詳細數值
+    fvg_arr:  fvg,
+    ob_arr:   ob,
+    bos_arr:  bos,
+    choch_arr:choch,
+    po3_arr:  po3,
+    ote_arr:  ote,
+  };
+}
+
+
 /* ═══════════════════════════════════════════════
    GLOBALS
 ═══════════════════════════════════════════════ */
@@ -1088,8 +1305,9 @@ async function fetchFundamentals(ticker, chartJson){
       const bvYF   = rv(ks.bookValue);
 
       // 52W — 先從 summaryDetail 找，再從 meta 找
-      const hi52 = rv(sd.fiftyTwoWeekHigh)||meta.fiftyTwoWeekHigh||null;
-      const lo52 = rv(sd.fiftyTwoWeekLow) ||meta.fiftyTwoWeekLow||null;
+      // meta 是台股最可靠的52W來源（summaryDetail 對台股常為null）
+      const hi52 = rv(sd.fiftyTwoWeekHigh)||meta.fiftyTwoWeekHigh||rv(pr.fiftyTwoWeekHigh)||null;
+      const lo52 = rv(sd.fiftyTwoWeekLow) ||meta.fiftyTwoWeekLow ||rv(pr.fiftyTwoWeekLow)||null;
 
       const f0 = {
         _src:'chart_json',
@@ -1115,9 +1333,11 @@ async function fetchFundamentals(ticker, chartJson){
         shortRatio:rv(ks.shortRatio),
       };
       f0._count = cntF(f0);
-      if(f0._count >= 1){
+      // 只要 meta 有52W就算有數據（台股base case）
+      if(f0._count>=1 || f0.hi52!=null || f0.beta!=null || f0.mktCap!=null){
+        if(f0.hi52!=null) f0._count = Math.max(f0._count, 1);
         best = f0;
-        console.log(`✅ [Fund0] ${ticker}: chart_json ${f0._count}項 | PE=${f0.pe} EPS=${f0.eps} 52H=${f0.hi52}`);
+        console.log(`✅ [Fund0] ${ticker}: chart_json ${f0._count}項 | PE=${f0.pe} 52H=${f0.hi52} Beta=${f0.beta} MktCap=${f0.mktCap}`);
       }
     }
   }catch(e){ console.warn('[Fund0]',e.message); }
@@ -1174,9 +1394,17 @@ async function fetchFundamentals(ticker, chartJson){
   // ═══════════════════════════════════════════════════════
   if(!best || best._count < 5){
     try{
-      const mods='financialData,defaultKeyStatistics,summaryDetail,price';
-      for(const base of ['query1','query2']){
-        const url=`https://${base}.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${mods}`;
+      // 台股策略：先試帶 modules，失敗再試不帶 modules（只取 meta）
+      const modsUrl='financialData,defaultKeyStatistics,summaryDetail,price';
+      const urlList = [
+        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${modsUrl}`,
+        `https://query2.finance.yahoo.com/v8/finance/chart/${t}?range=1y&interval=1d&modules=${modsUrl}`,
+        // 不帶 modules：meta 欄位最完整（確保拿到 fiftyTwoWeekHigh）
+        `https://query1.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d`,
+        `https://query2.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d`,
+      ];
+      for(const url of urlList){
+        const base = url.includes('query2') ? 'query2' : 'query1';
         const d = await tryFetchJSON(url,10000);
         const res = d?.chart?.result?.[0];
         if(!res) continue;
@@ -1200,7 +1428,13 @@ async function fetchFundamentals(ticker, chartJson){
           lo52:rv(sd.fiftyTwoWeekLow)||mt.fiftyTwoWeekLow||null,
         };
         fb._count=cntF(fb);
-        if(fb._count>=1){ best=best?merge(best,fb):fb; break; }
+        // 只要有任一欄位（哪怕只有52W）就接受
+        if(fb._count>=1 || fb.hi52!=null || fb.mktCap!=null){
+          if(fb.hi52!=null || fb.mktCap!=null) fb._count = Math.max(fb._count, 1);
+          best=best?merge(best,fb):fb;
+          console.log('✅ [FundB] v8 chart:', ticker, 'hi52='+fb.hi52, 'count='+fb._count);
+          break;
+        }
       }
     }catch(e){ console.warn('[FundB] v8:',e.message); }
   }
@@ -1552,6 +1786,12 @@ function analyze(bars, ticker, quoteData){
   const chopArr = calcChop(highs,lows,closes);
   const chop = chopArr[n-1]??50;
 
+  // ── ICT/SMC 計算（try-catch 保護，不影響主流程）──
+  let ictSmc = { score:0,fvg:0,ob:0,bos:false,choch:false,po3:'None',
+                 killzone:false,ote:0,signal:'NEUTRAL',
+                 fvg_count:0,ob_count:0,bos_count:0,choch_count:0,dist_count:0 };
+  try{ ictSmc = calcICTSMCScore(bars, ticker, atrArr); }catch(e){ console.warn('[ICT]',e.message); }
+
   // R²
   const r2Arr = calcR2(closes);
   const r2 = r2Arr[n-1]??0;
@@ -1646,6 +1886,17 @@ function analyze(bars, ticker, quoteData){
     if(aboveMA200){buy+=4;sigs.push({t:'站上MA200',c:'buy'});}
     else{sell+=4;sigs.push({t:'跌破MA200',c:'sell'});}
   }
+
+  // ── ICT/SMC 評分加成 ──
+  if(ictSmc.bos)              { buy  += 4; sigs.push({t:'BOS 結構突破',  c:'buy'}); }
+  if(ictSmc.choch)            { buy  += 5; sigs.push({t:'CHOCH 趨勢轉換',c:'buy'}); }
+  if(ictSmc.fvg > 0)          { buy  += 3; sigs.push({t:'FVG 多頭缺口',  c:'buy'}); }
+  if(ictSmc.fvg < 0)          { sell += 3; sigs.push({t:'FVG 空頭缺口',  c:'sell'}); }
+  if(ictSmc.ote === 1)        { buy  += 5; sigs.push({t:'OTE 最佳進場',  c:'buy'}); }
+  if(ictSmc.ote === -1)       { sell += 5; sigs.push({t:'OTE 空頭進場',  c:'sell'}); }
+  if(ictSmc.po3==='Distribution'){ buy += 3; sigs.push({t:'PO3 分配階段',c:'buy'}); }
+  if(ictSmc.signal==='BUY')   { buy  +=10; sigs.push({t:'ICT 買入共振',  c:'buy'}); }
+  if(ictSmc.signal==='SELL')  { sell +=10; sigs.push({t:'ICT 賣出共振',  c:'sell'}); }
 
   const total = buy - sell;
   const signal = total>=20?'Strong Buy':total>=10?'Buy':total<=-20?'Strong Sell':total<=-10?'Sell':'Hold';
@@ -2011,6 +2262,17 @@ function analyze(bars, ticker, quoteData){
         'RSI':+rsi.toFixed(1),'MFI':+mfi.toFixed(1),
         'Stoch RSI':+stochRSI.toFixed(1),'KDJ-J':+kdjJ.toFixed(1),
       }},
+      ict_smc:{score: ictSmc.score, label:'ICT/SMC 資金', details:{
+        'ICT 綜合分': ictSmc.score,
+        'FVG 缺口':   ictSmc.fvg !== 0 ? (ictSmc.fvg > 0 ? '✅ 多頭' : '✅ 空頭') : '—',
+        'Order Block':ictSmc.ob !== 0 ? ictSmc.ob.toFixed(2) : '—',
+        'BOS 突破':   ictSmc.bos ? '✅ 是' : '—',
+        'CHOCH 轉換': ictSmc.choch ? '✅ 是' : '—',
+        'PO3 階段':   ictSmc.po3 !== 'None' ? ictSmc.po3 : '—',
+        'Killzone':   ictSmc.killzone ? '✅ 在' : '—',
+        'OTE 回檔':   ictSmc.ote === 1 ? '✅ 多頭' : ictSmc.ote === -1 ? '✅ 空頭' : '—',
+        'ICT 訊號':   ictSmc.signal,
+      }},
       macro:{score:macroScore, label:'Macro 宏觀', details:{
         'vs MA200%':+pvMA200.toFixed(2),'Slope%':+slope.toFixed(4),
         'Chop':+chop.toFixed(1),
@@ -2204,25 +2466,31 @@ async function doAnalyze(){
 
   try {
     // 取 chart（OHLCV + YF modules 嘗試）
+    // 速度優化：chart 取完後立刻並行取基本面 + 開始計算
     const chartJson = await fetchYF(ticker);
     const bars      = parseOHLCV(chartJson);
-    // 並行取基本面：Finnhub + Alpha Vantage + YF modules 三方合併
-    const fund      = await fetchFundamentals(ticker, chartJson);
-    D = analyze(bars, ticker, fund);
-    D._fundSource = fund._src || DATA_MODE;
-    D.ticker = ticker;  // 保存 ticker 供 setChartInterval 使用
-
-    // 快取日線數據
-    _klineCache['1d']  = bars;
-    _klineCache['1wk'] = null;  // 清除其他時間框架的快取
-    _klineCache['15m'] = null;
-    CHART_INTERVAL = '1d';  // 重設為日線
-    _CV.offset = 0; _CV.zoom = 1;  // 重設縮放
-
-    D._klineData = bars;  // 當前 K 線數據
-    renderAll(D);
-    // 手機：分析完成自動切到總覽
+    // 同時發出基本面請求，不阻塞 analyze 計算
+    const fundPromise = fetchFundamentals(ticker, chartJson);
+    // 先用 chartJson 中的基本面快速 analyze（立即顯示K線和技術面）
+    const fundQuick = { _src:'chart_json_quick', ...(_extractYFModules(chartJson)) };
+    D = analyze(bars, ticker, fundQuick);
+    D.ticker = ticker;
+    _klineCache['1d'] = bars;
+    _klineCache['1wk'] = null; _klineCache['15m'] = null;
+    CHART_INTERVAL = '1d'; _CV.offset=0; _CV.zoom=1;
+    D._klineData = bars;
+    renderAll(D); // 先顯示技術面結果
     if(window.innerWidth <= 768) showPanel('overview');
+    // 再等基本面完成，更新估值數據
+    const fund = await fundPromise;
+    D._fundSource = fund._src || DATA_MODE;
+    if(fund._count > 0){
+      D = analyze(bars, ticker, fund); // 重新分析（含估值）
+      D.ticker = ticker; D._klineData = bars;
+      renderAll(D);
+      if(window.innerWidth <= 768) showPanel('overview');
+    }
+    // 兩階段渲染完成（以上已處理）
   } catch(err){
     showError(err.message);
   } finally {
@@ -2285,10 +2553,19 @@ function showError(msg){
 ═══════════════════════════════════════════════ */
 function renderAll(d){
   renderBanner(d);
-  renderTab(activeTab, d);
-  // Pre-render tabs
-  const tabs=['overview','kline','tech','factors','dow','smc','leading','risk'];
-  tabs.forEach(t=>{ if(t!==activeTab) renderTab(t,d); });
+  renderTab(activeTab, d); // 立即渲染當前 tab
+  // 其他 tab 延遲渲染（requestIdleCallback），不阻塞 UI
+  const others=['overview','kline','tech','factors','dow','smc','leading','risk'].filter(t=>t!==activeTab);
+  let idx=0;
+  function next(){
+    if(idx>=others.length) return;
+    const t=others[idx++];
+    try{ renderTab(t,d); }catch(e){}
+    if(typeof requestIdleCallback==='function') requestIdleCallback(next,{timeout:400});
+    else setTimeout(next,30);
+  }
+  if(typeof requestIdleCallback==='function') requestIdleCallback(next,{timeout:400});
+  else setTimeout(next,80);
 }
 
 function renderTab(tab, d){
