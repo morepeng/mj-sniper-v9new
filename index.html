@@ -1279,12 +1279,21 @@ async function fetchFundamentals(ticker, chartJson){
   let best = null;
 
   // ═══════════════════════════════════════════════════════
-  // 路徑0：從已有的 chartJson 提取（台/港股最可靠起點）
-  //   fetchYF 已帶 modules，直接讀 meta + modules
+  // 路徑0：從 chartJson + 輕量 v8 chart 提取（台股 meta 最可靠）
   // ═══════════════════════════════════════════════════════
   try{
-    const res = chartJson?.chart?.result?.[0];
+    // 先試輕量 v8（不帶modules），meta 最完整
+    let res0 = null;
+    for(const base of ['query1','query2']){
+      const d0 = await tryFetchJSON(
+        `https://${base}.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d`, 6000);
+      if(d0?.chart?.result?.[0]){ res0 = d0.chart.result[0]; break; }
+    }
+    // 合併：chartJson（有 modules）和 res0（meta 最完整）
+    const res = res0 || chartJson?.chart?.result?.[0];
     if(res){
+      // 如果有 res0，用它的 meta 覆蓋
+      if(res0) res.meta = Object.assign({}, chartJson?.chart?.result?.[0]?.meta||{}, res0.meta||{});
       const meta= res.meta||{};
       const fd  = res.financialData||{};
       const ks  = res.defaultKeyStatistics||{};
@@ -1424,8 +1433,10 @@ async function fetchFundamentals(ticker, chartJson){
           debtEq:rv(fd.debtToEquity), currRatio:rv(fd.currentRatio),
           divY:rv(sd.dividendYield)||rv(sd.trailingAnnualDividendYield),
           beta:rv(sd.beta)||rv(ks.beta),
-          hi52:rv(sd.fiftyTwoWeekHigh)||mt.fiftyTwoWeekHigh||null,
-          lo52:rv(sd.fiftyTwoWeekLow)||mt.fiftyTwoWeekLow||null,
+          hi52:rv(sd.fiftyTwoWeekHigh)||mt.fiftyTwoWeekHigh||rv(pr.fiftyTwoWeekHigh)||null,
+          lo52:rv(sd.fiftyTwoWeekLow) ||mt.fiftyTwoWeekLow ||rv(pr.fiftyTwoWeekLow) ||null,
+          beta:rv(sd.beta)||rv(ks.beta)||mt.beta||null,
+          mktCap:rv(pr.marketCap)||rv(sd.marketCap)||(priceNow&&rv(ks.sharesOutstanding)?priceNow*rv(ks.sharesOutstanding):null),
         };
         fb._count=cntF(fb);
         // 只要有任一欄位（哪怕只有52W）就接受
@@ -3043,7 +3054,7 @@ function renderDoubleDefense(tech){
 /* ── FACTORS ── */
 function renderFactors(d){
   const f   = d.factors || {};
-  const keys= ['momentum','value','quality','growth','volatility','sentiment','macro'];
+  const keys= ['momentum','value','quality','growth','volatility','sentiment','macro','ict_smc'];
   const el  = document.getElementById('factorsContent');
 
   // Count how many value fields are loaded (non-N/A)
