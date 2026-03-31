@@ -873,6 +873,324 @@ function calcICTSMCScore(bars, ticker, atrArr){
   };
 }
 
+// ══════════════════════════════════════════════════════
+//  OFI — Order Flow Imbalance（訂單流失衡）
+//  核心：用 K 線的買壓/賣壓估算主力資金方向
+//  OFI = Σ(買量 - 賣量)，正值=買壓強，負值=賣壓強
+// ══════════════════════════════════════════════════════
+function calcOFI(bars, period=14){
+  const n = bars.length;
+  const ofi = new Array(n).fill(0);
+  // 單根 K 線 OFI 估算：
+  // 買量 = 成交量 × (收-低)/(高-低)  → 代表向上驅動的量
+  // 賣量 = 成交量 × (高-收)/(高-低)  → 代表向下驅動的量
+  for(let i=0; i<n; i++){
+    const hl = bars[i].high - bars[i].low || 1e-8;
+    const buyVol  = bars[i].volume * (bars[i].close - bars[i].low)  / hl;
+    const sellVol = bars[i].volume * (bars[i].high  - bars[i].close)/ hl;
+    ofi[i] = buyVol - sellVol;
+  }
+  // 計算 OFI 累積值和 SMA
+  const ofiSma = sma(ofi, period);
+  // 標準化（Z-score）
+  const ofiZ = new Array(n).fill(0);
+  for(let i=period; i<n; i++){
+    const slice = ofi.slice(i-period, i);
+    const mean  = slice.reduce((a,b)=>a+b,0)/period;
+    const std   = Math.sqrt(slice.reduce((a,b)=>a+(b-mean)**2,0)/period) || 1e-8;
+    ofiZ[i] = (ofi[i] - mean) / std;
+  }
+  return { ofi, ofiSma, ofiZ };
+}
+
+// ══════════════════════════════════════════════════════
+//  OFI 訂單流評分（單獨評分項目）
+// ══════════════════════════════════════════════════════
+function calcOFIScore(bars, period=14){
+  const { ofi, ofiSma, ofiZ } = calcOFI(bars, period);
+  const n = bars.length;
+  const i = n - 1;
+
+  // 最近 3 根 OFI 趨勢
+  const ofiCurr  = ofi[i]    || 0;
+  const ofiPrev  = ofi[i-1]  || 0;
+  const ofiPrev2 = ofi[i-2]  || 0;
+  const ofiSmaV  = ofiSma[i] || 0;
+  const ofiZV    = ofiZ[i]   || 0;
+
+  // OFI 趨勢：連續3根方向
+  const ofiTrend = (ofiCurr > 0 && ofiPrev > 0 && ofiPrev2 > 0) ? 'bullish' :
+                   (ofiCurr < 0 && ofiPrev < 0 && ofiPrev2 < 0) ? 'bearish' : 'neutral';
+
+  // OFI 加速：本根 > 前根（動能增強）
+  const ofiAccel = Math.abs(ofiCurr) > Math.abs(ofiPrev);
+
+  // OFI 背離：價格新高但 OFI 下降（看空），價格新低但 OFI 上升（看多）
+  const closes = bars.map(b=>b.close);
+  const priceTrend = closes[i] > closes[i-3] ? 'up' : closes[i] < closes[i-3] ? 'down' : 'flat';
+  let ofiBullDiv = false, ofiBearDiv = false;
+  if(priceTrend==='down' && ofiCurr > ofiPrev)  ofiBullDiv = true; // 底背離
+  if(priceTrend==='up'   && ofiCurr < ofiPrev)  ofiBearDiv = true; // 頂背離
+
+  // 評分 0-100
+  let score = 50; // 中性起點
+  if(ofiTrend==='bullish') score += 20;
+  if(ofiTrend==='bearish') score -= 20;
+  if(ofiZV > 1.5)  score += 15; // 強烈買壓
+  if(ofiZV > 2.5)  score += 10; // 極端買壓
+  if(ofiZV < -1.5) score -= 15;
+  if(ofiZV < -2.5) score -= 10;
+  if(ofiCurr > ofiSmaV && ofiSmaV > 0) score += 10; // 高於均線
+  if(ofiCurr < ofiSmaV && ofiSmaV < 0) score -= 10;
+  if(ofiAccel) score += (ofiCurr > 0 ? 5 : -5);
+  if(ofiBullDiv) score += 15; // 底背離強力信號
+  if(ofiBearDiv) score -= 15;
+
+  score = Math.min(100, Math.max(0, score));
+
+  // 訊號方向
+  const signal = score >= 70 ? 'BUY' : score <= 30 ? 'SELL' : 'NEUTRAL';
+
+  return {
+    score,
+    signal,
+    ofi_curr:    +ofiCurr.toFixed(0),
+    ofi_sma:     +ofiSmaV.toFixed(0),
+    ofi_z:       +ofiZV.toFixed(2),
+    ofi_trend:   ofiTrend,
+    ofi_accel:   ofiAccel,
+    ofi_bull_div: ofiBullDiv,
+    ofi_bear_div: ofiBearDiv,
+    // 原始序列（供圖表用）
+    ofi_arr:     ofi,
+    ofi_z_arr:   ofiZ,
+  };
+}
+
+// ══════════════════════════════════════════════════════
+//  K 線缺口偵測（Gap Analysis）
+//  含：普通缺口 / 突破缺口 / 竭盡缺口
+// ══════════════════════════════════════════════════════
+function detectGaps(bars){
+  const gaps = [];
+  const n = bars.length;
+  const closes = bars.map(b=>b.close);
+  const volMA  = sma(bars.map(b=>b.volume), 20);
+
+  for(let i=1; i<n; i++){
+    const prevHigh = bars[i-1].high;
+    const prevLow  = bars[i-1].low;
+    const currOpen = bars[i].open;
+    const currLow  = bars[i].low;
+    const currHigh = bars[i].high;
+    const vol    = bars[i].volume;
+    const vma    = volMA[i] || vol;
+    const gapPct = 0;
+
+    // 向上跳空缺口
+    if(currLow > prevHigh){
+      const gapSize = (currLow - prevHigh) / prevHigh;
+      const isHighVol = vol > 1.5 * vma;
+      const type = isHighVol ? '突破缺口 ↑' : gapSize > 0.02 ? '竭盡缺口 ↑' : '普通缺口 ↑';
+      gaps.push({ idx:i, date:bars[i].date, type, dir:'up',
+                  gapLow:prevHigh, gapHigh:currLow,
+                  size:+(gapSize*100).toFixed(2), filled:false });
+    }
+    // 向下跳空缺口
+    if(currHigh < prevLow){
+      const gapSize = (prevLow - currHigh) / prevLow;
+      const isHighVol = vol > 1.5 * vma;
+      const type = isHighVol ? '突破缺口 ↓' : gapSize > 0.02 ? '竭盡缺口 ↓' : '普通缺口 ↓';
+      gaps.push({ idx:i, date:bars[i].date, type, dir:'down',
+                  gapHigh:prevLow, gapLow:currHigh,
+                  size:+(gapSize*100).toFixed(2), filled:false });
+    }
+  }
+  // 標記已填補的缺口
+  for(const g of gaps){
+    for(let j=g.idx+1; j<n; j++){
+      if(g.dir==='up'   && bars[j].low  <= g.gapLow)  { g.filled=true; break; }
+      if(g.dir==='down' && bars[j].high >= g.gapHigh) { g.filled=true; break; }
+    }
+  }
+  return gaps;
+}
+
+// ══════════════════════════════════════════════════════
+//  簡易回測引擎（基於現有技術訊號）
+// ══════════════════════════════════════════════════════
+function runBacktest(bars, ticker){
+  const n = bars.length;
+  if(n < 30) return null;
+
+  const closes  = bars.map(b=>b.close);
+  const highs   = bars.map(b=>b.high);
+  const lows    = bars.map(b=>b.low);
+  const vols    = bars.map(b=>b.volume);
+
+  // 計算指標
+  const rsiArr  = calcRSI(closes);
+  const { macd:macdArr, signal:sigArr, hist:histArr } = calcMACD(closes);
+  const e20     = ema(closes, 20);
+  const e50     = ema(closes, 50);
+  const atrArr  = calcATR(highs, lows, closes);
+  const stDir   = calcSupertrend(highs, lows, closes, atrArr);
+
+  const trades = [];
+  let position = 0;   // 0=空倉 1=多倉 -1=空倉
+  let entryPrice = 0;
+  let entryIdx   = 0;
+  let capital    = 100000;
+  let equity     = capital;
+
+  for(let i=20; i<n-1; i++){
+    const rsi  = rsiArr[i]  ?? 50;
+    const hist = histArr[i] ?? 0;
+    const histP= histArr[i-1] ?? 0;
+    const macdCross = hist > 0 && histP <= 0; // 金叉
+    const macdDeath = hist < 0 && histP >= 0; // 死叉
+    const st   = stDir[i] === 1;
+    const abEMA= e20[i] > e50[i];
+    const atr  = atrArr[i] ?? closes[i]*0.02;
+    const price= closes[i+1]; // 下一根開盤執行
+
+    // ── 進場：多頭訊號 ──
+    if(position===0 && st && abEMA && (macdCross || rsi < 35)){
+      position   = 1;
+      entryPrice = price;
+      entryIdx   = i+1;
+    }
+    // ── 進場：空頭訊號（若為美股才做空）──
+    // else if(position===0 && !st && !abEMA && (macdDeath || rsi > 65)){
+    //   position=-1; entryPrice=price; entryIdx=i+1;
+    // }
+
+    // ── 出場：多頭停損/停利 ──
+    if(position===1){
+      const sl  = entryPrice - 2.5 * atr; // 停損 2.5 ATR
+      const tp  = entryPrice + 5.0 * atr; // 停利 5.0 ATR (RR=1:2)
+      const stop= !st || macdDeath || rsi > 70;
+      if(closes[i] <= sl || closes[i] >= tp || stop){
+        const pnl   = (closes[i] - entryPrice) / entryPrice * 100;
+        const held  = i - entryIdx;
+        equity      *= (1 + pnl/100);
+        trades.push({
+          type:'多頭', entry:+entryPrice.toFixed(2), exit:+closes[i].toFixed(2),
+          pnl:+pnl.toFixed(2), held, win:pnl>0,
+          entryDate: bars[entryIdx]?.date||'', exitDate: bars[i]?.date||''
+        });
+        position=0;
+      }
+    }
+  }
+
+  if(!trades.length) return null;
+
+  const wins     = trades.filter(t=>t.win);
+  const losses   = trades.filter(t=>!t.win);
+  const winRate  = wins.length / trades.length * 100;
+  const avgWin   = wins.length  ? wins.reduce((a,t)=>a+t.pnl,0)/wins.length   : 0;
+  const avgLoss  = losses.length? losses.reduce((a,t)=>a+t.pnl,0)/losses.length: 0;
+  const profitFactor = avgLoss!==0 ? Math.abs(avgWin*wins.length / (avgLoss*losses.length)) : 99;
+
+  // 最大回撤
+  let peak=100000, maxDD=0, runEq=100000;
+  for(const t of trades){
+    runEq *= (1+t.pnl/100);
+    if(runEq>peak) peak=runEq;
+    const dd=(peak-runEq)/peak*100;
+    if(dd>maxDD) maxDD=dd;
+  }
+
+  return {
+    trades: trades.slice(-10), // 最近10筆
+    total:  trades.length,
+    wins:   wins.length,
+    losses: losses.length,
+    winRate:     +winRate.toFixed(1),
+    avgWin:      +avgWin.toFixed(2),
+    avgLoss:     +avgLoss.toFixed(2),
+    profitFactor:+profitFactor.toFixed(2),
+    maxDrawdown: +maxDD.toFixed(1),
+    finalEquity: +equity.toFixed(0),
+    totalReturn: +((equity-100000)/100000*100).toFixed(1),
+  };
+}
+
+// ══════════════════════════════════════════════════════
+//  籌碼分析：借券/外資/融資 散戶關係估算
+//  （基於技術面代理指標，因台股籌碼API需登入）
+// ══════════════════════════════════════════════════════
+function calcChipAnalysis(bars, fund){
+  const n = bars.length;
+  const closes = bars.map(b=>b.close);
+  const vols   = bars.map(b=>b.volume);
+  const volMA  = sma(vols, 20);
+
+  // 代理指標計算
+  // 外資動向代理：大量 + 上漲 = 外資買入，大量 + 下跌 = 外資賣出
+  let fiiNetBuy = 0;
+  for(let i=Math.max(0,n-20); i<n; i++){
+    const v   = vols[i] || 0;
+    const vma = volMA[i] || v;
+    const volRatio = vma > 0 ? v/vma : 1;
+    if(volRatio > 1.5){
+      fiiNetBuy += closes[i] >= (closes[i-1]||closes[i]) ? volRatio : -volRatio;
+    }
+  }
+
+  // 融資餘額代理：散戶通常在高點加碼（逆向指標）
+  // 用 RSI + 成交量估算
+  const rsiArr = calcRSI(closes);
+  const rsiNow = rsiArr[n-1] ?? 50;
+  // RSI > 70 且量增 → 散戶追高（看空信號）
+  // RSI < 30 且量縮 → 散戶恐慌（看多信號）
+  const marginSentiment = rsiNow > 70 ? '散戶融資追高（警惕）' :
+                          rsiNow < 30 ? '散戶恐慌殺低（機會）' :
+                          rsiNow > 55 ? '融資温和增加' : '融資態度中性';
+
+  // 借券空單代理：short_ratio（來自 Yahoo Fund）
+  const shortRatio = fund?.shortRatio ?? null;
+  let shortSignal = '無數據';
+  if(shortRatio !== null){
+    shortSignal = shortRatio > 10 ? `空單壓力大 (${shortRatio}天回補)` :
+                  shortRatio > 5  ? `空單中等 (${shortRatio}天)` :
+                                    `空單少 (${shortRatio}天)`;
+  }
+
+  // K 線缺口分析
+  const gaps = detectGaps(bars);
+  const openGaps    = gaps.filter(g=>!g.filled).slice(-5);
+  const recentGaps  = gaps.slice(-3);
+
+  // 外資買賣方向
+  const fiiDir = fiiNetBuy > 3 ? '📈 外資估計淨買入' :
+                 fiiNetBuy < -3? '📉 外資估計淨賣出' :
+                                 '⚖️ 外資方向中性';
+
+  // 散戶與主力關係
+  const retailVsSmart = rsiNow > 65 && fiiNetBuy < 0 ? '⚠️ 散戶追高、主力出貨（危險）' :
+                        rsiNow < 35 && fiiNetBuy > 0 ? '✅ 散戶恐慌、主力吸籌（機會）' :
+                        fiiNetBuy > 3                ? '📈 主力推升、跟隨為宜' :
+                        fiiNetBuy < -3               ? '📉 主力出場、謹慎觀望' :
+                                                       '⚖️ 多空均衡、觀望為主';
+
+  return {
+    fii_net:         +fiiNetBuy.toFixed(1),
+    fii_dir:         fiiDir,
+    margin_sentiment:marginSentiment,
+    short_ratio:     shortRatio,
+    short_signal:    shortSignal,
+    retail_vs_smart: retailVsSmart,
+    open_gaps:       openGaps,
+    recent_gaps:     recentGaps,
+    total_gaps:      gaps.length,
+    unfilled_gaps:   openGaps.length,
+  };
+}
+
+
+
 
 /* ═══════════════════════════════════════════════
    GLOBALS
@@ -1759,6 +2077,7 @@ function analyze(bars, ticker, quoteData){
   // EMAs
   const e8   = ema(closes,8);
   const e20  = ema(closes,20);
+  const e30  = ema(closes,30);
   const e50  = ema(closes,50);
   const e200 = ema(closes,200);
   const ma20 = sma(closes,20);
@@ -1797,11 +2116,24 @@ function analyze(bars, ticker, quoteData){
   const chopArr = calcChop(highs,lows,closes);
   const chop = chopArr[n-1]??50;
 
-  // ── ICT/SMC 計算（try-catch 保護，不影響主流程）──
+  // ── ICT/SMC 計算 ──
   let ictSmc = { score:0,fvg:0,ob:0,bos:false,choch:false,po3:'None',
                  killzone:false,ote:0,signal:'NEUTRAL',
                  fvg_count:0,ob_count:0,bos_count:0,choch_count:0,dist_count:0 };
   try{ ictSmc = calcICTSMCScore(bars, ticker, atrArr); }catch(e){ console.warn('[ICT]',e.message); }
+
+  // ── OFI 訂單流計算 ──
+  let ofiResult = { score:50, signal:'NEUTRAL', ofi_curr:0, ofi_z:0,
+                    ofi_trend:'neutral', ofi_bull_div:false, ofi_bear_div:false };
+  try{ ofiResult = calcOFIScore(bars); }catch(e){ console.warn('[OFI]',e.message); }
+
+  // ── K 線缺口偵測 ──
+  let gapAnalysis = [];
+  try{ gapAnalysis = detectGaps(bars); }catch(e){ console.warn('[GAP]',e.message); }
+
+  // ── 回測 ──
+  let backtestResult = null;
+  try{ backtestResult = runBacktest(bars, ticker); }catch(e){ console.warn('[BT]',e.message); }
 
   // R²
   const r2Arr = calcR2(closes);
@@ -1813,8 +2145,35 @@ function analyze(bars, ticker, quoteData){
 
   // OBV
   const obvArr = calcOBV(closes,vols);
-  const obvMA = sma(obvArr,20);
+  const obvMA  = sma(obvArr,20);
   const obvTrend = obvArr[n-1] > (obvMA[n-1]??0) ? 'Bullish' : 'Bearish';
+  // OBV × EMA30 交叉
+  const obvSlope    = (obvArr[n-1]||0) - (obvArr[n-6]||0);
+  const e30Slope    = (e30[n-1]||0) - (e30[n-6]||0);
+  const obvCrossUp  = obvSlope>0 && (obvArr[n-2]||0)<=(obvMA[n-2]||0) && (obvArr[n-1]||0)>(obvMA[n-1]||0);
+  const obvCrossDown= obvSlope<0 && (obvArr[n-2]||0)>=(obvMA[n-2]||0) && (obvArr[n-1]||0)<(obvMA[n-1]||0);
+  const obvAboveMA3 = [0,1,2].every(j=>(obvArr[n-1-j]||0)>(obvMA[n-1-j]||0));
+  const obvBelowMA3 = [0,1,2].every(j=>(obvArr[n-1-j]||0)<(obvMA[n-1-j]||0));
+  // OBV 四大秘訣
+  const priceHi20   = Math.max(...closes.slice(-20));
+  const priceLo20   = Math.min(...closes.slice(-20));
+  const obvHi20     = Math.max(...obvArr.slice(-20));
+  const obvLo20     = Math.min(...obvArr.slice(-20));
+  const obvSecret1  = obvArr[n-1]>=obvHi20*0.98 && price<priceHi20*0.98;
+  const obvSecret2  = obvArr[n-1]<=obvLo20*1.02 && price>priceLo20*1.02;
+  const obvSecret3  = Math.abs(obvArr[n-1])>Math.abs(obvArr[n-6]||1)*1.3;
+  const obvSecret4  = vols[n-1]>(volMA20[n-1]||0) && closes[n-1]>closes[n-2] && obvTrend==='Bullish';
+  const obv4Secrets = (obvSecret1?1:0)+(obvSecret2?1:0)+(obvSecret3?1:0)+(obvSecret4?1:0);
+  // BB 中線 + Slope 斜率交點
+  const bbMidSlope  = (bbMid[n-1]!=null&&bbMid[n-6]!=null)?bbMid[n-1]-bbMid[n-6]:0;
+  const priceSlope5 = linReg(closes.slice(-6));
+  const bbSlopeBull = priceSlope5>0 && bbMidSlope>0 && price>(bbMid[n-1]||0);
+  const bbSlopeBear = priceSlope5<0 && bbMidSlope<0 && price<(bbMid[n-1]||0);
+  const bbWidth     = bbUp[n-1]!=null&&bbLo[n-1]!=null?(bbUp[n-1]-bbLo[n-1])/price:0;
+  const bbWidthPrev = bbUp[n-6]!=null&&bbLo[n-6]!=null?(bbUp[n-6]-bbLo[n-6])/price:0;
+  const bbSqueeze   = bbWidthPrev>0 && bbWidth<bbWidthPrev*0.7;
+  const bbBreakUp   = bbSqueeze && price>(bbUp[n-1]||0);
+  const bbBreakDown = bbSqueeze && price<(bbLo[n-1]||0);
 
   // Volume ratio
   const volMA20 = sma(vols,20);
@@ -1839,78 +2198,427 @@ function analyze(bars, ticker, quoteData){
   const ret12m = n>252 ? (price/closes[n-252]-1)*100 : (price/closes[0]-1)*100;
 
   // ── SCORING ──────────────────────────────────────
-  let buy=0, sell=0;
-  const sigs=[];
+/* ═══════════════════════════════════════════════════════════
+   MJ 狙擊手 v9 — 統一淨分評分系統
+   規則：每個指標直接給 正分(看多) 或 負分(看空)
+   score = Σ所有項目分數（可正可負）
+   Strong Buy  ≥ +30
+   Buy         ≥ +15
+   Hold        -14 ~ +14
+   Sell        ≤ -15
+   Strong Sell ≤ -30
+   設計原則：
+   - 買賣對稱（同一指標的多空分值相同）
+   - 越強的指標分值越高
+   - 總分範圍約 -140 ~ +140（正常單股大約 -60 ~ +60）
+═══════════════════════════════════════════════════════════ */
 
-  // RSI
-  if(rsi<30){buy+=8;sigs.push({t:'RSI超賣',c:'buy'});}
-  else if(rsi<40){buy+=4;sigs.push({t:'RSI偏低',c:'buy'});}
-  else if(rsi>70){sell+=8;sigs.push({t:'RSI超買',c:'sell'});}
-  else if(rsi>60){sell+=4;sigs.push({t:'RSI偏高',c:'sell'});}
+  let score = 0;  // 統一淨分
+  const sigs = [];
+  const S = (pt, label, cat) => {
+    score += pt;
+    sigs.push({ t: label, c: cat, pt });
+  };
 
-  // MACD
-  if(histV>0){buy+=5;sigs.push({t:'MACD正柱',c:'buy'});}
-  else{sell+=5;sigs.push({t:'MACD負柱',c:'sell'});}
-  if(macdJustCross){buy+=6;sigs.push({t:'🔥MACD金叉',c:'buy'});}
+  // ══════════════════════════════════════════════════════
+  // 一、動量指標（Momentum）權重 25%
+  // ══════════════════════════════════════════════════════
 
-  // KDJ
-  if(kdjK>kdjD && kdjJ<80){buy+=5;sigs.push({t:'KDJ多排',c:'buy'});}
-  else if(kdjK<kdjD && kdjJ>20){sell+=5;sigs.push({t:'KDJ空排',c:'sell'});}
+  // RSI (最大 ±8)
+  if(rsi < 25)       S(+8, 'RSI極度超賣(<25)',  'buy');
+  else if(rsi < 30)  S(+6, 'RSI超賣(<30)',       'buy');
+  else if(rsi < 40)  S(+3, 'RSI偏低(30~40)',     'buy');
+  else if(rsi > 80)  S(-8, 'RSI極度超買(>80)',   'sell');
+  else if(rsi > 70)  S(-6, 'RSI超買(>70)',        'sell');
+  else if(rsi > 60)  S(-3, 'RSI偏高(60~70)',      'sell');
 
-  // EMA
-  if(e8[n-1]>e20[n-1]&&e20[n-1]>e50[n-1]){buy+=8;sigs.push({t:'EMA多頭排列',c:'buy'});}
-  else if(e8[n-1]<e20[n-1]&&e20[n-1]<e50[n-1]){sell+=8;sigs.push({t:'EMA空頭排列',c:'sell'});}
+  // MACD (最大 ±8)
+  if(macdJustCross)  S(+8, '🔥 MACD 金叉',       'buy');
+  else if(histV > 0) S(+4, 'MACD 正柱(動能多)',   'buy');
+  else               S(-4, 'MACD 負柱(動能空)',   'sell');
 
-  // BB
-  if(bbPos<10){buy+=6;sigs.push({t:'BB下軌反彈',c:'buy'});}
-  else if(bbPos>90){sell+=6;sigs.push({t:'BB上軌壓力',c:'sell'});}
+  // KDJ (最大 ±5)
+  if(kdjK > kdjD && kdjJ < 80)   S(+5, 'KDJ 多頭排列',  'buy');
+  else if(kdjK < kdjD && kdjJ > 20) S(-5, 'KDJ 空頭排列', 'sell');
 
-  // Supertrend
-  if(stDir[n-1]===1){buy+=5;sigs.push({t:'Supertrend多頭',c:'buy'});}
-  else{sell+=5;sigs.push({t:'Supertrend空頭',c:'sell'});}
+  // ══════════════════════════════════════════════════════
+  // 二、趨勢指標（Trend）權重 20%
+  // ══════════════════════════════════════════════════════
 
-  // OBV
-  if(obvTrend==='Bullish'&&volRatio>1.2){buy+=5;sigs.push({t:'OBV強勢',c:'buy'});}
-  else if(obvTrend==='Bearish'){sell+=3;sigs.push({t:'OBV弱勢',c:'sell'});}
+  // EMA 排列 (最大 ±8)
+  if(e8[n-1]>e20[n-1] && e20[n-1]>e50[n-1])      S(+8, 'EMA 多頭排列(8>20>50)',   'buy');
+  else if(e8[n-1]<e20[n-1] && e20[n-1]<e50[n-1]) S(-8, 'EMA 空頭排列(8<20<50)',   'sell');
 
-  // Volume + price
-  if(volRatio>2&&closes[n-1]>closes[n-2]){buy+=5;sigs.push({t:'量價齊揚',c:'buy'});}
-  else if(volRatio>2&&closes[n-1]<closes[n-2]){sell+=5;sigs.push({t:'放量下跌',c:'sell'});}
+  // Supertrend (最大 ±5)
+  if(stDir[n-1] === 1)  S(+5, 'Supertrend 多頭',  'buy');
+  else                   S(-5, 'Supertrend 空頭',  'sell');
 
-  // Chop
-  if(chop<38.2){buy+=4;sigs.push({t:'強趨勢確認',c:'buy'});}
-  else if(chop>61.8){sell+=2;sigs.push({t:'震盪市場',c:'info'});}
-
-  // MFI
-  if(mfi<20){buy+=5;sigs.push({t:'MFI超賣',c:'buy'});}
-  else if(mfi>80){sell+=5;sigs.push({t:'MFI超買',c:'sell'});}
-
-  // Fib golden pocket
-  const hi = Math.max(...highs.slice(-60)), lo = Math.min(...lows.slice(-60));
-  const fib618=(hi-lo)*0.618+lo, fib786=(hi-lo)*0.786+lo;
-  const inGolden = price>=fib618 && price<=fib786;
-  if(inGolden){buy+=4;sigs.push({t:'黃金口袋區',c:'buy'});}
-
-  // MA200
-  const aboveMA200 = e200[n-1]!=null && price>e200[n-1];
-  if(e200[n-1]!=null){
-    if(aboveMA200){buy+=4;sigs.push({t:'站上MA200',c:'buy'});}
-    else{sell+=4;sigs.push({t:'跌破MA200',c:'sell'});}
+  // MA200 (最大 ±4)
+  if(e200[n-1] != null){
+    if(price > e200[n-1])  S(+4, '站上 MA200',    'buy');
+    else                    S(-4, '跌破 MA200',    'sell');
   }
 
-  // ── ICT/SMC 評分加成 ──
-  if(ictSmc.bos)              { buy  += 4; sigs.push({t:'BOS 結構突破',  c:'buy'}); }
-  if(ictSmc.choch)            { buy  += 5; sigs.push({t:'CHOCH 趨勢轉換',c:'buy'}); }
-  if(ictSmc.fvg > 0)          { buy  += 3; sigs.push({t:'FVG 多頭缺口',  c:'buy'}); }
-  if(ictSmc.fvg < 0)          { sell += 3; sigs.push({t:'FVG 空頭缺口',  c:'sell'}); }
-  if(ictSmc.ote === 1)        { buy  += 5; sigs.push({t:'OTE 最佳進場',  c:'buy'}); }
-  if(ictSmc.ote === -1)       { sell += 5; sigs.push({t:'OTE 空頭進場',  c:'sell'}); }
-  if(ictSmc.po3==='Distribution'){ buy += 3; sigs.push({t:'PO3 分配階段',c:'buy'}); }
-  if(ictSmc.signal==='BUY')   { buy  +=10; sigs.push({t:'ICT 買入共振',  c:'buy'}); }
-  if(ictSmc.signal==='SELL')  { sell +=10; sigs.push({t:'ICT 賣出共振',  c:'sell'}); }
+  // Chop (最大 ±3)
+  if(chop < 38.2)    S(+3, '趨勢市場(Chop<38)',  'buy');
+  else if(chop > 61.8) S(-3, '震盪市場(Chop>62)', 'sell');
 
-  const total = buy - sell;
-  const signal = total>=20?'Strong Buy':total>=10?'Buy':total<=-20?'Strong Sell':total<=-10?'Sell':'Hold';
+  // ══════════════════════════════════════════════════════
+  // 三、布林帶（Bollinger Bands）權重 8%
+  // ══════════════════════════════════════════════════════
+
+  // BB 位置 (最大 ±6)
+  if(bbPos < 10)      S(+6, 'BB 下軌超賣反彈',   'buy');
+  else if(bbPos < 25) S(+3, 'BB 下方偏低',        'buy');
+  else if(bbPos > 90) S(-6, 'BB 上軌超買壓力',    'sell');
+  else if(bbPos > 75) S(-3, 'BB 上方偏高',        'sell');
+
+  // BB + Slope 交點 (最大 ±6)
+  if(bbBreakUp)          S(+8, '🔥 BB 緊縮向上突破', 'buy');
+  else if(bbBreakDown)   S(-8, '🔥 BB 緊縮向下突破', 'sell');
+  else if(bbSlopeBull)   S(+5, 'BB+Slope 多頭交點',  'buy');
+  else if(bbSlopeBear)   S(-5, 'BB+Slope 空頭交點',  'sell');
+  if(bbSqueeze && !bbBreakUp && !bbBreakDown) sigs.push({t:'⏳ BB 緊縮待突破', c:'info', pt:0});
+
+  // ══════════════════════════════════════════════════════
+  // 四、成交量（Volume）權重 8%
+  // ══════════════════════════════════════════════════════
+
+  // OBV 趨勢 (最大 ±5)
+  if(obvTrend === 'Bullish' && volRatio > 1.2) S(+5, 'OBV 強勢(量能支撐)',  'buy');
+  else if(obvTrend === 'Bearish')              S(-4, 'OBV 弱勢(量能流失)',  'sell');
+
+  // 量價配合 (最大 ±5)
+  if(volRatio > 2 && closes[n-1] > closes[n-2])      S(+5, '🔥 放量上漲(量價齊揚)', 'buy');
+  else if(volRatio > 2 && closes[n-1] < closes[n-2]) S(-5, '🔥 放量下跌(量價背離)', 'sell');
+
+  // MFI (最大 ±5)
+  if(mfi < 20)       S(+5, 'MFI 資金超賣(<20)',   'buy');
+  else if(mfi < 30)  S(+2, 'MFI 資金偏低',        'buy');
+  else if(mfi > 80)  S(-5, 'MFI 資金超買(>80)',   'sell');
+  else if(mfi > 70)  S(-2, 'MFI 資金偏高',        'sell');
+
+  // OBV × EMA30 交叉 (最大 ±8)
+  if(obvCrossUp)         S(+8, '🔥 OBV 上穿均線(金叉)',  'buy');
+  else if(obvCrossDown)  S(-8, '🔥 OBV 下穿均線(死叉)',  'sell');
+  else if(obvAboveMA3)   S(+3, 'OBV 連3根 > 均線',       'buy');
+  else if(obvBelowMA3)   S(-3, 'OBV 連3根 < 均線',       'sell');
+
+  // OBV 四大秘訣 (最大 +25，空頭版對稱)
+  if(obvSecret1)           S(+7, 'OBV秘訣①：量先行(積聚看多)',  'buy');
+  if(obvSecret2)           S(+8, 'OBV秘訣②：底部背離(看多)',    'buy');
+  if(obvSecret3)           S(+4, 'OBV秘訣③：主力急買',          'buy');
+  if(obvSecret4)           S(+4, 'OBV秘訣④：量價同向',          'buy');
+  if(obv4Secrets >= 3)     S(+5, '🔥 OBV四訣 3+項共振',         'buy');
+  // 空頭版：OBV 急跌 = 主力急賣
+  if(!obvSecret3 && Math.abs(obvArr[n-1]) < Math.abs(obvArr[n-6]||1)*0.7)
+    S(-4, 'OBV量能急速萎縮(賣壓)',   'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 五、斐波那契（Fibonacci）權重 4%
+  // ══════════════════════════════════════════════════════
+  if(inGolden) S(+4, '黃金口袋區(61.8~78.6%)',  'buy');
+
+  // ══════════════════════════════════════════════════════
+  // 六、道氏理論（Dow Theory）權重 15%
+  // ══════════════════════════════════════════════════════
+
+  // 三重趨勢 (最大 ±10)
+  if(dowTrend3 === 'TripleBull')    S(+10, '🔥 道氏三重多頭(主中短齊揚)',   'buy');
+  else if(dowTrend3 === 'TripleBear') S(-10, '❄️ 道氏三重空頭(主中短齊跌)', 'sell');
+  else if(dowTrend3 === 'MajInterBull') S(+6, '道氏主中期多頭',              'buy');
+  else if(dowTrend3 === 'MajInterBear') S(-6, '道氏主中期空頭',              'sell');
+
+  // 123 法則 (最大 ±8)
+  if(rule123Bull)   S(+8, '道氏123法則：確認多頭',  'buy');
+  else if(rule123Bear) S(-8, '道氏123法則：確認空頭', 'sell');
+
+  // 2B 法則（假突破反轉）(最大 ±6)
+  if(twoBBear)      S(+6, '道氏2B法則：刺高收低(看多)',  'buy');
+  else if(twoBBull) S(-6, '道氏2B法則：刺低收高(看空)',  'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 七、威科夫分析（Wyckoff）權重 10%
+  // ══════════════════════════════════════════════════════
+  if(wySpring)      S(+8, '🔥 威科夫 Spring(彈簧底)',    'buy');
+  else if(wySOW)    S(-6, '威科夫 SOW(弱勢信號)',         'sell');
+  if(wySOS)         S(+7, '威科夫 SOS(強勢信號)',         'buy');
+  else if(wyUpthrust) S(-7, '威科夫 Upthrust(上推陷阱)', 'sell');
+  if(wyPhase === 'Phase E (Markup)')           S(+5, '威科夫 E期(標漲階段)',   'buy');
+  else if(wyPhase === 'Phase A/B (Distribution)') S(-5, '威科夫 AB期(派發)',  'sell');
+  else if(wyPhase === 'Phase C/D (Testing/SOS)')  S(+3, '威科夫 CD期(測試)',  'buy');
+
+  // ══════════════════════════════════════════════════════
+  // 八、OFI 訂單流（Order Flow）權重 8%
+  // ══════════════════════════════════════════════════════
+  if(ofiResult.signal === 'BUY')        S(+8, 'OFI買壓強勢(Z>1.5)',       'buy');
+  else if(ofiResult.signal === 'SELL')  S(-8, 'OFI賣壓強勢(Z<-1.5)',      'sell');
+  if(ofiResult.ofi_bull_div)            S(+6, 'OFI底背離(趨勢反轉看多)',   'buy');
+  else if(ofiResult.ofi_bear_div)       S(-6, 'OFI頂背離(趨勢反轉看空)',   'sell');
+  if(ofiResult.ofi_z > 2)              S(+4, 'OFI極端買壓(Z>2)',           'buy');
+  else if(ofiResult.ofi_z < -2)        S(-4, 'OFI極端賣壓(Z<-2)',          'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 九、ICT/SMC 智能資金（核心佔比 20%）
+  //     OTE 為最高權重項目（核心進場訊號）
+  // ══════════════════════════════════════════════════════
+
+  // 結構訊號 (最大 ±12)
+  if(ictSmc.bos)            S(+5, '🔲 BOS 結構突破(看多)',   'buy');
+  else if(!ictSmc.bos && ictSmc.choch) {} // CHOCH 單獨處理
+  if(ictSmc.choch)          S(+7, '🔄 CHOCH 趨勢轉換(看多)', 'buy');
+
+  // FVG 缺口 (最大 ±5)
+  if(ictSmc.fvg > 0)        S(+5, '🕳️ FVG 多頭公允缺口',     'buy');
+  else if(ictSmc.fvg < 0)   S(-5, '🕳️ FVG 空頭公允缺口',     'sell');
+
+  // ★ OTE 最佳進場（核心，最大 +19 多頭 / -16 空頭）
+  if(ictSmc.ote === 1){
+    S(+12, '🎯 OTE 多頭最佳進場(61.8~78.6%)', 'buy');
+    if(ictSmc.killzone) S(+4, '⚡ OTE+Killzone 時段共振',  'buy');
+    if(ictSmc.fvg > 0)  S(+4, '⚡ OTE+FVG 雙重確認',       'buy');
+    if(ictSmc.bos)      S(+3, '⚡ OTE+BOS 三重確認',        'buy');
+  } else if(ictSmc.ote === -1){
+    S(-12, '🎯 OTE 空頭最佳進場(61.8~78.6%)', 'sell');
+    if(ictSmc.killzone) S(-4, '⚡ OTE+Killzone 空頭共振',   'sell');
+    if(ictSmc.fvg < 0)  S(-4, '⚡ OTE+FVG 空頭確認',        'sell');
+  }
+
+  // PO3 & Killzone (最大 ±4)
+  if(ictSmc.po3 === 'Distribution')  S(+4, '📊 PO3 分配階段(看多)',   'buy');
+  else if(ictSmc.po3 === 'Manipulation') S(-3, '📊 PO3 操縱階段(謹慎)', 'sell');
+  if(ictSmc.killzone && ictSmc.ote === 0) S(+2, '⏰ Silver Bullet Killzone', 'buy');
+
+  // ICT 全條件共振 (最大 ±12)
+  if(ictSmc.signal === 'BUY')  S(+12, '✅ ICT 全條件買入共振',  'buy');
+  else if(ictSmc.signal === 'SELL') S(-12, '🚫 ICT 全條件賣出共振', 'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 十、五大先行指標評分
+  // ══════════════════════════════════════════════════════
+  // L1 廣度
+  if(obvTrend==='Bullish'&&volRatio>1.5)   S(+5,'L1廣度：量能強勢擴張','buy');
+  else if(obvTrend==='Bearish'&&volRatio>1.3) S(-4,'L1廣度：量能萎縮賣壓','sell');
+  // L2 情緒
+  if(rsi<25||kdjJ<10)                      S(+4,'L2情緒：極度恐慌(底部機會)','buy');
+  else if(rsi>75||kdjJ>90)                 S(-4,'L2情緒：極度貪婪(頂部風險)','sell');
+  if(stochRSI<10)                          S(+3,'L2情緒：StochRSI極度超賣','buy');
+  else if(stochRSI>90)                     S(-3,'L2情緒：StochRSI極度超買','sell');
+  // L3 資金
+  if(ofiResult.ofi_z>2.5&&mfi<60)         S(+5,'L3資金：主力強力介入','buy');
+  else if(ofiResult.ofi_z<-2.5&&mfi>40)   S(-5,'L3資金：主力大量撤出','sell');
+  if(mfi>20&&mfi<40&&obvTrend==='Bullish') S(+3,'L3資金：MFI低位回升','buy');
+  // L4 宏觀
+  if(aboveMA200&&slope>0&&adx>25)          S(+5,'L4宏觀：趨勢強勢(MA200+ADX)','buy');
+  else if(!aboveMA200&&slope<0&&adx>25)    S(-5,'L4宏觀：趨勢弱勢(MA200+ADX)','sell');
+  if(adx<15)                               S(-2,'L4宏觀：ADX極弱(無趨勢)','sell');
+  // L5 結構複合
+  const structScore = (ictSmc.score>70?3:ictSmc.score<30?-2:0)
+                    + (dowTrend3==='TripleBull'?3:dowTrend3==='TripleBear'?-3:0)
+                    + ((wySpring||wySOS)?2:(wyUpthrust||wySOW)?-2:0);
+  if(structScore>=5)      S(+6,'L5結構：ICT+道氏+威科夫三重共振','buy');
+  else if(structScore>=3) S(+3,'L5結構：結構偏多','buy');
+  else if(structScore<=-5)S(-6,'L5結構：結構全面轉空','sell');
+  else if(structScore<=-3)S(-3,'L5結構：結構偏空','sell');
+
+  // ══════════════════════════════════════════════════════
+  // 十一、風控反向訊號
+  // ══════════════════════════════════════════════════════
+  if(var95<-5)           S(-3,`⚠️ VaR95風險偏高(${var95.toFixed(1)}%)`,'sell');
+  if(cvar99<-8)          S(-4,`⚠️ CVaR99極端風險(${cvar99.toFixed(1)}%)`,'sell');
+  const upGaps  = gapAnalysis.filter(g=>g.dir==='up'  &&!g.filled&&g.size>0.5);
+  const downGaps= gapAnalysis.filter(g=>g.dir==='down'&&!g.filled&&g.size>0.5);
+  if(upGaps.length>0)   S(-3,`🕳️ 上方${upGaps.length}個未填缺口(壓力)`,'sell');
+  if(downGaps.length>0) S(+3,`🕳️ 下方${downGaps.length}個未填缺口(支撐)`,'buy');
+
+  // ══════════════════════════════════════════════════════
+  // 十二、籌碼訊號評分
+  // ══════════════════════════════════════════════════════
+  if(rsi>65&&obvTrend==='Bearish') S(-4,'⚠️ 散戶追高主力出貨','sell');
+  if(rsi<35&&obvTrend==='Bullish') S(+4,'✅ 散戶恐慌主力吸籌','buy');
+  const shortR = fund?.shortRatio||null;
+  if(shortR!==null&&shortR>10) S(+3,`🩳 空單大(${shortR}天,軋空潛力)`,'buy');
+  if(shortR!==null&&shortR<2)  S(-1,'空單極少(無反彈支撐)','sell');
+
+  // ══════════════════════════════════════════════════════
+  // 十三、K 線型態評分（23種型態，最近5根K線）
+  //   強力型態 ±8，標準型態 ±5，弱訊型態 ±3
+  // ══════════════════════════════════════════════════════
+  const recentPats = patterns.filter(p => p.i >= n-5); // 最近5根K線型態
+  // 定義型態分值（按強度）
+  const patScores = {
+    // 強力看多型態 +8
+    '多頭吞噬 Bullish Engulfing':  +8, '晨星 Morning Star':         +8,
+    '三白兵 Three White Soldiers': +8, '穿刺線 Piercing Line':       +8,
+    // 標準看多型態 +5
+    '鎚子線 Hammer':               +5, '倒錘線 Inverted Hammer':     +5,
+    '蜻蜓十字 Dragonfly Doji':     +5, '多頭光腳 Bull Marubozu':     +5,
+    '平底 Tweezer Bottom':         +5, '上升三法 Rising Three Methods':+5,
+    // 弱看多型態 +3
+    '多頭孕線 Bullish Harami':     +3,
+    // 強力看空型態 -8
+    '空頭吞噬 Bearish Engulfing':  -8, '暮星 Evening Star':          -8,
+    '三烏鴉 Three Black Crows':    -8, '烏雲蓋頂 Dark Cloud Cover':  -8,
+    // 標準看空型態 -5
+    '上吊線 Hanging Man':          -5, '射擊之星 Shooting Star':     -5,
+    '墓碑十字 Gravestone Doji':    -5, '空頭光腳 Bear Marubozu':     -5,
+    '平頂 Tweezer Top':            -5,
+    // 弱看空型態 -3
+    '空頭孕線 Bearish Harami':     -3,
+    // 中性（不計分）
+    '十字星 Doji': 0, '紡錘線 Spinning Top': 0,
+  };
+  let patTotalScore = 0;
+  const scoredPats = [];
+  for(const pat of recentPats){
+    const pt = patScores[pat.name];
+    if(pt !== undefined && pt !== 0){
+      // 避免同類型態重複計分（取最新一個）
+      const existing = scoredPats.find(p=>p.name===pat.name);
+      if(!existing){
+        scoredPats.push({...pat, pt});
+        patTotalScore += pt;
+        // 用 S() 統一記錄（可被 sigs 收集並計入 score）
+        S(pt, `🕯️ ${pat.name}`, pt>0?'buy':'sell');
+      }
+    }
+  }
+  // 型態共振加成（同方向多個型態）
+  const bullPats = scoredPats.filter(p=>p.pt>0);
+  const bearPats = scoredPats.filter(p=>p.pt<0);
+  if(bullPats.length >= 2){ S(+4, `🕯️ 型態共振：${bullPats.length}個看多型態`, 'buy'); }
+  if(bearPats.length >= 2){ S(-4, `🕯️ 型態共振：${bearPats.length}個看空型態`, 'sell'); }
+
+  // ══════════════════════════════════════════════════════
+  // 十四、技術指標補充評分（ADX/StochRSI/R²/HistVol/RSI背離）
+  // ══════════════════════════════════════════════════════
+
+  // ADX 趨勢強度（獨立計分）
+  if(adx > 40)          S(+4, `ADX超強趨勢(${adx.toFixed(0)})`, pdiV>ndiV?'buy':'sell');
+  else if(adx > 25)     S(+2, `ADX強趨勢(${adx.toFixed(0)})`,   pdiV>ndiV?'buy':'sell');
+
+  // PDI vs NDI 方向
+  if(pdiV > ndiV && adx > 20) S(+3, 'ADX多頭主導(PDI>NDI)', 'buy');
+  else if(ndiV > pdiV && adx > 20) S(-3, 'ADX空頭主導(NDI>PDI)', 'sell');
+
+  // R²（趨勢確定性）
+  if(r2 > 0.85)         S(+3, `R²趨勢高確定性(${r2.toFixed(2)})`, slope>0?'buy':'sell');
+  else if(r2 < 0.2)     S(-1, 'R²趨勢極低(盤整狀態)', 'sell');
+
+  // Stochastic RSI
+  if(stochRSI < 5)      S(+4, 'StochRSI極端超賣(<5)',  'buy');
+  else if(stochRSI < 15) S(+2, 'StochRSI超賣(<15)',    'buy');
+  else if(stochRSI > 95) S(-4, 'StochRSI極端超買(>95)', 'sell');
+  else if(stochRSI > 85) S(-2, 'StochRSI超買(>85)',    'sell');
+
+  // 歷史波動率（低波動率 = 趨勢穩定）
+  const hvDaily = hv;
+  if(hvDaily < 0.01)    S(+2, '低波動率(趨勢穩定)', 'buy');
+  if(hvDaily > 0.04)    S(-2, '高波動率(風險偏高)', 'sell');
+
+  // RSI 背離訊號（已在技術指標計算）
+  if(rsiDiv === 'bullish') S(+5, '🔍 RSI底部背離(看多)', 'buy');
+  if(rsiDiv === 'bearish') S(-5, '🔍 RSI頂部背離(看空)', 'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 十五、估值評級（SABCD 五級）納入評分
+  //   基於 PE / PB / ROE / 毛利率 / 負債比 五維度
+  //   S級：頂尖公司（護城河深）
+  //   A級：優質公司
+  //   B級：普通公司（基準，不加減分）
+  //   C級：弱質公司
+  //   D級：劣質/危險公司
+  // ══════════════════════════════════════════════════════
+  // 計算估值評級分數
+  let valRatingScore = 0; let valRatingCount = 0;
+
+  // PE 評分（越低越好，但不能虧損）
+  if(pe !== null){
+    valRatingCount++;
+    if(pe < 0)         valRatingScore += -2;      // 虧損
+    else if(pe < 10)   valRatingScore += 3;        // 極低估
+    else if(pe < 15)   valRatingScore += 2;
+    else if(pe < 25)   valRatingScore += 1;
+    else if(pe < 35)   valRatingScore += 0;
+    else               valRatingScore += -1;       // 高估
+  }
+  // ROE 評分（越高越好）
+  if(roe !== null){
+    valRatingCount++;
+    const roeP = roe * 100;
+    if(roeP >= 25)     valRatingScore += 3;        // 頂尖（護城河）
+    else if(roeP >= 15)valRatingScore += 2;
+    else if(roeP >= 8) valRatingScore += 1;
+    else if(roeP >= 0) valRatingScore += 0;
+    else               valRatingScore += -2;       // 虧損
+  }
+  // 毛利率評分
+  if(grossMgn !== null){
+    valRatingCount++;
+    const gmP = grossMgn * 100;
+    if(gmP >= 50)      valRatingScore += 3;        // 高護城河
+    else if(gmP >= 30) valRatingScore += 2;
+    else if(gmP >= 15) valRatingScore += 1;
+    else               valRatingScore += 0;
+  }
+  // 負債比評分（越低越好）
+  if(debtEq !== null){
+    valRatingCount++;
+    if(debtEq < 0.3)   valRatingScore += 2;
+    else if(debtEq < 1)valRatingScore += 1;
+    else if(debtEq < 2)valRatingScore += 0;
+    else               valRatingScore += -2;       // 高負債
+  }
+  // PB 評分
+  if(pb !== null){
+    valRatingCount++;
+    if(pb < 1)         valRatingScore += 2;        // 低於淨值
+    else if(pb < 2)    valRatingScore += 1;
+    else if(pb < 5)    valRatingScore += 0;
+    else               valRatingScore += -1;
+  }
+
+  // 計算平均分數 → 評級
+  const valAvg = valRatingCount > 0 ? valRatingScore / valRatingCount : 0;
+  const valGrade = valAvg >= 2.2 ? 'S' : valAvg >= 1.5 ? 'A' :
+                   valAvg >= 0.5 ? 'B' : valAvg >= -0.5 ? 'C' : 'D';
+
+  // 評級加入評分
+  const gradeScores = { 'S':+12, 'A':+7, 'B':0, 'C':-6, 'D':-12 };
+  const gradeLabels = {
+    'S':'🏆 S級：護城河頂尖公司', 'A':'⭐ A級：優質公司',
+    'B':'📊 B級：普通公司(基準)', 'C':'⚠️ C級：弱質公司', 'D':'🚨 D級：危險公司',
+  };
+  const gradePt = gradeScores[valGrade];
+  if(gradePt !== 0) S(gradePt, gradeLabels[valGrade], gradePt>0?'buy':'sell');
+  else if(valGrade==='B') sigs.push({t:gradeLabels['B'], c:'info', pt:0});
+
+  // 成長性加成（高成長 + 合理估值 = 額外加分）
+  if(epsGr !== null && epsGr > 0.2 && pe !== null && pe < 30)
+    S(+4, `📈 高成長合理估值(EPS成長${(epsGr*100).toFixed(0)}%+PE<30)`, 'buy');
+  if(revGr !== null && revGr > 0.15 && roe !== null && roe > 0.15)
+    S(+3, `📈 營收高成長+高ROE`, 'buy');
+  // 股息安全墊
+  if(divY !== null && divY > 0.04)
+    S(+2, `💰 高股息(${(divY*100).toFixed(1)}%)`, 'buy');
+  // 估值過高警示
+  if(pe !== null && pe > 50 && epsGr !== null && epsGr < 0.1)
+    S(-4, '⚠️ 高PE低成長(估值風險)', 'sell');
+  if(pb !== null && pb > 10)
+    S(-3, `⚠️ PB過高(${pb.toFixed(1)}x，溢價風險)`, 'sell');
+
+  // ══════════════════════════════════════════════════════
+  // 最終計算
+  // ══════════════════════════════════════════════════════
+  const total = score;  // 直接使用淨分
+  const buy   = sigs.filter(s=>s.pt>0).reduce((a,s)=>a+s.pt, 0);
+  const sell  = sigs.filter(s=>s.pt<0).reduce((a,s)=>a+Math.abs(s.pt), 0);
+  const signal = total >= 30 ? 'Strong Buy'  :
+                 total >= 15 ? 'Buy'          :
+                 total <= -30? 'Strong Sell'  :
+                 total <= -15? 'Sell'          : 'Hold';
+
+  co
 
   /* ══════════════════════════════════════════════
      🛡️ 雙重防衛系統 v8.5
@@ -1965,9 +2673,9 @@ function analyze(bars, ticker, quoteData){
   // Squeeze: BB inside KC (Keltner Channel)
   const kcMid  = e20;
   const kcBand = atrArr.map((a,i)=> a!=null ? a*1.5 : null);
-  const bbWidth= bbUp.map((u,i)=> (u!=null&&bbLo[i]!=null) ? (u-bbLo[i])/2 : null);
+  const bbWidthArr= bbUp.map((u,i)=> (u!=null&&bbLo[i]!=null) ? (u-bbLo[i])/2 : null);
   const kcWidth= kcBand.map(b=> b!=null ? b : null);
-  const ttmSqueeze = bbWidth[n-1]!=null && kcWidth[n-1]!=null && bbWidth[n-1] < kcWidth[n-1];
+  const ttmSqueeze = bbWidthArr[n-1]!=null && kcWidth[n-1]!=null && bbWidthArr[n-1] < kcWidth[n-1];
   // TTM momentum: delta of (close - midpoint of BB/KC)
   const ttmMomentum = closes[n-1] - (bbMid[n-1]??closes[n-1]);
   const ttmMomPrev  = closes[n-2] - (bbMid[n-2]??closes[n-2]);
@@ -2133,19 +2841,41 @@ function analyze(bars, ticker, quoteData){
   const comp = +(momScore*.20+valScore*.15+qualScore*.20+growScore*.15+volScore*.10+sentScore*.15+macroScore*.05).toFixed(2);
 
   // ── DOW THEORY ────────────────────────────────────
-  const majUp  = e200[n-1]!=null ? price>e200[n-1] : null;
-  const interUp= ma60[n-1]!=null ? price>ma60[n-1] : null;
-  const minUp  = ma20[n-1]!=null ? price>ma20[n-1] : null;
-  const dowScore = (majUp!=null?(majUp?4:-4):0)+(interUp!=null?(interUp?2:-2):0)+(minUp!=null?(minUp?1:-1):0);
-  const dowSignal = dowScore>=5?'Strong Bullish':dowScore>=2?'Bullish':dowScore<=-5?'Strong Bearish':dowScore<=-2?'Bearish':'Neutral';
+  // Dow Theory 計算 → 已移至 Dow Theory 強化區塊 (dowScore/dowSignal/majTrend/interTrend/minTrend)
 
-  // 123 Rule proxy
-  const peak1=Math.max(...closes.slice(-40,-20)), trough=Math.min(...closes.slice(-30,-10)), peak2=Math.max(...closes.slice(-15));
-  const rule123 = (trough<peak1&&peak2>peak1)?'Buy Break (123法則確認)':
-                  (trough>peak1&&peak2<trough)?'Sell Break (123法則確認)':'待確認';
+    // 123/2B Rule → 見 Dow Theory 強化區塊
   const rule2b  = (price>peak1*(1+0.02)&&histV<0.03*price)?'可能假突破 (2B警示)':'無明顯假突破';
 
-  // ── WYCKOFF ───────────────────────────────────────
+  // ── DOW THEORY 強化 ─────────────────────────────
+  // 道氏三重趨勢（主趨勢/中趨勢/短趨勢）
+  const majTrend  = e200[n-1]!=null ? (price>e200[n-1]?'Bull':'Bear') : 'N/A';
+  const interTrend= ma60[n-1]!=null ? (price>ma60[n-1] ?'Bull':'Bear') : 'N/A';
+  const minTrend  = ma20[n-1]!=null ? (price>ma20[n-1] ?'Bull':'Bear') : 'N/A';
+  const dowTrend3 = majTrend==='Bull'&&interTrend==='Bull'&&minTrend==='Bull' ? 'TripleBull' :
+                    majTrend==='Bear'&&interTrend==='Bear'&&minTrend==='Bear' ? 'TripleBear' :
+                    majTrend==='Bull'&&interTrend==='Bull'                   ? 'MajInterBull' :
+                    majTrend==='Bear'&&interTrend==='Bear'                   ? 'MajInterBear' : 'Mixed';
+
+  // 123法則（更精確版）
+  const peak1   = Math.max(...closes.slice(-40,-20));
+  const trough  = Math.min(...closes.slice(-30,-10));
+  const peak2   = Math.max(...closes.slice(-10));
+  const rule123Bull = peak2>peak1 && trough>Math.min(...closes.slice(-40,-20)) && price>peak1;
+  const rule123Bear = trough<Math.min(...closes.slice(-40,-20)) && peak2<peak1 && price<trough;
+  // 2B 法則（假突破反轉）
+  const swingHi = Math.max(...highs.slice(-20,-1));
+  const swingLo = Math.min(...lows.slice(-20,-1));
+  const twoBBull= highs[n-1]>swingHi && closes[n-1]<swingHi;  // 刺破高點後收低
+  const twoBBear= lows[n-1]<swingLo  && closes[n-1]>swingLo;  // 刺破低點後收高
+
+  // 道氏評分（-10 ~ +10）
+  const dowScore = (majTrend==='Bull'?4:-4) + (interTrend==='Bull'?3:-3) +
+                   (minTrend==='Bull'?2:-2) + (rule123Bull?3:rule123Bear?-3:0) +
+                   (twoBBull?-2:twoBBear?2:0);
+  const dowSignal= dowScore>=8?'Strong Bullish':dowScore>=4?'Bullish':
+                   dowScore<=-8?'Strong Bearish':dowScore<=-4?'Bearish':'Neutral';
+
+  // ── WYCKOFF 強化 ─────────────────────────────────
   const recentSlope = linReg(closes.slice(-20));
   const recentVol   = vols.slice(-20).reduce((a,b)=>a+b,0)/20;
   const prevVol     = vols.slice(-40,-20).reduce((a,b)=>a+b,0)/20;
@@ -2160,16 +2890,37 @@ function analyze(bars, ticker, quoteData){
   const wySOS = stDir[n-1]===1&&macdV>0&&rsi>50&&volRatio>1.3;
   const wySOW = stDir[n-1]===-1&&macdV<0&&rsi<50&&volRatio>1.3;
 
-  // ── RISK ──────────────────────────────────────────
-  const stopLoss = price - 2*atr;
-  const stopPct  = (stopLoss/price-1)*100;
+  // ── RISK 風控計算 ────────────────────────────────
+  const stopLoss    = price - 2.5*atr;          // ATR停損 2.5x
+  const stopLossAgg = price - 1.5*atr;          // 積極停損 1.5x
+  const stopLossCon = price - 3.5*atr;          // 保守停損 3.5x
+  const stopPct     = (stopLoss/price-1)*100;
+  const tgt1        = price + 2.5*atr;          // 停利1 (1:1 RR)
+  const tgt2        = price + 5.0*atr;          // 停利2 (1:2 RR)
+  const tgt3        = price + 7.5*atr;          // 停利3 (1:3 RR)
+
+  // VaR / CVaR
   const rets = closes.map((_,i)=>i===0?0:(closes[i]-closes[i-1])/closes[i-1]);
   const sortedRets = rets.slice(1).sort((a,b)=>a-b);
-  const var95  = sortedRets[Math.floor(sortedRets.length*0.05)]*100;
-  const cvar99 = sortedRets.slice(0,Math.max(1,Math.floor(sortedRets.length*0.01))).reduce((a,b)=>a+b,0)/
-                 Math.max(1,Math.floor(sortedRets.length*0.01))*100;
-  const posSz  = Math.min(50/Math.max(Math.abs(stopPct),1),100).toFixed(1);
-  const tgt1   = price+2.5*atr, tgt2=price+5*atr;
+  const N = sortedRets.length;
+  const var95  = sortedRets[Math.floor(N*0.05)]*100;  // 95% VaR
+  const var99  = sortedRets[Math.floor(N*0.01)]*100;  // 99% VaR
+  const cvar95 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.05))).reduce((a,b)=>a+b,0)/
+                 Math.max(1,Math.floor(N*0.05))*100;
+  const cvar99 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.01))).reduce((a,b)=>a+b,0)/
+                 Math.max(1,Math.floor(N*0.01))*100;
+
+  // Kelly 公式: f = (p*b - q) / b  其中 b=RR, p=估計勝率, q=1-p
+  // 用歷史勝率（上漲天數/總天數）作估計
+  const upDays   = rets.filter(r=>r>0).length;
+  const winRateEst = N > 0 ? upDays/N : 0.5;
+  const rr       = 2.0;  // 目標 RR 1:2
+  const kellyFull= (winRateEst*rr - (1-winRateEst)) / rr;
+  const kellyHalf= Math.max(0, kellyFull/2)*100;   // 半Kelly（更保守）
+  const posSz    = Math.min(kellyHalf, 30).toFixed(1);  // 上限30%
+
+  // 歷史波動率（年化）
+  const hvAnn = (hv * Math.sqrt(252)).toFixed(1);
 
   // Chart bars with indicators (include all for candlestick)
   const chartBars = bars.map((b,i)=>({...b,
@@ -2188,8 +2939,9 @@ function analyze(bars, ticker, quoteData){
   const patterns = detectKPatterns(bars);
 
   return {
-    ticker, signal, buy_score:buy, sell_score:sell, total_score:total,
+    ticker, signal, buy_score:buy, sell_score:sell, net_score:score, total_score:total,
     composite_score:comp, price, signals:sigs,
+    val_grade: valGrade,  val_avg: +valAvg.toFixed(2),
     date: bars[n-1].date,
     technical:{
       rsi:+rsi.toFixed(2), macd:+macdV.toFixed(4), macd_signal:+sigV.toFixed(4),
@@ -2227,7 +2979,104 @@ function analyze(bars, ticker, quoteData){
       dd_reasons:       ddReasons,
       slope_w5:         +slopeW5.toFixed(4),
       slope_w10:        +slopeW10.toFixed(4),
+      // OBV 四大秘訣
+      obv_cross_up:     obvCrossUp,
+      obv_cross_down:   obvCrossDown,
+      obv_above_ma3:    obvAboveMA3,
+      obv_secret1:      obvSecret1,
+      obv_secret2:      obvSecret2,
+      obv_secret3:      obvSecret3,
+      obv_secret4:      obvSecret4,
+      obv_4secrets:     obv4Secrets,
+      // BB + Slope
+      bb_slope_bull:    bbSlopeBull,
+      bb_slope_bear:    bbSlopeBear,
+      bb_squeeze:       bbSqueeze,
+      bb_break_up:      bbBreakUp,
+      bb_break_down:    bbBreakDown,
+      bb_mid_slope:     +bbMidSlope.toFixed(4),
+      price_slope5:     +priceSlope5.toFixed(4),
+      // 道氏三重趨勢
+      dow_trend3:       dowTrend3,
+      dow_score:        dowScore,
+      dow_signal:       dowSignal,
+      rule123_bull:     rule123Bull,
+      rule123_bear:     rule123Bear,
+      two_b_bull:       twoBBear,
+      two_b_bear:       twoBBull,
+      maj_trend:        majTrend,
+      inter_trend:      interTrend,
+      min_trend:        minTrend,
+      // OFI 訂單流
+      ofi_score:        ofiResult.score,
+      ofi_signal:       ofiResult.signal,
+      ofi_curr:         ofiResult.ofi_curr,
+      ofi_z:            ofiResult.ofi_z,
+      ofi_trend:        ofiResult.ofi_trend,
+      ofi_bull_div:     ofiResult.ofi_bull_div,
+      ofi_bear_div:     ofiResult.ofi_bear_div,
+      // 估值評級
+      val_grade:        valGrade,
+      val_avg:          +valAvg.toFixed(2),
+      val_count:        valRatingCount,
+      // K線型態
+      pat_count_bull:   scoredPats.filter(p=>p.pt>0).length,
+      pat_count_bear:   scoredPats.filter(p=>p.pt<0).length,
     },
+    // K 線缺口
+    gaps: gapAnalysis,
+    // 風控數據
+    risk:{
+      stop_loss:      +stopLoss.toFixed(2),
+      stop_loss_agg:  +stopLossAgg.toFixed(2),
+      stop_loss_con:  +stopLossCon.toFixed(2),
+      stop_pct:       +stopPct.toFixed(2),
+      target1:        +tgt1.toFixed(2),
+      target2:        +tgt2.toFixed(2),
+      target3:        +tgt3.toFixed(2),
+      var95:          +var95.toFixed(2),
+      var99:          +var99.toFixed(2),
+      cvar95:         +cvar95.toFixed(2),
+      cvar99:         +cvar99.toFixed(2),
+      kelly_full:     +(kellyFull*100).toFixed(1),
+      kelly_half:     +kellyHalf.toFixed(1),
+      pos_size:       +posSz,
+      hv_ann:         +hvAnn,
+      atr_pct:        +atrPct.toFixed(2),
+      rr_ratio:       2.0,
+    },
+    // 五大先行指標評分
+    leading:{
+      l1_breadth: {
+        score: obvTrend==='Bullish'?( volRatio>1.5?75:60) : (volRatio>1.5?30:40),
+        signal: obvTrend==='Bullish'?'偏多':'偏空',
+        details:{ obv:obvTrend, vol_ratio:+volRatio.toFixed(2), mfi:+mfi.toFixed(1) }
+      },
+      l2_sentiment:{
+        score: rsi<30?85:rsi<40?65:rsi>70?25:rsi>60?40:50,
+        signal: rsi<30?'超賣機會':rsi>70?'超買警戒':'中性',
+        details:{ rsi:+rsi.toFixed(1), stoch_rsi:+stochRSI.toFixed(1), kdj_j:+kdjJ.toFixed(1) }
+      },
+      l3_capital:{
+        score: ofiResult.score,
+        signal: ofiResult.signal,
+        details:{ ofi_z:ofiResult.ofi_z, ofi_trend:ofiResult.ofi_trend,
+                  bull_div:ofiResult.ofi_bull_div, bear_div:ofiResult.ofi_bear_div }
+      },
+      l4_macro:{
+        score: e200[n-1]!=null ? (price>e200[n-1]?(slope>0?75:60):(slope<0?25:40)) : 50,
+        signal: e200[n-1]!=null ? (price>e200[n-1]?'站上MA200':'跌破MA200') : 'N/A',
+        details:{ above_ma200:aboveMA200, slope:+slope.toFixed(4), adx:+adx.toFixed(1) }
+      },
+      l5_structure:{
+        score: ictSmc.score,
+        signal: ictSmc.signal,
+        details:{ bos:ictSmc.bos, choch:ictSmc.choch, ote:ictSmc.ote, fvg:ictSmc.fvg,
+                  dow_trend3:dowTrend3, wyckoff:wyPhase }
+      },
+    },
+    // 回測
+    backtest: backtestResult,
     factors:{
       momentum:{score:momScore, label:'Momentum 動量', details:{
         '1M Ret%':+ret1m.toFixed(2),'3M Ret%':+ret3m.toFixed(2),
@@ -2273,6 +3122,14 @@ function analyze(bars, ticker, quoteData){
         'RSI':+rsi.toFixed(1),'MFI':+mfi.toFixed(1),
         'Stoch RSI':+stochRSI.toFixed(1),'KDJ-J':+kdjJ.toFixed(1),
       }},
+      ofi:{score: ofiResult.score, label:'OFI 訂單流', details:{
+        'OFI 分數':    ofiResult.score,
+        'OFI 訊號':    ofiResult.signal,
+        'OFI Z值':     ofiResult.ofi_z.toFixed(2),
+        'OFI 趨勢':    ofiResult.ofi_trend==='bullish'?'📈 買壓連續':ofiResult.ofi_trend==='bearish'?'📉 賣壓連續':'⚖️ 中性',
+        '底背離':      ofiResult.ofi_bull_div?'✅ 發現（看多）':'—',
+        '頂背離':      ofiResult.ofi_bear_div?'⚠️ 發現（看空）':'—',
+      }},
       ict_smc:{score: ictSmc.score, label:'ICT/SMC 資金', details:{
         'ICT 綜合分': ictSmc.score,
         'FVG 缺口':   ictSmc.fvg !== 0 ? (ictSmc.fvg > 0 ? '✅ 多頭' : '✅ 空頭') : '—',
@@ -2292,19 +3149,13 @@ function analyze(bars, ticker, quoteData){
     fundamentals:{pe,pb,roe,revGr,divY},
     dow_theory:{
       score:dowScore, signal:dowSignal,
-      major_trend:majUp==null?'N/A':majUp?'Uptrend':'Downtrend',
-      intermediate_trend:interUp==null?'N/A':interUp?'Uptrend':'Downtrend',
-      minor_trend:minUp==null?'N/A':minUp?'Uptrend':'Downtrend',
-      rule_123:{signal:rule123, score:dowScore},
-      rule_2b:{signal:rule2b, score:0},
-      details:[
-        `主要趨勢 vs MA200: ${majUp?'↑ 多頭':'↓ 空頭'}`,
-        `中期趨勢 vs MA60:  ${interUp?'↑ 多頭':'↓ 空頭'}`,
-        `短期趨勢 vs MA20:  ${minUp?'↑ 多頭':'↓ 空頭'}`,
-        `123法則: ${rule123}`,
-        `2B法則:  ${rule2b}`,
-      ],
-    },
+      trend3:dowTrend3,
+      major_trend:    majTrend==='Bull'?'Uptrend':majTrend==='Bear'?'Downtrend':'N/A',
+      intermediate_trend:interTrend==='Bull'?'Uptrend':interTrend==='Bear'?'Downtrend':'N/A',
+      minor_trend:    minTrend==='Bull'?'Uptrend':minTrend==='Bear'?'Downtrend':'N/A',
+      rule123_bull:   rule123Bull, rule123_bear: rule123Bear,
+      two_b_bull:     twoBBear,   two_b_bear:   twoBBull,
+      rule_123:{signal:rule123Bull, score:dowScore}},
     wyckoff:{
       phase:wyPhase, type:wyType,
       spring:wySpring, upthrust:wyUpthrust,
@@ -2495,6 +3346,8 @@ async function doAnalyze(){
     // 再等基本面完成，更新估值數據
     const fund = await fundPromise;
     D._fundSource = fund._src || DATA_MODE;
+    D._bars = bars;   // 保存 bars 供籌碼分析用
+    D._fund = fund;   // 保存 fund 供借券數據用
     if(fund._count > 0){
       D = analyze(bars, ticker, fund); // 重新分析（含估值）
       D.ticker = ticker; D._klineData = bars;
@@ -2608,7 +3461,7 @@ function renderBanner(d){
   sc.style.color=color;
   document.getElementById('bPrice').textContent=fp(d.price);
   document.getElementById('bChg').innerHTML=
-    `<span style="color:var(--cyan)">買${d.buy_score} / 賣${d.sell_score} / 淨${d.total_score}</span>`;
+    `<span style="color:var(--cyan)">多方${d.buy_score}分 / 空方${d.sell_score}分 / 淨分${d.net_score??d.total_score}</span>`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -2636,8 +3489,10 @@ function generateTradeDecision(d){
 
   // ── 2. 0-100 綜合評分 ──────────────────────────
   // 買賣分 (最高 ~60) → normalize 40分
-  const rawScore = Math.max(-100, Math.min(100, d.total_score || 0));
-  const scoreNorm = Math.round((rawScore + 100) / 2); // 0-100 range
+  // 用新淨分系統（正=看多，負=看空，範圍約 ±140）
+  const netSc   = d.net_score ?? d.total_score ?? 0;
+  const rawScore = Math.max(-140, Math.min(140, netSc));
+  const scoreNorm = Math.round((rawScore + 140) / 2.8); // 正規化到 0-100
   // 七因子補正 ±20
   const facAdj = Math.round((d.composite_score || 0) * 8);
   // 過濾層數補正 ±20
@@ -3054,7 +3909,7 @@ function renderDoubleDefense(tech){
 /* ── FACTORS ── */
 function renderFactors(d){
   const f   = d.factors || {};
-  const keys= ['momentum','value','quality','growth','volatility','sentiment','macro','ict_smc'];
+  const keys= ['momentum','value','quality','growth','volatility','sentiment','macro','ofi','ict_smc'];
   const el  = document.getElementById('factorsContent');
 
   // Count how many value fields are loaded (non-N/A)
@@ -3112,6 +3967,12 @@ function renderFactors(d){
     const fi = f[k] || {}, sc = fi.score ?? 0;
     const col= sc>0?'var(--green)':sc<0?'var(--red)':'var(--text2)';
     const isValue = k === 'value';
+    const isICT   = k === 'ict_smc';
+    const isOFI   = k === 'ofi';
+    // Value 面板：顯示 SABCD 評級
+    const valGradeShow = isValue && d.val_grade ? d.val_grade : null;
+    const gradeColor = {'S':'var(--green)','A':'#7fff7f','B':'var(--cyan)',
+                        'C':'var(--orange)','D':'var(--red)'}[valGradeShow]||'var(--text3)';
     const details = fi.details || {};
     const hasData = Object.values(details).some(v=>v!=='N/A' && v!=null);
 
@@ -3209,6 +4070,7 @@ function renderFactors(d){
 /* ── DOW / WYCKOFF ── */
 function renderDow(d){
   const dt=d.dow_theory||{}, wy=d.wyckoff||{};
+  const tech=d.technical||{};
   const sc=dt.score??0, sig=dt.signal||'Neutral';
   const col=sig.includes('Bullish')?'var(--green)':sig.includes('Bearish')?'var(--red)':'var(--cyan)';
   document.getElementById('dowContent').innerHTML=`
@@ -3261,191 +4123,415 @@ function renderDow(d){
         <div style="font-size:11px;color:var(--text2);margin-top:4px">趨勢: ${wy.ad_trend||'N/A'}</div>
       </div>
     </div>
+  </div>
+
+  <!-- ══ 道氏三重趨勢 ══ -->
+  <div class="card mb">
+    <div class="card-t">📐 道氏三重趨勢確認</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
+      ${[
+        ['主趨勢 (MA200)', tech.maj_trend||'N/A', 'major'],
+        ['中趨勢 (MA60)',  tech.inter_trend||'N/A','inter'],
+        ['短趨勢 (MA20)',  tech.min_trend||'N/A',  'minor'],
+      ].map(([l,v])=>`<div class="mc">
+        <div class="mc-l">${l}</div>
+        <div class="mc-v ${v==='Bull'?'pos':v==='Bear'?'neg':''}">${v==='Bull'?'📈 多頭':v==='Bear'?'📉 空頭':'—'}</div>
+      </div>`).join('')}
+    </div>
+    <div style="text-align:center;padding:8px;background:var(--bg3);border-radius:4px">
+      <span style="font-family:var(--fh);font-size:14px;color:${tech.dow_trend3==='TripleBull'?'var(--green)':tech.dow_trend3==='TripleBear'?'var(--red)':'var(--cyan)'}">
+        ${tech.dow_trend3==='TripleBull'?'🔥 三重多頭共振':tech.dow_trend3==='TripleBear'?'❄️ 三重空頭共振':
+          tech.dow_trend3==='MajInterBull'?'📈 主中期多頭':tech.dow_trend3==='MajInterBear'?'📉 主中期空頭':'⚖️ 混合趨勢'}
+      </span>
+    </div>
+    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <span class="stag ${tech.rule123_bull?'buy':'info'}">123法則: ${tech.rule123_bull?'✅ 看多':tech.rule123_bear?'⚠️ 看空':'觀察'}</span>
+      <span class="stag ${tech.two_b_bull?'buy':tech.two_b_bear?'sell':'info'}">2B法則: ${tech.two_b_bull?'✅ 反轉看多':tech.two_b_bear?'⚠️ 反轉看空':'無訊號'}</span>
+      <span class="stag info">道氏評分: ${tech.dow_score??0}分</span>
+    </div>
+  </div>
+
+  <!-- ══ OBV 四大秘訣 ══ -->
+  <div class="card mb">
+    <div class="card-t">📊 OBV 四大秘訣 + EMA30 交叉</div>
+    <div class="g2" style="margin-bottom:8px">
+      ${[
+        ['秘訣1：OBV先行', tech.obv_secret1, 'OBV創新高但價格未創高（積聚）'],
+        ['秘訣2：底部背離', tech.obv_secret2, 'OBV創新低但價格未創低（底部）'],
+        ['秘訣3：主力急買', tech.obv_secret3, 'OBV絕對值急速上升（大量介入）'],
+        ['秘訣4：量價同向', tech.obv_secret4, '放量上漲且OBV多頭（確認趨勢）'],
+      ].map(([name,active,desc])=>`
+      <div class="mc" style="border-left:3px solid ${active?'var(--green)':'var(--border)'}">
+        <div class="mc-l" style="color:${active?'var(--green)':'var(--text3)'}">${active?'✅':'○'} ${name}</div>
+        <div style="font-size:9px;color:var(--text3)">${desc}</div>
+      </div>`).join('')}
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <span class="stag ${tech.obv_cross_up?'buy':tech.obv_cross_down?'sell':'info'}">
+        OBV×EMA30: ${tech.obv_cross_up?'📈 金叉':tech.obv_cross_down?'📉 死叉':'中性'}
+      </span>
+      <span class="stag ${tech.obv_4secrets>=3?'buy':tech.obv_4secrets>=2?'info':'info'}">
+        共振數: ${tech.obv_4secrets||0}/4 ${tech.obv_4secrets>=3?'🔥':''}
+      </span>
+    </div>
+  </div>
+
+  <!-- ══ BB + Slope 斜率交點 ══ -->
+  <div class="card mb">
+    <div class="card-t">📈 布林帶 + Slope 斜率交點</div>
+    <div class="mg" style="margin-bottom:8px">
+      ${mc('BB+Slope方向', tech.bb_slope_bull?'📈 多頭確認':tech.bb_slope_bear?'📉 空頭確認':'中性', tech.bb_slope_bull?'pos':tech.bb_slope_bear?'neg':'')}
+      ${mc('BB緊縮', tech.bb_squeeze?'⚡ 即將突破':'正常', tech.bb_squeeze?'warn':'')}
+      ${mc('BB突破方向', tech.bb_break_up?'↑ 向上':tech.bb_break_down?'↓ 向下':'待定', tech.bb_break_up?'pos':tech.bb_break_down?'neg':'')}
+      ${mc('BB中線斜率', fn(tech.bb_mid_slope,4), tech.bb_mid_slope>0?'pos':'neg')}
+      ${mc('5日Price斜率', fn(tech.price_slope5,4), tech.price_slope5>0?'pos':'neg')}
+    </div>
+    <div style="font-size:10px;color:var(--text3);padding:4px 0">
+      💡 BB+Slope 交點：當布林帶中線斜率與價格斜率同向，且價格在中線同側 = 趨勢確立信號
+    </div>
   </div>`;
 }
 
 /* ── SMC ── */
 function renderSMC(d){
-  const tech=d.technical||{};
+  const tech = d.technical||{};
+  const ict  = d.factors?.ict_smc?.details||{};
+  const gaps = d.gaps||[];
+  const chip = d._chip||{};
+  const ofi  = tech;
+
+  const openGaps   = gaps.filter(g=>!g.filled);
+  const recentGaps = gaps.slice(-3);
+
   document.getElementById('smcContent').innerHTML=`
+  <!-- ══ ICT/SMC 結構 ══ -->
   <div class="g2 mb">
     <div class="card">
-      <div class="card-t">🏦 智能資金 SMC</div>
+      <div class="card-t">🏦 ICT/SMC 智能資金結構</div>
       <div class="smc-item"><span class="smc-ico">💹</span>
         <div><div class="smc-lbl">SMC 資金流向</div>
           <div class="smc-val ${tech.obv_trend==='Bullish'?'pos':'neg'}">${tech.obv_trend==='Bullish'?'Smart Money 流入 📈':'Smart Money 流出 📉'}</div></div></div>
       <div class="smc-item"><span class="smc-ico">🔲</span>
         <div><div class="smc-lbl">BOS 結構突破</div>
-          <div class="smc-val">${tech.supertrend==='多頭'?'多頭結構突破 ✅':'空頭結構突破 ⚠️'}</div></div></div>
+          <div class="smc-val ${ict['BOS 突破']==='✅ 是'?'pos':''}">
+            ${ict['BOS 突破']||'—'}</div></div></div>
       <div class="smc-item"><span class="smc-ico">🔄</span>
-        <div><div class="smc-lbl">CHoCH 趨勢轉換</div>
-          <div class="smc-val">${tech.macd_just_cross?'🔥 剛發生 MACD 金叉轉換':'維持現有趨勢'}</div></div></div>
+        <div><div class="smc-lbl">CHOCH 趨勢轉換</div>
+          <div class="smc-val ${ict['CHOCH 轉換']==='✅ 是'?'pos':''}">
+            ${ict['CHOCH 轉換']||'—'}</div></div></div>
       <div class="smc-item"><span class="smc-ico">📐</span>
-        <div><div class="smc-lbl">FVG 公允缺口 / 斐波那契</div>
-          <div class="smc-val">${tech.in_golden?`✅ 黃金口袋 (${fp(tech.fib618)}–${fp(tech.fib786)})`:'無特殊缺口'}</div></div></div>
-    </div>
-    <div class="card">
-      <div class="card-t">📊 OFI 訂單流</div>
+        <div><div class="smc-lbl">FVG 公允缺口</div>
+          <div class="smc-val ${ict['FVG 缺口']&&ict['FVG 缺口']!=='—'?'pos':''}">
+            ${ict['FVG 缺口']||'無缺口'}</div></div></div>
       <div class="smc-item"><span class="smc-ico">📊</span>
-        <div><div class="smc-lbl">OFI 綜合訊號</div>
-          <div class="smc-val">${d.market?.sniper_signal||'分析中'}</div></div></div>
+        <div><div class="smc-lbl">OTE 斐波最佳進場</div>
+          <div class="smc-val ${ict['OTE 回檔']&&ict['OTE 回檔']!=='—'?'pos':''}">
+            ${ict['OTE 回檔']||'—'} &nbsp;<span style="font-size:9px;color:var(--text3)">(61.8%~78.6%)</span></div></div></div>
       <div class="smc-item"><span class="smc-ico">🎯</span>
-        <div><div class="smc-lbl">訂單塊 Order Block 區間</div>
-          <div class="smc-val">壓力: ${fp(tech.bb_upper)} / 支撐: ${fp(tech.bb_lower)}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">💰</span>
-        <div><div class="smc-lbl">OBV 量能趨勢</div>
-          <div class="smc-val ${tech.obv_trend==='Bullish'?'pos':'neg'}">${tech.obv_trend} | 成交量倍 ${fn(tech.vol_ratio)}x</div></div></div>
-      <div class="stags" style="margin-top:8px">
-        ${d.signals.slice(0,8).map(s=>`<span class="stag ${s.c}">${s.t}</span>`).join('')}
-      </div>
+        <div><div class="smc-lbl">PO3 階段 / ICT訊號</div>
+          <div class="smc-val">${ict['PO3 階段']||'—'} ／ ${ict['ICT 訊號']||'—'}</div></div></div>
+    </div>
+
+    <!-- ══ OFI 訂單流 ══ -->
+    <div class="card">
+      <div class="card-t">📊 OFI 訂單流 (Order Flow Imbalance)</div>
+      <div class="smc-item"><span class="smc-ico">⚡</span>
+        <div><div class="smc-lbl">OFI 訊號 / 分數</div>
+          <div class="smc-val ${tech.ofi_signal==='BUY'?'pos':tech.ofi_signal==='SELL'?'neg':''}">
+            ${tech.ofi_signal==='BUY'?'📈 買壓強勢':tech.ofi_signal==='SELL'?'📉 賣壓強勢':'⚖️ 中性'}
+            <span style="font-size:10px;color:var(--cyan)">&nbsp;${tech.ofi_score||50}分</span></div></div></div>
+      <div class="smc-item"><span class="smc-ico">📈</span>
+        <div><div class="smc-lbl">OFI 趨勢 / Z值</div>
+          <div class="smc-val ${tech.ofi_trend==='bullish'?'pos':tech.ofi_trend==='bearish'?'neg':''}">
+            ${tech.ofi_trend==='bullish'?'買壓連續':tech.ofi_trend==='bearish'?'賣壓連續':'中性'}
+            <span style="font-size:10px">&nbsp;Z=${tech.ofi_z||0}</span></div></div></div>
+      <div class="smc-item"><span class="smc-ico">🔍</span>
+        <div><div class="smc-lbl">OFI 背離訊號</div>
+          <div class="smc-val ${tech.ofi_bull_div?'pos':tech.ofi_bear_div?'neg':''}">
+            ${tech.ofi_bull_div?'✅ 底背離（看多）':tech.ofi_bear_div?'⚠️ 頂背離（看空）':'無背離'}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">💡</span>
+        <div><div class="smc-lbl">說明</div>
+          <div class="smc-val" style="font-size:10px;color:var(--text2)">
+            OFI = 買量 - 賣量，用K線高低收估算主力資金方向<br>
+            Z>2=極端買壓，Z&lt;-2=極端賣壓，背離=趨勢反轉信號</div></div></div>
     </div>
   </div>
-  <div class="g3">
-    <div class="card"><div class="card-t">📐 Fibonacci 關鍵位</div>
-      <div class="mg">
-        ${mc('Fib 61.8%',fp(tech.fib618),'info')}
-        ${mc('Fib 78.6%',fp(tech.fib786),'info')}
-        ${mc('BB中軌',fp(tech.bb_mid),'info')}
-        ${mc('EMA 200',tech.ema200?fp(tech.ema200):'N/A','')}
-      </div>
+
+  <!-- ══ K線缺口分析 ══ -->
+  <div class="card mb">
+    <div class="card-t">🕳️ K線缺口分析（共 ${gaps.length} 個）</div>
+    ${openGaps.length===0 ? '<div style="color:var(--text3);font-size:12px;padding:8px">目前無未填補缺口</div>' :
+      openGaps.slice(0,5).map(g=>`
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border)">
+        <div>
+          <span class="smc-val ${g.dir==='up'?'pos':'neg'}" style="font-size:11px">${g.type}</span>
+          <span style="font-size:10px;color:var(--text3);margin-left:6px">${g.date?.slice(5)||''}</span>
+        </div>
+        <div style="text-align:right">
+          <div style="font-family:var(--fm);font-size:11px">${g.dir==='up'?g.gapLow.toFixed(2)+'~'+g.gapHigh.toFixed(2):g.gapHigh.toFixed(2)+'~'+g.gapLow.toFixed(2)}</div>
+          <div style="font-size:9px;color:var(--yellow)">缺口 ${g.size}%&nbsp;⬆️未填</div>
+        </div>
+      </div>`).join('')
+    }
+    ${recentGaps.filter(g=>g.filled).length>0?`
+    <div style="margin-top:8px;font-size:10px;color:var(--text3)">最近已填補：${recentGaps.filter(g=>g.filled).map(g=>g.type+' '+g.size+'%').join('、')}</div>`:''}
+  </div>`;
+
+  // 動態加入籌碼分析（需要 fund 數據）
+  const chipHtml = _renderChipPanel(d);
+  document.getElementById('smcContent').innerHTML += chipHtml;
+}
+
+function _renderChipPanel(d){
+  const fund  = d._fund||{};
+  const tech  = d.technical||{};
+  const bars  = d._bars||[];
+  let chip    = { fii_dir:'計算中', margin_sentiment:'計算中',
+                  short_signal:'無數據', retail_vs_smart:'計算中',
+                  open_gaps:[], unfilled_gaps:0 };
+  try{ chip = calcChipAnalysis(bars||[], fund); }catch(e){}
+
+  return `
+  <!-- ══ 籌碼分析 ══ -->
+  <div class="g2 mb">
+    <div class="card">
+      <div class="card-t">🏛️ 外資 / 主力 動向（技術估算）</div>
+      <div class="smc-item"><span class="smc-ico">🌍</span>
+        <div><div class="smc-lbl">外資動向估算</div>
+          <div class="smc-val">${chip.fii_dir}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">⚖️</span>
+        <div><div class="smc-lbl">散戶 vs 主力</div>
+          <div class="smc-val">${chip.retail_vs_smart}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">💰</span>
+        <div><div class="smc-lbl">融資餘額估算（散戶情緒）</div>
+          <div class="smc-val">${chip.margin_sentiment}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">📝</span>
+        <div><div class="smc-lbl" style="font-size:9px;color:var(--text3)">
+          ⚠️ 以上為技術指標代理估算，非實際籌碼數據。<br>
+          實際外資/融資/借券數據請至台灣證交所 TWSE 查詢。
+        </div></div></div>
     </div>
-    <div class="card"><div class="card-t">🔥 動量確認</div>
-      <div class="mg">
-        ${mc('MACD',fn(tech.macd,4),tech.macd>0?'pos':'neg')}
-        ${mc('RSI',fn(tech.rsi),tech.rsi>70?'neg':tech.rsi<30?'pos':'')}
-        ${mc('MFI',fn(tech.mfi),tech.mfi>80?'neg':tech.mfi<20?'pos':'')}
-        ${mc('Stoch RSI',fn(tech.stoch_rsi),tech.stoch_rsi>80?'neg':tech.stoch_rsi<20?'pos':'')}
-      </div>
-    </div>
-    <div class="card"><div class="card-t">🏗️ 市場結構</div>
-      <div class="mg">
-        ${mc('Supertrend',tech.supertrend,tech.supertrend==='多頭'?'pos':'neg')}
-        ${mc('Chop',fn(tech.chop),tech.chop<38.2?'pos':tech.chop>61.8?'warn':'')}
-        ${mc('R²',fn(tech.r2,3),tech.r2>0.65?'pos':'warn')}
-        ${mc('趨勢',d.market?.trend_state,'','')}
-      </div>
+    <div class="card">
+      <div class="card-t">📋 借券 / 空單分析</div>
+      <div class="smc-item"><span class="smc-ico">🩳</span>
+        <div><div class="smc-lbl">借券空單壓力</div>
+          <div class="smc-val">${chip.short_signal}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">📊</span>
+        <div><div class="smc-lbl">Short Ratio（Yahoo）</div>
+          <div class="smc-val">${chip.short_ratio!=null?chip.short_ratio+'天回補':'N/A (台股不提供)'}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">🧠</span>
+        <div><div class="smc-lbl">散戶放空解讀</div>
+          <div class="smc-val" style="font-size:11px">
+            空單多 = 軋空潛力大（逆向看多）<br>
+            空單少 = 無壓力，趨勢平穩</div></div></div>
     </div>
   </div>`;
 }
 
 /* ── LEADING ── */
 function renderLeading(d){
-  const tech=d.technical||{};
+  const tech = d.technical||{};
+  const lead = d.leading||{};
+  const risk = d.risk||{};
+
+  function tier(num, name, scoreObj, items){
+    const sc = scoreObj?.score??50;
+    const sig= scoreObj?.signal||'N/A';
+    const col= sc>=65?'var(--green)':sc>=45?'var(--cyan)':sc>=30?'var(--orange)':'var(--red)';
+    return `<div class="ltier"><div class="ltier-hdr">
+      <div><span class="ltier-num">${num}</span><span class="ltier-name">${name}</span></div>
+      <span style="font-family:var(--fm);color:${col}">${sig} <b>${sc}</b>分</span>
+    </div><div class="ltier-body"><div class="mg">${items}</div></div></div>`;
+  }
+
   document.getElementById('leadingContent').innerHTML=`
-  <div class="ltier"><div class="ltier-hdr">
-    <div><span class="ltier-num">L1</span><span class="ltier-name">市場廣度 Breadth</span></div>
-    <span style="font-family:var(--fm);color:${tech.obv_trend==='Bullish'?'var(--green)':'var(--red)'}">${tech.obv_trend==='Bullish'?'▲ 偏多':'▼ 偏空'}</span>
-  </div><div class="ltier-body"><div class="mg">
-    ${mc('OBV趨勢',tech.obv_trend,tech.obv_trend==='Bullish'?'pos':'neg')}
-    ${mc('成交量倍',fn(tech.vol_ratio)+'x',tech.vol_ratio>1.5?'pos':tech.vol_ratio<0.7?'neg':'')}
-    ${mc('MFI',fn(tech.mfi),tech.mfi<20?'pos':tech.mfi>80?'neg':'')}
-    ${mc('趨勢狀態',d.market?.trend_state,'','')}
-  </div></div></div>
+  ${tier('L1','市場廣度 Breadth', lead.l1_breadth,`
+    ${mc('OBV趨勢',    tech.obv_trend,           tech.obv_trend==='Bullish'?'pos':'neg')}
+    ${mc('OBV×EMA30', tech.obv_cross_up?'📈金叉':tech.obv_cross_down?'📉死叉':'中性',
+                      tech.obv_cross_up?'pos':tech.obv_cross_down?'neg':'')}
+    ${mc('成交量倍率', (tech.vol_ratio||0).toFixed(2)+'x', tech.vol_ratio>1.5?'pos':tech.vol_ratio<0.7?'neg':'')}
+    ${mc('MFI資金流量', (tech.mfi||0).toFixed(1),          tech.mfi<30?'pos':tech.mfi>70?'neg':'')}
+    ${mc('OBV四訣共振', (tech.obv_4secrets||0)+'/4項',     tech.obv_4secrets>=3?'pos':'')}
+  `)}
 
-  <div class="ltier"><div class="ltier-hdr">
-    <div><span class="ltier-num">L2</span><span class="ltier-name">極端情緒 Sentiment/VIX</span></div>
-    <span style="font-family:var(--fm);color:${tech.rsi<30?'var(--green)':tech.rsi>70?'var(--red)':'var(--cyan)'}">
-      ${tech.rsi<30?'🔥 超賣機會':tech.rsi>70?'⚠️ 超買警戒':'中性'}
-    </span>
-  </div><div class="ltier-body"><div class="mg">
-    ${mc('RSI(14)',fn(tech.rsi),tech.rsi>70?'neg':tech.rsi<30?'pos':'')}
-    ${mc('Stoch RSI',fn(tech.stoch_rsi),tech.stoch_rsi<20?'pos':tech.stoch_rsi>80?'neg':'')}
-    ${mc('KDJ-J',fn(tech.kdj_j),tech.kdj_j<20?'pos':tech.kdj_j>80?'neg':'')}
-    ${mc('7因子情緒',fn(d.factors?.sentiment?.score),+(d.factors?.sentiment?.score||0)>0?'pos':'neg')}
-  </div></div></div>
+  ${tier('L2','極端情緒 Sentiment', lead.l2_sentiment,`
+    ${mc('RSI(14)',       (tech.rsi||0).toFixed(1),      tech.rsi>70?'neg':tech.rsi<30?'pos':'')}
+    ${mc('StochRSI',      (tech.stoch_rsi||0).toFixed(1),tech.stoch_rsi<20?'pos':tech.stoch_rsi>80?'neg':'')}
+    ${mc('KDJ-J值',       (tech.kdj_j||0).toFixed(1),    tech.kdj_j<20?'pos':tech.kdj_j>80?'neg':'')}
+    ${mc('情緒因子評分',  (d.factors?.sentiment?.score||0).toFixed(0)+'分',
+                          (d.factors?.sentiment?.score||0)>0?'pos':'neg')}
+  `)}
 
-  <div class="ltier"><div class="ltier-hdr">
-    <div><span class="ltier-num">L3</span><span class="ltier-name">資金動能 Money Flow</span></div>
-    <span style="font-family:var(--fm);color:${tech.macd>0?'var(--green)':'var(--red)'}">
-      ${tech.macd>0?'▲ 資金流入':'▼ 資金流出'}
-    </span>
-  </div><div class="ltier-body"><div class="mg">
-    ${mc('MACD柱',fn(tech.macd_hist,4),tech.macd_hist>0?'pos':'neg')}
-    ${mc('OBV',tech.obv_trend,tech.obv_trend==='Bullish'?'pos':'neg')}
-    ${mc('成交量',fn(tech.vol_ratio)+'x',tech.vol_ratio>1.5?'pos':tech.vol_ratio<0.7?'neg':'')}
-    ${mc('MFI',fn(tech.mfi),tech.mfi<20?'pos':tech.mfi>80?'neg':'')}
-  </div></div></div>
+  ${tier('L3','資金流向 Capital', lead.l3_capital,`
+    ${mc('OFI訊號',   tech.ofi_signal||'N/A',             tech.ofi_signal==='BUY'?'pos':tech.ofi_signal==='SELL'?'neg':'')}
+    ${mc('OFI Z值',   (tech.ofi_z||0).toFixed(2),         tech.ofi_z>1.5?'pos':tech.ofi_z<-1.5?'neg':'')}
+    ${mc('OFI底背離', tech.ofi_bull_div?'✅ 是':'—',       tech.ofi_bull_div?'pos':'')}
+    ${mc('OFI頂背離', tech.ofi_bear_div?'⚠️ 是':'—',      tech.ofi_bear_div?'neg':'')}
+  `)}
 
-  <div class="ltier"><div class="ltier-hdr">
-    <div><span class="ltier-num">L4</span><span class="ltier-name">宏觀先行 Macro</span></div>
-    <span style="font-family:var(--fm);color:${+(d.factors?.macro?.score||0)>0?'var(--green)':'var(--red)'}">
-      7F Macro: ${d.factors?.macro?.score>0?'+':''}${d.factors?.macro?.score??0}
-    </span>
-  </div><div class="ltier-body"><div class="mg">
-    ${mc('MA200位置',tech.ema200?(tech.above_ma200?'↑ 站上':'↓ 跌破'):'N/A',tech.above_ma200?'pos':'neg')}
-    ${mc('EMA200',tech.ema200?fp(tech.ema200):'N/A','')}
-    ${mc('趨勢斜率',fn(tech.slope,4)+'%',tech.slope>0?'pos':'neg')}
-    ${mc('宏觀因子',fn(d.factors?.macro?.score),(d.factors?.macro?.score||0)>0?'pos':'neg')}
-  </div></div></div>
+  ${tier('L4','宏觀趨勢 Macro', lead.l4_macro,`
+    ${mc('MA200',         tech.above_ma200?'📈 站上':'📉 跌破', tech.above_ma200?'pos':'neg')}
+    ${mc('ADX趨勢強度',   (tech.adx||0).toFixed(1),             tech.adx>25?'pos':tech.adx<15?'neg':'')}
+    ${mc('Slope斜率',     (tech.slope||0).toFixed(4),            tech.slope>0?'pos':'neg')}
+    ${mc('道氏三重趨勢',  tech.dow_trend3||'N/A',
+                          tech.dow_trend3==='TripleBull'?'pos':tech.dow_trend3==='TripleBear'?'neg':'')}
+  `)}
 
-  <div class="ltier"><div class="ltier-hdr">
-    <div><span class="ltier-num">L5</span><span class="ltier-name">市場結構 Structure</span></div>
-    <span style="font-family:var(--fm);color:${tech.chop<38.2?'var(--green)':tech.chop>61.8?'var(--yellow)':'var(--cyan)'}">
-      ${tech.chop<38.2?'🎯 強趨勢':tech.chop>61.8?'⚡ 震盪市':'過渡期'}
-    </span>
-  </div><div class="ltier-body"><div class="mg">
-    ${mc('Choppiness',fn(tech.chop),tech.chop<38.2?'pos':tech.chop>61.8?'warn':'')}
-    ${mc('R²品質',fn(tech.r2,3),tech.r2>0.65?'pos':'warn')}
-    ${mc('Supertrend',tech.supertrend,tech.supertrend==='多頭'?'pos':'neg')}
-    ${mc('狙擊信號',d.market?.sniper_signal||'—',(d.market?.sniper_signal||'').includes('就緒')?'pos':'')}
-  </div></div></div>`;
+  ${tier('L5','市場結構 Structure', lead.l5_structure,`
+    ${mc('ICT/SMC評分',   (tech.obv_4secrets||0)+'pts',  '')}
+    ${mc('BOS突破',       tech.bos?'✅ 是':'—',           tech.bos?'pos':'')}
+    ${mc('CHOCH轉換',     tech.choch?'✅ 是':'—',         tech.choch?'pos':'')}
+    ${mc('OTE進場',       tech.ote===1?'✅ 多頭':tech.ote===-1?'⚠️ 空頭':'—',
+                          tech.ote===1?'pos':tech.ote===-1?'neg':'')}
+    ${mc('威科夫階段',    tech.wyPhase||d.wyckoff?.phase||'N/A', '')}
+  `)}
+
+  <!-- VaR 快覽 -->
+  <div class="card mt" style="margin-top:10px">
+    <div class="card-t">⚠️ 風險快覽（VaR）</div>
+    <div class="mg">
+      ${mc('VaR 95%',   (risk.var95||0).toFixed(2)+'%',  (risk.var95||0)<-3?'neg':'')}
+      ${mc('CVaR 99%',  (risk.cvar99||0).toFixed(2)+'%', (risk.cvar99||0)<-5?'neg':'')}
+      ${mc('Kelly倉位', (risk.kelly_half||0).toFixed(1)+'%',  (risk.kelly_half||0)>10?'pos':'')}
+      ${mc('ATR停損距', (risk.atr_pct||0).toFixed(2)+'%', '')}
+    </div>
+  </div>`;
 }
 
 /* ── RISK ── */
 function renderRisk(d){
-  const r=d.risk||{}, tech=d.technical||{};
-  const var95Pct=Math.min(Math.abs(r.var_95||0)*10,100);
+  const tech = d.technical||{};
+  const risk = d.risk||{};
+  const bt   = d.backtest||null;
+  const gaps = d.gaps||[];
+  const openGaps = gaps.filter(g=>!g.filled);
+  const up_gaps  = openGaps.filter(g=>g.dir==='up').slice(0,3);
+  const dn_gaps  = openGaps.filter(g=>g.dir==='down').slice(0,3);
+
   document.getElementById('riskContent').innerHTML=`
+  <!-- ══ VaR / CVaR 風險值 ══ -->
   <div class="g2 mb">
     <div class="card">
-      <div class="card-t">🛡️ 動態停損 (2×ATR)</div>
-      <div style="text-align:center;padding:14px 0">
-        <div style="font-size:10px;color:var(--text3);font-family:var(--fm)">建議停損價</div>
-        <div style="font-family:var(--fm);font-size:30px;color:var(--red);margin:6px 0">${fp(r.stop_loss)}</div>
-        <div style="font-family:var(--fm);font-size:15px;color:var(--red)">${fn(r.stop_loss_pct)}%</div>
-      </div>
+      <div class="card-t">📉 風險值（Value at Risk）</div>
       <div class="mg">
-        ${mc('ATR(14)',fp(r.atr),'')}
-        ${mc('建議倉位',fn(r.position_size)+'%','info')}
-        ${mc('目標1 (2.5×ATR)',fp(r.target_1),'pos')}
-        ${mc('目標2 (5×ATR)',fp(r.target_2),'pos')}
+        ${mc('VaR 95%（日）',  (risk.var95||0).toFixed(2)+'%',  (risk.var95||0)<-3?'neg':'')}
+        ${mc('VaR 99%（日）',  (risk.var99||0).toFixed(2)+'%',  (risk.var99||0)<-5?'neg':'')}
+        ${mc('CVaR 95%（尾部）',(risk.cvar95||0).toFixed(2)+'%',(risk.cvar95||0)<-5?'neg':'')}
+        ${mc('CVaR 99%（極端）',(risk.cvar99||0).toFixed(2)+'%',(risk.cvar99||0)<-8?'neg':'')}
+        ${mc('年化歷史波動率',  (risk.hv_ann||0)+'%',            (risk.hv_ann||0)>50?'neg':'')}
+        ${mc('日ATR波動率',     (risk.atr_pct||0).toFixed(2)+'%','')}
+      </div>
+      <div style="font-size:9px;color:var(--text3);margin-top:6px">
+        VaR95 = 有95%機率單日跌幅不超過此值 | CVaR99 = 最差1%情境的平均虧損
       </div>
     </div>
     <div class="card">
-      <div class="card-t">📉 VaR 風險量化</div>
-      <div class="mg" style="margin-bottom:14px">
-        ${mc('VaR 95% (日)',fn(r.var_95)+'%','neg')}
-        ${mc('CVaR 99% (日)',fn(r.cvar_99)+'%','neg')}
-        ${mc('歷史波動 (年)',fn(tech.hist_vol)+'%',tech.hist_vol>50?'warn':'')}
-        ${mc('ATR%',fn(tech.atr_pct)+'%','')}
+      <div class="card-t">🎯 倉位管理（Kelly公式）</div>
+      <div class="mg">
+        ${mc('Kelly全倉',      (risk.kelly_full||0).toFixed(1)+'%', (risk.kelly_full||0)>0?'pos':'neg')}
+        ${mc('Kelly半倉（建議）',(risk.kelly_half||0).toFixed(1)+'%',(risk.kelly_half||0)>5?'pos':'')}
+        ${mc('建議倉位上限',    (risk.pos_size||0)+'%',               '')}
+        ${mc('RR比設定',        (risk.rr_ratio||2)+'：1',             'pos')}
       </div>
-      <div style="font-size:10px;color:var(--text3);margin-bottom:4px">VaR 95% 風險可視化</div>
-      <div class="prog"><div class="prog-fill" style="width:${var95Pct}%;background:var(--red)"></div></div>
-      <div style="margin-top:12px;padding:10px;background:var(--bg3);border-radius:4px;border:1px solid var(--border)">
-        <div style="font-size:10px;color:var(--text3);font-family:var(--fm);margin-bottom:5px">📌 Kelly 半倉建議</div>
-        <div style="font-family:var(--fm);font-size:13px;color:var(--cyan)">建議倉位: ${fn(r.position_size)}% of Capital</div>
+      <div style="font-size:9px;color:var(--text3);margin-top:6px">
+        Kelly = (勝率×RR - 敗率) / RR ÷ 2（半Kelly更保守）
       </div>
     </div>
   </div>
+
+  <!-- ══ ATR 停損停利 ══ -->
   <div class="card mb">
-    <div class="card-t">⏱️ 進場時機建議</div>
-    <div class="g3">
-      <div class="entry-card"><div class="entry-type">積極型 AGGRESSIVE</div><div style="font-size:12px;color:var(--text2)">信號當日收盤前分批進 1/3</div></div>
-      <div class="entry-card"><div class="entry-type">標準型 STANDARD</div><div style="font-size:12px;color:var(--text2)">次日開盤確認方向後進 1/2</div></div>
-      <div class="entry-card"><div class="entry-type" style="color:var(--cyan)">保守型 CONSERVATIVE</div><div style="font-size:12px;color:var(--text2)">等待確認K線收盤站穩後進場</div></div>
+    <div class="card-t">🛡️ ATR 停損停利參考（現價 ${risk.stop_loss?tech.price||d.price:'N/A'}）</div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-family:var(--fm);font-size:11px">
+        <tr style="color:var(--text3);border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:4px">類型</th>
+          <th style="text-align:right;padding:4px">停損價</th>
+          <th style="text-align:right;padding:4px">停利1 (1:1)</th>
+          <th style="text-align:right;padding:4px">停利2 (1:2)</th>
+          <th style="text-align:right;padding:4px">停利3 (1:3)</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:4px;color:var(--yellow)">⚡積極 1.5×ATR</td>
+          <td style="text-align:right;color:var(--red)">${(risk.stop_loss_agg||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target1||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target2||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target3||0).toFixed(2)}</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border);background:rgba(0,212,255,.05)">
+          <td style="padding:4px;color:var(--cyan)">🎯標準 2.5×ATR</td>
+          <td style="text-align:right;color:var(--red)">${(risk.stop_loss||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target1||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target2||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target3||0).toFixed(2)}</td>
+        </tr>
+        <tr>
+          <td style="padding:4px;color:var(--text3)">🛡️保守 3.5×ATR</td>
+          <td style="text-align:right;color:var(--red)">${(risk.stop_loss_con||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target1||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target2||0).toFixed(2)}</td>
+          <td style="text-align:right;color:var(--green)">${(risk.target3||0).toFixed(2)}</td>
+        </tr>
+      </table>
+    </div>
+    <div style="font-size:9px;color:var(--text3);margin-top:6px">
+      ⚠️ 僅供參考，實際停損需依個人風險承受度調整
     </div>
   </div>
-  <div class="card">
-    <div class="card-t">⚖️ 風險等級總覽</div>
-    <div class="mg">
-      ${mc('最終信號',d.signal||'Hold',d.signal?.includes('Buy')?'pos':d.signal?.includes('Sell')?'neg':'')}
-      ${mc('市場環境',d.market?.trend_state||'N/A','')}
-      ${mc('波動環境',d.market?.vol_regime||'N/A',(d.market?.vol_regime||'').includes('High')?'warn':'')}
-      ${mc('狙擊信號',d.market?.sniper_signal||'N/A',(d.market?.sniper_signal||'').includes('就緒')?'pos':'')}
-      ${mc('7因子',`${d.composite_score>=0?'+':''}${d.composite_score}`,(d.composite_score||0)>0?'pos':'neg')}
-      ${mc('買/賣分',`${d.buy_score}/${d.sell_score}`,(d.buy_score||0)>(d.sell_score||0)?'pos':'neg')}
+
+  <!-- ══ 缺口分析 ══ -->
+  <div class="card mb">
+    <div class="card-t">🕳️ K線缺口分析（未填補共 ${openGaps.length} 個）</div>
+    ${up_gaps.length||dn_gaps.length ? `
+    <div class="g2">
+      <div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:4px">⬆️ 上方缺口（壓力）</div>
+        ${up_gaps.length ? up_gaps.map(g=>`
+        <div style="padding:4px 0;border-bottom:1px solid var(--border);font-size:11px;font-family:var(--fm)">
+          <div style="color:var(--yellow)">${g.type} ${g.size}%</div>
+          <div style="color:var(--text3)">${g.gapLow.toFixed(2)}~${g.gapHigh.toFixed(2)}</div>
+          <div style="color:var(--text3);font-size:9px">${g.date?.slice(5)||''}</div>
+        </div>`).join('') : '<div style="color:var(--text3);font-size:11px">無</div>'}
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:4px">⬇️ 下方缺口（支撐）</div>
+        ${dn_gaps.length ? dn_gaps.map(g=>`
+        <div style="padding:4px 0;border-bottom:1px solid var(--border);font-size:11px;font-family:var(--fm)">
+          <div style="color:var(--cyan)">${g.type} ${g.size}%</div>
+          <div style="color:var(--text3)">${g.gapHigh.toFixed(2)}~${g.gapLow.toFixed(2)}</div>
+          <div style="color:var(--text3);font-size:9px">${g.date?.slice(5)||''}</div>
+        </div>`).join('') : '<div style="color:var(--text3);font-size:11px">無</div>'}
+      </div>
+    </div>` : '<div style="color:var(--text3);font-size:12px;padding:8px">無未填補缺口</div>'}
+  </div>
+
+  <!-- ══ 回測結果 ══ -->
+  ${bt ? `
+  <div class="card mb">
+    <div class="card-t">📊 歷史回測（Supertrend+EMA+MACD，ATR 2.5x停損/5x停利）</div>
+    <div class="g2 mb">
+      <div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+          ${[[`交易次數`,bt.total+`次`],[`勝率`,bt.winRate+`%`],
+             [`平均獲利`,`+`+bt.avgWin+`%`],[`平均虧損`,bt.avgLoss+`%`],
+             [`獲利因子`,bt.profitFactor+`x`],[`最大回撤`,bt.maxDrawdown+`%`],
+             [`總報酬`,bt.totalReturn+(bt.totalReturn>0?`% ✅`:`% ❌`)]
+            ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div>
+              <div class="mc-v ${v.startsWith('+')||v.endsWith('✅')?'pos':v.includes('-')||v.endsWith('❌')?'neg':''}">${v}</div></div>`).join('')}
+        </div>
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:6px">最近5筆交易</div>
+        ${bt.trades.slice(-5).reverse().map(t=>`
+        <div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);font-family:var(--fm);font-size:10px">
+          <span style="color:var(--text3)">${t.entryDate?.slice(5,10)||''}</span>
+          <span>${t.entry}→${t.exit}</span>
+          <span style="color:${t.pnl>0?'var(--green)':'var(--red)'}">${t.pnl>0?'+':''}${t.pnl}%</span>
+        </div>`).join('')}
+      </div>
     </div>
-  </div>`;
+    <div style="font-size:9px;color:var(--text3)">⚠️ 歷史回測不代表未來績效，不含手續費及滑點</div>
+  </div>` : `<div class="card mb" style="color:var(--text3);font-size:12px;padding:12px">回測數據不足（需30根以上K線）</div>`}`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -3540,7 +4626,42 @@ async function loadIndices(){
     // 動態更新模式標籤
     const modeTag = _getModeTag();
     bar.innerHTML = modeTag + parts.join('') +
-      `<span style="font-size:10px;color:var(--text3);font-family:var(--fm)">載入中…</span>`;
+      `<span style="font-size:10px;color:var(--text3);font-family:var(--fm)">載入中…</span>
+
+  <!-- ══ 簡易回測結果 ══ -->
+  ${bt ? `
+  <div class="card mb">
+    <div class="card-t">📊 歷史回測（技術訊號，僅供參考）</div>
+    <div class="g2 mb">
+      <div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+          ${[
+            ['總交易次數', bt.total+'次'],
+            ['勝率',       bt.winRate+'%'],
+            ['平均獲利',   '+'+bt.avgWin+'%'],
+            ['平均虧損',   bt.avgLoss+'%'],
+            ['獲利因子',   bt.profitFactor+'x'],
+            ['最大回撤',   bt.maxDrawdown+'%'],
+            ['總報酬',     bt.totalReturn>0?'+'+bt.totalReturn+'%':bt.totalReturn+'%'],
+          ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div>
+            <div class="mc-v ${v.startsWith('+')?'pos':v.startsWith('-')?'neg':''}">${v}</div></div>`).join('')}
+        </div>
+      </div>
+      <div>
+        <div style="font-size:10px;color:var(--text3);margin-bottom:6px">最近交易記錄</div>
+        ${bt.trades.slice(-5).reverse().map(t=>`
+        <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--fm);font-size:10px">
+          <span>${t.entryDate?.slice(5,10)||''}</span>
+          <span>${t.entry}→${t.exit}</span>
+          <span style="color:${t.pnl>0?'var(--green)':'var(--red)'}">
+            ${t.pnl>0?'+':''}${t.pnl}% (${t.held}天)</span>
+        </div>`).join('')}
+      </div>
+    </div>
+    <div style="font-size:9px;color:var(--text3);padding:4px">
+      ⚠️ 回測使用 Supertrend + EMA + MACD 訊號，ATR停損2.5x/停利5x，不含手續費，不代表未來績效
+    </div>
+  </div>` : '<div class="card mb" style="color:var(--text3);font-size:12px;padding:12px">回測數據不足（需30根以上K線）</div>'}`;
     await new Promise(res=>setTimeout(res, DATA_MODE==='local'?60:200));
   }
 
