@@ -2217,6 +2217,12 @@ function analyze(bars, ticker, quoteData){
 ═══════════════════════════════════════════════════════════ */
 
 
+  // ── 評分前提前計算（避免 before initialization 錯誤）──
+  const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
+  const fib618X = (hiX-loX)*0.618+loX, fib786X = (hiX-loX)*0.786+loX;
+  const inGolden    = price>=fib618X && price<=fib786X;
+  const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
+
   /* ══════════════════════════════════════════════
      🛡️ 雙重防衛系統 v8.5
      ── 完整複刻原版評分邏輯 ──
@@ -2438,10 +2444,9 @@ function analyze(bars, ticker, quoteData){
   const comp = +(momScore*.20+valScore*.15+qualScore*.20+growScore*.15+volScore*.10+sentScore*.15+macroScore*.05).toFixed(2);
 
   // ── DOW THEORY ────────────────────────────────────
-  // Dow Theory 計算 → 已移至 Dow Theory 強化區塊 (dowScore/dowSignal/majTrend/interTrend/minTrend)
+  // Dow Theory → 見後面強化區塊
 
     // 123/2B Rule → 見 Dow Theory 強化區塊
-  const rule2b  = (price>peak1*(1+0.02)&&histV<0.03*price)?'可能假突破 (2B警示)':'無明顯假突破';
 
   // ── DOW THEORY 強化 ─────────────────────────────
   // 道氏三重趨勢（主趨勢/中趨勢/短趨勢）
@@ -2457,6 +2462,7 @@ function analyze(bars, ticker, quoteData){
   const peak1   = Math.max(...closes.slice(-40,-20));
   const trough  = Math.min(...closes.slice(-30,-10));
   const peak2   = Math.max(...closes.slice(-10));
+  const rule2b  = (price>peak1*(1+0.02)&&histV<0.03*price)?'可能假突破 (2B警示)':'無明顯假突破';
   const rule123Bull = peak2>peak1 && trough>Math.min(...closes.slice(-40,-20)) && price>peak1;
   const rule123Bear = trough<Math.min(...closes.slice(-40,-20)) && peak2<peak1 && price<trough;
   // 2B 法則（假突破反轉）
@@ -2535,11 +2541,7 @@ function analyze(bars, ticker, quoteData){
   // Detect K-line patterns (on full bars)
   const patterns = detectKPatterns(bars);
 
-  // ── 評分前提前計算（避免 before initialization 錯誤）──
-  const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
-  const fib618X = (hiX-loX)*0.618+loX, fib786X = (hiX-loX)*0.786+loX;
-  const inGolden    = price>=fib618X && price<=fib786X;
-  const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
+
 
   let score = 0;  // 統一淨分
   const sigs = [];
