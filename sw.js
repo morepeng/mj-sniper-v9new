@@ -2,7 +2,7 @@
    修復：Yahoo Finance 請求不走 SW 快取，直接穿透
    避免 networkFirst 快取過期返回 {"error":"offline"}
 */
-const CACHE_VER   = 'mj-dashboard-v8.5-3.0'; // 強制更新
+const CACHE_VER = 'mj-dashboard-v9-1775045947'; // 強制更新
 const SHELL_CACHE = CACHE_VER + '-shell';
 
 // App Shell — 只快取本地靜態資源
