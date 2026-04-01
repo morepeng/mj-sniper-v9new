@@ -2344,7 +2344,7 @@ function analyze(bars, ticker, quoteData){
   if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
 
   // [6] K線型態（在 patterns 計算之前暫用信號代理）
-  const klinePatScore = buy - sell; // proxy
+  const klinePatScore = score; // proxy（以目前淨分 score 代替）
   if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
   else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
 
