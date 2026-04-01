@@ -1408,11 +1408,13 @@ function _yfChartURLs(t, range, interval, mods=true){
 async function fetchYF(ticker, range='1y', interval='1d'){
   const t = encodeURIComponent(ticker);
   // 1. 本機代理
+  setProgress('chart','K線: 嘗試本機代理…','localhost:8889');
   try{
     const r = await fetchWithTimeout(`${LOCAL_PROXY}/yf/chart/${t}?range=${range}&interval=${interval}`, {}, 3000);
     if(r.ok){ const d=await r.json(); if(d?.chart?.result){ DATA_MODE='local'; return d; } }
   }catch(_){}
   // 2. 直連 + 模組
+  setProgress('chart','K線: 直連 Yahoo Finance…',ticker);
   for(const u of _yfChartURLs(t,range,interval,true)){
     const d = await tryFetchJSON(u,8000);
     if(d?.chart?.result){ DATA_MODE='direct'; return d; }
@@ -2214,6 +2216,332 @@ function analyze(bars, ticker, quoteData){
    - 總分範圍約 -140 ~ +140（正常單股大約 -60 ~ +60）
 ═══════════════════════════════════════════════════════════ */
 
+  co
+
+  /* ══════════════════════════════════════════════
+     🛡️ 雙重防衛系統 v8.5
+     ── 完整複刻原版評分邏輯 ──
+  ══════════════════════════════════════════════ */
+
+  // ── ADX（Average Directional Index）──────────
+  function calcADX(hi, lo, cl, p=14){
+    const n2=hi.length;
+    const tr=[],pdm=[],ndm=[];
+    for(let i=1;i<n2;i++){
+      const h=hi[i]-lo[i], h2=Math.abs(hi[i]-cl[i-1]), h3=Math.abs(lo[i]-cl[i-1]);
+      tr.push(Math.max(h,h2,h3));
+      pdm.push(hi[i]-hi[i-1]>lo[i-1]-lo[i]?Math.max(hi[i]-hi[i-1],0):0);
+      ndm.push(lo[i-1]-lo[i]>hi[i]-hi[i-1]?Math.max(lo[i-1]-lo[i],0):0);
+    }
+    // Wilder smooth
+    function ws(arr,p2){
+      const o=[];let s=arr.slice(0,p2).reduce((a,b)=>a+b,0);o.push(s);
+      for(let i=p2;i<arr.length;i++){s=s-s/p2+arr[i];o.push(s);}
+      return o;
+    }
+    const atr14=ws(tr,p),pdi14=ws(pdm,p),ndi14=ws(ndm,p);
+    const pdi=pdi14.map((v,i)=>atr14[i]?v/atr14[i]*100:0);
+    const ndi=ndi14.map((v,i)=>atr14[i]?v/atr14[i]*100:0);
+    const dx=pdi.map((v,i)=>{const s=v+ndi[i];return s?Math.abs(v-ndi[i])/s*100:0;});
+    const adxArr=ws(dx,p);
+    return {
+      adx:  adxArr[adxArr.length-1]??25,
+      pdi:  pdi[pdi.length-1]??0,
+      ndi:  ndi[ndi.length-1]??0,
+    };
+  }
+  const {adx, pdi: pdiV, ndi: ndiV} = calcADX(highs, lows, closes);
+
+  // ── RVOL (Relative Volume) ────────────────────
+  const rvol = volRatio; // already computed above
+
+  // ── RSI Divergence ────────────────────────────
+  // Simplified: bullish div = price lower low but RSI higher low (last 10 bars)
+  let rsiDiv = 'None';
+  if(n>=12){
+    const priceLL = closes[n-1] < Math.min(...closes.slice(-10,-1));
+    const rsiHL   = rsiArr[n-1]!=null && rsiArr[n-1] > Math.min(...rsiArr.slice(-10,-1).filter(v=>v!=null));
+    const priceHH = closes[n-1] > Math.max(...closes.slice(-10,-1));
+    const rsiLH   = rsiArr[n-1]!=null && rsiArr[n-1] < Math.max(...rsiArr.slice(-10,-1).filter(v=>v!=null));
+    if(priceLL && rsiHL) rsiDiv = 'Bullish Div';
+    else if(priceHH && rsiLH) rsiDiv = 'Bearish Div';
+  }
+
+  // ── TTM Squeeze ───────────────────────────────
+  // Squeeze: BB inside KC (Keltner Channel)
+  const kcMid  = e20;
+  const kcBand = atrArr.map((a,i)=> a!=null ? a*1.5 : null);
+  const bbWidthArr= bbUp.map((u,i)=> (u!=null&&bbLo[i]!=null) ? (u-bbLo[i])/2 : null);
+  const kcWidth= kcBand.map(b=> b!=null ? b : null);
+  const ttmSqueeze = bbWidthArr[n-1]!=null && kcWidth[n-1]!=null && bbWidthArr[n-1] < kcWidth[n-1];
+  // TTM momentum: delta of (close - midpoint of BB/KC)
+  const ttmMomentum = closes[n-1] - (bbMid[n-1]??closes[n-1]);
+  const ttmMomPrev  = closes[n-2] - (bbMid[n-2]??closes[n-2]);
+  let ttmSignal = 0;
+  if(ttmSqueeze && ttmMomentum > 0 && ttmMomentum > ttmMomPrev) ttmSignal = 1;  // squeeze + expanding up
+  if(ttmSqueeze && ttmMomentum < 0 && ttmMomentum < ttmMomPrev) ttmSignal = -1; // squeeze + expanding down
+
+  // ── KDJ/MACD Resonance ────────────────────────
+  // KDJ golden cross in last 3 bars
+  const kGold = kArr.some((_,i)=>i>=n-3&&i>0 && kArr[i]!=null&&dArr[i]!=null&&kArr[i-1]!=null&&dArr[i-1]!=null
+    && kArr[i]>dArr[i] && kArr[i-1]<=dArr[i-1]);
+  const kDead = kArr.some((_,i)=>i>=n-3&&i>0 && kArr[i]!=null&&dArr[i]!=null&&kArr[i-1]!=null&&dArr[i-1]!=null
+    && kArr[i]<dArr[i] && kArr[i-1]>=dArr[i-1]);
+  // MACD golden cross in last 3 bars
+  const mGold = macdArr.some((_,i)=>i>=n-3&&i>0 && macdArr[i]!=null&&sigArr[i]!=null&&macdArr[i-1]!=null&&sigArr[i-1]!=null
+    && macdArr[i]>sigArr[i] && macdArr[i-1]<=sigArr[i-1]);
+  const mDead = macdArr.some((_,i)=>i>=n-3&&i>0 && macdArr[i]!=null&&sigArr[i]!=null&&macdArr[i-1]!=null&&sigArr[i-1]!=null
+    && macdArr[i]<sigArr[i] && macdArr[i-1]>=sigArr[i-1]);
+  const resonanceBuy  = kGold && mGold;
+  const resonanceSell = kDead && mDead;
+
+  // ── Sniper Signal (Slope-based) ───────────────
+  const slopeW5  = linReg(closes.slice(-5))  / price * 100;
+  const slopeW10 = linReg(closes.slice(-10)) / price * 100;
+  const sniperSignal = (slopeW5>0 && slopeW10>0) ? 1 : (slopeW5<0 && slopeW10<0) ? -1 : 0;
+
+  // ── Double Defense ────────────────────────────
+  let doubleDefense = false, ddType = 'None';
+  if(resonanceBuy  && sniperSignal===1) { doubleDefense=true; ddType='Bullish'; }
+  if(resonanceSell && sniperSignal===-1){ doubleDefense=true; ddType='Bearish'; }
+
+  // ── 0-100 狙擊手評分 ──────────────────────────
+  let ddScore = 50;
+  const ddReasons = [];
+
+  // [1] 基礎指標 (±20)
+  if(stDir[n-1]===1){ ddScore+=10; ddReasons.push({t:'Supertrend多頭',c:'buy'}); }
+  else              { ddScore-=10; ddReasons.push({t:'Supertrend空頭',c:'sell'}); }
+  if(obvTrend==='Bullish'&&volRatio>1.1){ ddScore+=10; ddReasons.push({t:'OBV看多',c:'buy'}); }
+  else if(obvTrend==='Bearish')          { ddScore-=10; ddReasons.push({t:'OBV看空',c:'sell'}); }
+
+  // [2] 進階指標 (±30)
+  if(ttmSignal===1)       { ddScore+=15; ddReasons.push({t:'TTM擠壓噴出(多)',c:'buy'}); }
+  else if(ttmSignal===-1) { ddScore-=15; ddReasons.push({t:'TTM擠壓噴出(空)',c:'sell'}); }
+  if(rsiDiv==='Bullish Div'){ ddScore+=15; ddReasons.push({t:'RSI底背離',c:'buy'}); }
+  else if(rsiDiv==='Bearish Div'){ ddScore-=15; ddReasons.push({t:'RSI頂背離',c:'sell'}); }
+
+  // [3] 共振 + 狙擊手 (核心 ±35)
+  if(resonanceBuy) { ddScore+=20; ddReasons.push({t:'KDJ/MACD金叉共振',c:'buy'}); }
+  if(resonanceSell){ ddScore-=20; ddReasons.push({t:'KDJ/MACD死叉共振',c:'sell'}); }
+  if(sniperSignal===1) { ddScore+=15; ddReasons.push({t:'🎯 狙擊手AI看多',c:'buy'}); }
+  if(sniperSignal===-1){ ddScore-=15; ddReasons.push({t:'🎯 狙擊手AI看空',c:'sell'}); }
+
+  // [4] 雙重防衛加權 (±10)
+  if(doubleDefense){
+    if(ddType==='Bullish'){ ddScore+=10; ddReasons.push({t:'🛡️ 雙重防衛(多頭協同)',c:'buy'}); }
+    else                  { ddScore-=10; ddReasons.push({t:'🛡️ 雙重防衛(空頭協同)',c:'sell'}); }
+  }
+
+  // [5] 輔助 (ADX/RVOL/黃金口袋)
+  if(adx>25) { ddScore+=5; }
+  if(rvol>1.5){ ddScore+=5; ddReasons.push({t:`RVOL爆量(${rvol.toFixed(1)}x)`,c:'buy'}); }
+  if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
+
+  // [6] K線型態（在 patterns 計算之前暫用信號代理）
+  const klinePatScore = buy - sell; // proxy
+  if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
+  else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
+
+  ddScore = Math.max(0, Math.min(100, ddScore));
+
+  // ── 7 FACTORS ────────────────────────────────────
+  const momScore = clamp(
+    (ret1m>5?2:ret1m>0?1:ret1m<-5?-2:-1) +
+    (ret3m>10?2:ret3m>0?1:ret3m<-10?-2:-1) +
+    (ret6m>15?2:ret6m<-10?-2:0) +
+    (rsi<40?1:rsi>65?-1:0),-5,5);
+
+  // ── 基本面數據（已由 fetchFundamentals 合併好傳入）──
+  // quoteData 此處即為 fetchFundamentals() 回傳的合併物件
+  const fund = (quoteData && typeof quoteData === 'object' && !quoteData.chart)
+    ? quoteData                          // 已是合併後的 fund 物件
+    : extractFundamentals(quoteData);    // 舊路徑兼容（傳 chartJson）
+  const pe      = fund.pe;
+  const forwardPE= fund.forwardPE;
+  const pb      = fund.pb;
+  const roe     = fund.roe;
+  const revGr   = fund.revGr;
+  const epsGr   = fund.epsGr;
+  const divY    = fund.divY;
+  const mktCap  = fund.mktCap;
+  const debtEq  = fund.debtEq;
+  const currRatio= fund.currRatio;
+  const profitMgn= fund.profitMgn;
+  const grossMgn = fund.grossMgn;
+  const opMgn    = fund.opMgn;
+  const beta     = fund.beta;
+  const peg      = fund.peg;
+  const eps      = fund.eps;
+  const bv       = fund.bv;
+  const evEbitda = fund.evEbitda;
+  const hi52     = fund.hi52;
+  const lo52     = fund.lo52;
+
+  // ── 估值評分 (Value Score) ─────────────────────────
+  let valScore = 0;
+  if(pe != null){
+    if(pe < 0)       valScore -= 2;       // 虧損
+    else if(pe < 12) valScore += 3;       // 超低估
+    else if(pe < 18) valScore += 2;       // 低估
+    else if(pe < 25) valScore += 1;       // 合理
+    else if(pe < 35) valScore -= 1;       // 略高
+    else if(pe < 50) valScore -= 2;       // 偏貴
+    else             valScore -= 3;       // 嚴重高估
+  }
+  if(pb != null){
+    if(pb < 1)       valScore += 2;
+    else if(pb < 2)  valScore += 1;
+    else if(pb < 5)  valScore += 0;
+    else             valScore -= 1;
+  }
+  if(roe != null){
+    if(roe > 0.25)   valScore += 2;
+    else if(roe > 0.15) valScore += 1;
+    else if(roe < 0) valScore -= 2;
+    else             valScore -= 1;
+  }
+  if(peg != null && peg > 0){
+    if(peg < 1)      valScore += 2;
+    else if(peg < 2) valScore += 1;
+    else if(peg > 3) valScore -= 1;
+  }
+  if(debtEq != null){
+    if(debtEq < 30)  valScore += 1;
+    else if(debtEq > 200) valScore -= 1;
+  }
+  valScore = clamp(valScore, -5, 5);
+
+  const qualScore = clamp(
+    (r2>0.8?2:r2>0.6?1:r2<0.3?-1:0) +
+    (obvTrend==='Bullish'?2:-1) +
+    (stDir[n-1]===1?2:-2) +
+    (chop<45?1:chop>61.8?-1:0),-5,5);
+
+  const growScore = clamp(
+    (revGr!=null?(revGr>0.2?3:revGr>0.05?2:revGr>0?1:revGr<-0.1?-2:-1):
+      (ret12m>30?3:ret12m>15?2:ret12m>5?1:ret12m<-10?-2:-1)) +
+    (epsGr!=null?(epsGr>0.2?2:epsGr>0.05?1:epsGr<-0.1?-2:0):0) +
+    (volRatio>1.5?1:0),-5,5);
+
+  const volScore = clamp(
+    (hv>60?-2:hv>40?-1:hv<20?1:0) +
+    (atrPct>3?-1:0),-5,5);
+
+  const sentScore = clamp(
+    (rsi<30?2:rsi>70?-2:0) +
+    (mfi<30?1:mfi>70?-1:0) +
+    (stochRSI<20?2:stochRSI>80?-1:0),-5,5);
+
+  const pvMA200 = e200[n-1]!=null?(price/e200[n-1]-1)*100:0;
+  const macroScore = clamp((pvMA200>5?1:pvMA200<-5?-1:0)+(slope>0?1:-1),-5,5);
+
+  const comp = +(momScore*.20+valScore*.15+qualScore*.20+growScore*.15+volScore*.10+sentScore*.15+macroScore*.05).toFixed(2);
+
+  // ── DOW THEORY ────────────────────────────────────
+  // Dow Theory 計算 → 已移至 Dow Theory 強化區塊 (dowScore/dowSignal/majTrend/interTrend/minTrend)
+
+    // 123/2B Rule → 見 Dow Theory 強化區塊
+  const rule2b  = (price>peak1*(1+0.02)&&histV<0.03*price)?'可能假突破 (2B警示)':'無明顯假突破';
+
+  // ── DOW THEORY 強化 ─────────────────────────────
+  // 道氏三重趨勢（主趨勢/中趨勢/短趨勢）
+  const majTrend  = e200[n-1]!=null ? (price>e200[n-1]?'Bull':'Bear') : 'N/A';
+  const interTrend= ma60[n-1]!=null ? (price>ma60[n-1] ?'Bull':'Bear') : 'N/A';
+  const minTrend  = ma20[n-1]!=null ? (price>ma20[n-1] ?'Bull':'Bear') : 'N/A';
+  const dowTrend3 = majTrend==='Bull'&&interTrend==='Bull'&&minTrend==='Bull' ? 'TripleBull' :
+                    majTrend==='Bear'&&interTrend==='Bear'&&minTrend==='Bear' ? 'TripleBear' :
+                    majTrend==='Bull'&&interTrend==='Bull'                   ? 'MajInterBull' :
+                    majTrend==='Bear'&&interTrend==='Bear'                   ? 'MajInterBear' : 'Mixed';
+
+  // 123法則（更精確版）
+  const peak1   = Math.max(...closes.slice(-40,-20));
+  const trough  = Math.min(...closes.slice(-30,-10));
+  const peak2   = Math.max(...closes.slice(-10));
+  const rule123Bull = peak2>peak1 && trough>Math.min(...closes.slice(-40,-20)) && price>peak1;
+  const rule123Bear = trough<Math.min(...closes.slice(-40,-20)) && peak2<peak1 && price<trough;
+  // 2B 法則（假突破反轉）
+  const swingHi = Math.max(...highs.slice(-20,-1));
+  const swingLo = Math.min(...lows.slice(-20,-1));
+  const twoBBull= highs[n-1]>swingHi && closes[n-1]<swingHi;  // 刺破高點後收低
+  const twoBBear= lows[n-1]<swingLo  && closes[n-1]>swingLo;  // 刺破低點後收高
+
+  // 道氏評分（-10 ~ +10）
+  const dowScore = (majTrend==='Bull'?4:-4) + (interTrend==='Bull'?3:-3) +
+                   (minTrend==='Bull'?2:-2) + (rule123Bull?3:rule123Bear?-3:0) +
+                   (twoBBull?-2:twoBBear?2:0);
+  const dowSignal= dowScore>=8?'Strong Bullish':dowScore>=4?'Bullish':
+                   dowScore<=-8?'Strong Bearish':dowScore<=-4?'Bearish':'Neutral';
+
+  // ── WYCKOFF 強化 ─────────────────────────────────
+  const recentSlope = linReg(closes.slice(-20));
+  const recentVol   = vols.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const prevVol     = vols.slice(-40,-20).reduce((a,b)=>a+b,0)/20;
+  const volExpand   = recentVol>prevVol*1.3;
+  const wyPhase = recentSlope>0 && volExpand ? 'Phase E (Markup)' :
+                  recentSlope>0 && !volExpand? 'Phase C/D (Testing/SOS)' :
+                  recentSlope<0 && volExpand ? 'Phase A/B (Distribution)' :
+                  'Phase B (Consolidation)';
+  const wyType = price>e200[n-1] ? 'Accumulation (吸籌)' : 'Distribution (派發)';
+  const wySpring = lows[n-1]<Math.min(...lows.slice(-10,-1))&&closes[n-1]>lows[n-1]*1.01;
+  const wyUpthrust = highs[n-1]>Math.max(...highs.slice(-10,-1))&&closes[n-1]<highs[n-1]*0.99;
+  const wySOS = stDir[n-1]===1&&macdV>0&&rsi>50&&volRatio>1.3;
+  const wySOW = stDir[n-1]===-1&&macdV<0&&rsi<50&&volRatio>1.3;
+
+  // ── RISK 風控計算 ────────────────────────────────
+  const stopLoss    = price - 2.5*atr;          // ATR停損 2.5x
+  const stopLossAgg = price - 1.5*atr;          // 積極停損 1.5x
+  const stopLossCon = price - 3.5*atr;          // 保守停損 3.5x
+  const stopPct     = (stopLoss/price-1)*100;
+  const tgt1        = price + 2.5*atr;          // 停利1 (1:1 RR)
+  const tgt2        = price + 5.0*atr;          // 停利2 (1:2 RR)
+  const tgt3        = price + 7.5*atr;          // 停利3 (1:3 RR)
+
+  // VaR / CVaR
+  const rets = closes.map((_,i)=>i===0?0:(closes[i]-closes[i-1])/closes[i-1]);
+  const sortedRets = rets.slice(1).sort((a,b)=>a-b);
+  const N = sortedRets.length;
+  const var95  = sortedRets[Math.floor(N*0.05)]*100;  // 95% VaR
+  const var99  = sortedRets[Math.floor(N*0.01)]*100;  // 99% VaR
+  const cvar95 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.05))).reduce((a,b)=>a+b,0)/
+                 Math.max(1,Math.floor(N*0.05))*100;
+  const cvar99 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.01))).reduce((a,b)=>a+b,0)/
+                 Math.max(1,Math.floor(N*0.01))*100;
+
+  // Kelly 公式: f = (p*b - q) / b  其中 b=RR, p=估計勝率, q=1-p
+  // 用歷史勝率（上漲天數/總天數）作估計
+  const upDays   = rets.filter(r=>r>0).length;
+  const winRateEst = N > 0 ? upDays/N : 0.5;
+  const rr       = 2.0;  // 目標 RR 1:2
+  const kellyFull= (winRateEst*rr - (1-winRateEst)) / rr;
+  const kellyHalf= Math.max(0, kellyFull/2)*100;   // 半Kelly（更保守）
+  const posSz    = Math.min(kellyHalf, 30).toFixed(1);  // 上限30%
+
+  // 歷史波動率（年化）
+  const hvAnn = (hv * Math.sqrt(252)).toFixed(1);
+
+  // Chart bars with indicators (include all for candlestick)
+  const chartBars = bars.map((b,i)=>({...b,
+    ema20:  e20[i]!=null?+e20[i].toFixed(4):null,
+    ema50:  e50[i]!=null?+e50[i].toFixed(4):null,
+    ema200: e200[i]!=null?+e200[i].toFixed(4):null,
+    bb_up:  bbUp[i]!=null?+bbUp[i].toFixed(4):null,
+    bb_lo:  bbLo[i]!=null?+bbLo[i].toFixed(4):null,
+    macd_h: histArr[i]!=null?+histArr[i].toFixed(4):null,
+    macd_l: macdArr[i]!=null?+macdArr[i].toFixed(4):null,
+    sig_l:  sigArr[i]!=null?+sigArr[i].toFixed(4):null,
+    rsi_v:  rsiArr[i]!=null?+rsiArr[i].toFixed(2):null,
+  }));
+
+  // Detect K-line patterns (on full bars)
+  const patterns = detectKPatterns(bars);
+
+  // ── 評分前提前計算（避免 before initialization 錯誤）──
+  const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
+  const fib618X = (hiX-loX)*0.618+loX, fib786X = (hiX-loX)*0.786+loX;
+  const inGolden    = price>=fib618X && price<=fib786X;
+  const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
+
   let score = 0;  // 統一淨分
   const sigs = [];
   const S = (pt, label, cat) => {
@@ -2619,326 +2947,6 @@ function analyze(bars, ticker, quoteData){
                  total <= -30? 'Strong Sell'  :
                  total <= -15? 'Sell'          : 'Hold';
 
-  co
-
-  /* ══════════════════════════════════════════════
-     🛡️ 雙重防衛系統 v8.5
-     ── 完整複刻原版評分邏輯 ──
-  ══════════════════════════════════════════════ */
-
-  // ── ADX（Average Directional Index）──────────
-  function calcADX(hi, lo, cl, p=14){
-    const n2=hi.length;
-    const tr=[],pdm=[],ndm=[];
-    for(let i=1;i<n2;i++){
-      const h=hi[i]-lo[i], h2=Math.abs(hi[i]-cl[i-1]), h3=Math.abs(lo[i]-cl[i-1]);
-      tr.push(Math.max(h,h2,h3));
-      pdm.push(hi[i]-hi[i-1]>lo[i-1]-lo[i]?Math.max(hi[i]-hi[i-1],0):0);
-      ndm.push(lo[i-1]-lo[i]>hi[i]-hi[i-1]?Math.max(lo[i-1]-lo[i],0):0);
-    }
-    // Wilder smooth
-    function ws(arr,p2){
-      const o=[];let s=arr.slice(0,p2).reduce((a,b)=>a+b,0);o.push(s);
-      for(let i=p2;i<arr.length;i++){s=s-s/p2+arr[i];o.push(s);}
-      return o;
-    }
-    const atr14=ws(tr,p),pdi14=ws(pdm,p),ndi14=ws(ndm,p);
-    const pdi=pdi14.map((v,i)=>atr14[i]?v/atr14[i]*100:0);
-    const ndi=ndi14.map((v,i)=>atr14[i]?v/atr14[i]*100:0);
-    const dx=pdi.map((v,i)=>{const s=v+ndi[i];return s?Math.abs(v-ndi[i])/s*100:0;});
-    const adxArr=ws(dx,p);
-    return {
-      adx:  adxArr[adxArr.length-1]??25,
-      pdi:  pdi[pdi.length-1]??0,
-      ndi:  ndi[ndi.length-1]??0,
-    };
-  }
-  const {adx, pdi: pdiV, ndi: ndiV} = calcADX(highs, lows, closes);
-
-  // ── RVOL (Relative Volume) ────────────────────
-  const rvol = volRatio; // already computed above
-
-  // ── RSI Divergence ────────────────────────────
-  // Simplified: bullish div = price lower low but RSI higher low (last 10 bars)
-  let rsiDiv = 'None';
-  if(n>=12){
-    const priceLL = closes[n-1] < Math.min(...closes.slice(-10,-1));
-    const rsiHL   = rsiArr[n-1]!=null && rsiArr[n-1] > Math.min(...rsiArr.slice(-10,-1).filter(v=>v!=null));
-    const priceHH = closes[n-1] > Math.max(...closes.slice(-10,-1));
-    const rsiLH   = rsiArr[n-1]!=null && rsiArr[n-1] < Math.max(...rsiArr.slice(-10,-1).filter(v=>v!=null));
-    if(priceLL && rsiHL) rsiDiv = 'Bullish Div';
-    else if(priceHH && rsiLH) rsiDiv = 'Bearish Div';
-  }
-
-  // ── TTM Squeeze ───────────────────────────────
-  // Squeeze: BB inside KC (Keltner Channel)
-  const kcMid  = e20;
-  const kcBand = atrArr.map((a,i)=> a!=null ? a*1.5 : null);
-  const bbWidthArr= bbUp.map((u,i)=> (u!=null&&bbLo[i]!=null) ? (u-bbLo[i])/2 : null);
-  const kcWidth= kcBand.map(b=> b!=null ? b : null);
-  const ttmSqueeze = bbWidthArr[n-1]!=null && kcWidth[n-1]!=null && bbWidthArr[n-1] < kcWidth[n-1];
-  // TTM momentum: delta of (close - midpoint of BB/KC)
-  const ttmMomentum = closes[n-1] - (bbMid[n-1]??closes[n-1]);
-  const ttmMomPrev  = closes[n-2] - (bbMid[n-2]??closes[n-2]);
-  let ttmSignal = 0;
-  if(ttmSqueeze && ttmMomentum > 0 && ttmMomentum > ttmMomPrev) ttmSignal = 1;  // squeeze + expanding up
-  if(ttmSqueeze && ttmMomentum < 0 && ttmMomentum < ttmMomPrev) ttmSignal = -1; // squeeze + expanding down
-
-  // ── KDJ/MACD Resonance ────────────────────────
-  // KDJ golden cross in last 3 bars
-  const kGold = kArr.some((_,i)=>i>=n-3&&i>0 && kArr[i]!=null&&dArr[i]!=null&&kArr[i-1]!=null&&dArr[i-1]!=null
-    && kArr[i]>dArr[i] && kArr[i-1]<=dArr[i-1]);
-  const kDead = kArr.some((_,i)=>i>=n-3&&i>0 && kArr[i]!=null&&dArr[i]!=null&&kArr[i-1]!=null&&dArr[i-1]!=null
-    && kArr[i]<dArr[i] && kArr[i-1]>=dArr[i-1]);
-  // MACD golden cross in last 3 bars
-  const mGold = macdArr.some((_,i)=>i>=n-3&&i>0 && macdArr[i]!=null&&sigArr[i]!=null&&macdArr[i-1]!=null&&sigArr[i-1]!=null
-    && macdArr[i]>sigArr[i] && macdArr[i-1]<=sigArr[i-1]);
-  const mDead = macdArr.some((_,i)=>i>=n-3&&i>0 && macdArr[i]!=null&&sigArr[i]!=null&&macdArr[i-1]!=null&&sigArr[i-1]!=null
-    && macdArr[i]<sigArr[i] && macdArr[i-1]>=sigArr[i-1]);
-  const resonanceBuy  = kGold && mGold;
-  const resonanceSell = kDead && mDead;
-
-  // ── Sniper Signal (Slope-based) ───────────────
-  const slopeW5  = linReg(closes.slice(-5))  / price * 100;
-  const slopeW10 = linReg(closes.slice(-10)) / price * 100;
-  const sniperSignal = (slopeW5>0 && slopeW10>0) ? 1 : (slopeW5<0 && slopeW10<0) ? -1 : 0;
-
-  // ── Double Defense ────────────────────────────
-  let doubleDefense = false, ddType = 'None';
-  if(resonanceBuy  && sniperSignal===1) { doubleDefense=true; ddType='Bullish'; }
-  if(resonanceSell && sniperSignal===-1){ doubleDefense=true; ddType='Bearish'; }
-
-  // ── 0-100 狙擊手評分 ──────────────────────────
-  let ddScore = 50;
-  const ddReasons = [];
-
-  // [1] 基礎指標 (±20)
-  if(stDir[n-1]===1){ ddScore+=10; ddReasons.push({t:'Supertrend多頭',c:'buy'}); }
-  else              { ddScore-=10; ddReasons.push({t:'Supertrend空頭',c:'sell'}); }
-  if(obvTrend==='Bullish'&&volRatio>1.1){ ddScore+=10; ddReasons.push({t:'OBV看多',c:'buy'}); }
-  else if(obvTrend==='Bearish')          { ddScore-=10; ddReasons.push({t:'OBV看空',c:'sell'}); }
-
-  // [2] 進階指標 (±30)
-  if(ttmSignal===1)       { ddScore+=15; ddReasons.push({t:'TTM擠壓噴出(多)',c:'buy'}); }
-  else if(ttmSignal===-1) { ddScore-=15; ddReasons.push({t:'TTM擠壓噴出(空)',c:'sell'}); }
-  if(rsiDiv==='Bullish Div'){ ddScore+=15; ddReasons.push({t:'RSI底背離',c:'buy'}); }
-  else if(rsiDiv==='Bearish Div'){ ddScore-=15; ddReasons.push({t:'RSI頂背離',c:'sell'}); }
-
-  // [3] 共振 + 狙擊手 (核心 ±35)
-  if(resonanceBuy) { ddScore+=20; ddReasons.push({t:'KDJ/MACD金叉共振',c:'buy'}); }
-  if(resonanceSell){ ddScore-=20; ddReasons.push({t:'KDJ/MACD死叉共振',c:'sell'}); }
-  if(sniperSignal===1) { ddScore+=15; ddReasons.push({t:'🎯 狙擊手AI看多',c:'buy'}); }
-  if(sniperSignal===-1){ ddScore-=15; ddReasons.push({t:'🎯 狙擊手AI看空',c:'sell'}); }
-
-  // [4] 雙重防衛加權 (±10)
-  if(doubleDefense){
-    if(ddType==='Bullish'){ ddScore+=10; ddReasons.push({t:'🛡️ 雙重防衛(多頭協同)',c:'buy'}); }
-    else                  { ddScore-=10; ddReasons.push({t:'🛡️ 雙重防衛(空頭協同)',c:'sell'}); }
-  }
-
-  // [5] 輔助 (ADX/RVOL/黃金口袋)
-  if(adx>25) { ddScore+=5; }
-  if(rvol>1.5){ ddScore+=5; ddReasons.push({t:`RVOL爆量(${rvol.toFixed(1)}x)`,c:'buy'}); }
-  if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
-
-  // [6] K線型態（在 patterns 計算之前暫用信號代理）
-  const klinePatScore = buy - sell; // proxy
-  if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
-  else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
-
-  ddScore = Math.max(0, Math.min(100, ddScore));
-
-  // ── 7 FACTORS ────────────────────────────────────
-  const momScore = clamp(
-    (ret1m>5?2:ret1m>0?1:ret1m<-5?-2:-1) +
-    (ret3m>10?2:ret3m>0?1:ret3m<-10?-2:-1) +
-    (ret6m>15?2:ret6m<-10?-2:0) +
-    (rsi<40?1:rsi>65?-1:0),-5,5);
-
-  // ── 基本面數據（已由 fetchFundamentals 合併好傳入）──
-  // quoteData 此處即為 fetchFundamentals() 回傳的合併物件
-  const fund = (quoteData && typeof quoteData === 'object' && !quoteData.chart)
-    ? quoteData                          // 已是合併後的 fund 物件
-    : extractFundamentals(quoteData);    // 舊路徑兼容（傳 chartJson）
-  const pe      = fund.pe;
-  const forwardPE= fund.forwardPE;
-  const pb      = fund.pb;
-  const roe     = fund.roe;
-  const revGr   = fund.revGr;
-  const epsGr   = fund.epsGr;
-  const divY    = fund.divY;
-  const mktCap  = fund.mktCap;
-  const debtEq  = fund.debtEq;
-  const currRatio= fund.currRatio;
-  const profitMgn= fund.profitMgn;
-  const grossMgn = fund.grossMgn;
-  const opMgn    = fund.opMgn;
-  const beta     = fund.beta;
-  const peg      = fund.peg;
-  const eps      = fund.eps;
-  const bv       = fund.bv;
-  const evEbitda = fund.evEbitda;
-  const hi52     = fund.hi52;
-  const lo52     = fund.lo52;
-
-  // ── 估值評分 (Value Score) ─────────────────────────
-  let valScore = 0;
-  if(pe != null){
-    if(pe < 0)       valScore -= 2;       // 虧損
-    else if(pe < 12) valScore += 3;       // 超低估
-    else if(pe < 18) valScore += 2;       // 低估
-    else if(pe < 25) valScore += 1;       // 合理
-    else if(pe < 35) valScore -= 1;       // 略高
-    else if(pe < 50) valScore -= 2;       // 偏貴
-    else             valScore -= 3;       // 嚴重高估
-  }
-  if(pb != null){
-    if(pb < 1)       valScore += 2;
-    else if(pb < 2)  valScore += 1;
-    else if(pb < 5)  valScore += 0;
-    else             valScore -= 1;
-  }
-  if(roe != null){
-    if(roe > 0.25)   valScore += 2;
-    else if(roe > 0.15) valScore += 1;
-    else if(roe < 0) valScore -= 2;
-    else             valScore -= 1;
-  }
-  if(peg != null && peg > 0){
-    if(peg < 1)      valScore += 2;
-    else if(peg < 2) valScore += 1;
-    else if(peg > 3) valScore -= 1;
-  }
-  if(debtEq != null){
-    if(debtEq < 30)  valScore += 1;
-    else if(debtEq > 200) valScore -= 1;
-  }
-  valScore = clamp(valScore, -5, 5);
-
-  const qualScore = clamp(
-    (r2>0.8?2:r2>0.6?1:r2<0.3?-1:0) +
-    (obvTrend==='Bullish'?2:-1) +
-    (stDir[n-1]===1?2:-2) +
-    (chop<45?1:chop>61.8?-1:0),-5,5);
-
-  const growScore = clamp(
-    (revGr!=null?(revGr>0.2?3:revGr>0.05?2:revGr>0?1:revGr<-0.1?-2:-1):
-      (ret12m>30?3:ret12m>15?2:ret12m>5?1:ret12m<-10?-2:-1)) +
-    (epsGr!=null?(epsGr>0.2?2:epsGr>0.05?1:epsGr<-0.1?-2:0):0) +
-    (volRatio>1.5?1:0),-5,5);
-
-  const volScore = clamp(
-    (hv>60?-2:hv>40?-1:hv<20?1:0) +
-    (atrPct>3?-1:0),-5,5);
-
-  const sentScore = clamp(
-    (rsi<30?2:rsi>70?-2:0) +
-    (mfi<30?1:mfi>70?-1:0) +
-    (stochRSI<20?2:stochRSI>80?-1:0),-5,5);
-
-  const pvMA200 = e200[n-1]!=null?(price/e200[n-1]-1)*100:0;
-  const macroScore = clamp((pvMA200>5?1:pvMA200<-5?-1:0)+(slope>0?1:-1),-5,5);
-
-  const comp = +(momScore*.20+valScore*.15+qualScore*.20+growScore*.15+volScore*.10+sentScore*.15+macroScore*.05).toFixed(2);
-
-  // ── DOW THEORY ────────────────────────────────────
-  // Dow Theory 計算 → 已移至 Dow Theory 強化區塊 (dowScore/dowSignal/majTrend/interTrend/minTrend)
-
-    // 123/2B Rule → 見 Dow Theory 強化區塊
-  const rule2b  = (price>peak1*(1+0.02)&&histV<0.03*price)?'可能假突破 (2B警示)':'無明顯假突破';
-
-  // ── DOW THEORY 強化 ─────────────────────────────
-  // 道氏三重趨勢（主趨勢/中趨勢/短趨勢）
-  const majTrend  = e200[n-1]!=null ? (price>e200[n-1]?'Bull':'Bear') : 'N/A';
-  const interTrend= ma60[n-1]!=null ? (price>ma60[n-1] ?'Bull':'Bear') : 'N/A';
-  const minTrend  = ma20[n-1]!=null ? (price>ma20[n-1] ?'Bull':'Bear') : 'N/A';
-  const dowTrend3 = majTrend==='Bull'&&interTrend==='Bull'&&minTrend==='Bull' ? 'TripleBull' :
-                    majTrend==='Bear'&&interTrend==='Bear'&&minTrend==='Bear' ? 'TripleBear' :
-                    majTrend==='Bull'&&interTrend==='Bull'                   ? 'MajInterBull' :
-                    majTrend==='Bear'&&interTrend==='Bear'                   ? 'MajInterBear' : 'Mixed';
-
-  // 123法則（更精確版）
-  const peak1   = Math.max(...closes.slice(-40,-20));
-  const trough  = Math.min(...closes.slice(-30,-10));
-  const peak2   = Math.max(...closes.slice(-10));
-  const rule123Bull = peak2>peak1 && trough>Math.min(...closes.slice(-40,-20)) && price>peak1;
-  const rule123Bear = trough<Math.min(...closes.slice(-40,-20)) && peak2<peak1 && price<trough;
-  // 2B 法則（假突破反轉）
-  const swingHi = Math.max(...highs.slice(-20,-1));
-  const swingLo = Math.min(...lows.slice(-20,-1));
-  const twoBBull= highs[n-1]>swingHi && closes[n-1]<swingHi;  // 刺破高點後收低
-  const twoBBear= lows[n-1]<swingLo  && closes[n-1]>swingLo;  // 刺破低點後收高
-
-  // 道氏評分（-10 ~ +10）
-  const dowScore = (majTrend==='Bull'?4:-4) + (interTrend==='Bull'?3:-3) +
-                   (minTrend==='Bull'?2:-2) + (rule123Bull?3:rule123Bear?-3:0) +
-                   (twoBBull?-2:twoBBear?2:0);
-  const dowSignal= dowScore>=8?'Strong Bullish':dowScore>=4?'Bullish':
-                   dowScore<=-8?'Strong Bearish':dowScore<=-4?'Bearish':'Neutral';
-
-  // ── WYCKOFF 強化 ─────────────────────────────────
-  const recentSlope = linReg(closes.slice(-20));
-  const recentVol   = vols.slice(-20).reduce((a,b)=>a+b,0)/20;
-  const prevVol     = vols.slice(-40,-20).reduce((a,b)=>a+b,0)/20;
-  const volExpand   = recentVol>prevVol*1.3;
-  const wyPhase = recentSlope>0 && volExpand ? 'Phase E (Markup)' :
-                  recentSlope>0 && !volExpand? 'Phase C/D (Testing/SOS)' :
-                  recentSlope<0 && volExpand ? 'Phase A/B (Distribution)' :
-                  'Phase B (Consolidation)';
-  const wyType = price>e200[n-1] ? 'Accumulation (吸籌)' : 'Distribution (派發)';
-  const wySpring = lows[n-1]<Math.min(...lows.slice(-10,-1))&&closes[n-1]>lows[n-1]*1.01;
-  const wyUpthrust = highs[n-1]>Math.max(...highs.slice(-10,-1))&&closes[n-1]<highs[n-1]*0.99;
-  const wySOS = stDir[n-1]===1&&macdV>0&&rsi>50&&volRatio>1.3;
-  const wySOW = stDir[n-1]===-1&&macdV<0&&rsi<50&&volRatio>1.3;
-
-  // ── RISK 風控計算 ────────────────────────────────
-  const stopLoss    = price - 2.5*atr;          // ATR停損 2.5x
-  const stopLossAgg = price - 1.5*atr;          // 積極停損 1.5x
-  const stopLossCon = price - 3.5*atr;          // 保守停損 3.5x
-  const stopPct     = (stopLoss/price-1)*100;
-  const tgt1        = price + 2.5*atr;          // 停利1 (1:1 RR)
-  const tgt2        = price + 5.0*atr;          // 停利2 (1:2 RR)
-  const tgt3        = price + 7.5*atr;          // 停利3 (1:3 RR)
-
-  // VaR / CVaR
-  const rets = closes.map((_,i)=>i===0?0:(closes[i]-closes[i-1])/closes[i-1]);
-  const sortedRets = rets.slice(1).sort((a,b)=>a-b);
-  const N = sortedRets.length;
-  const var95  = sortedRets[Math.floor(N*0.05)]*100;  // 95% VaR
-  const var99  = sortedRets[Math.floor(N*0.01)]*100;  // 99% VaR
-  const cvar95 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.05))).reduce((a,b)=>a+b,0)/
-                 Math.max(1,Math.floor(N*0.05))*100;
-  const cvar99 = sortedRets.slice(0,Math.max(1,Math.floor(N*0.01))).reduce((a,b)=>a+b,0)/
-                 Math.max(1,Math.floor(N*0.01))*100;
-
-  // Kelly 公式: f = (p*b - q) / b  其中 b=RR, p=估計勝率, q=1-p
-  // 用歷史勝率（上漲天數/總天數）作估計
-  const upDays   = rets.filter(r=>r>0).length;
-  const winRateEst = N > 0 ? upDays/N : 0.5;
-  const rr       = 2.0;  // 目標 RR 1:2
-  const kellyFull= (winRateEst*rr - (1-winRateEst)) / rr;
-  const kellyHalf= Math.max(0, kellyFull/2)*100;   // 半Kelly（更保守）
-  const posSz    = Math.min(kellyHalf, 30).toFixed(1);  // 上限30%
-
-  // 歷史波動率（年化）
-  const hvAnn = (hv * Math.sqrt(252)).toFixed(1);
-
-  // Chart bars with indicators (include all for candlestick)
-  const chartBars = bars.map((b,i)=>({...b,
-    ema20:  e20[i]!=null?+e20[i].toFixed(4):null,
-    ema50:  e50[i]!=null?+e50[i].toFixed(4):null,
-    ema200: e200[i]!=null?+e200[i].toFixed(4):null,
-    bb_up:  bbUp[i]!=null?+bbUp[i].toFixed(4):null,
-    bb_lo:  bbLo[i]!=null?+bbLo[i].toFixed(4):null,
-    macd_h: histArr[i]!=null?+histArr[i].toFixed(4):null,
-    macd_l: macdArr[i]!=null?+macdArr[i].toFixed(4):null,
-    sig_l:  sigArr[i]!=null?+sigArr[i].toFixed(4):null,
-    rsi_v:  rsiArr[i]!=null?+rsiArr[i].toFixed(2):null,
-  }));
-
-  // Detect K-line patterns (on full bars)
-  const patterns = detectKPatterns(bars);
-
   return {
     ticker, signal, buy_score:buy, sell_score:sell, net_score:score, total_score:total,
     composite_score:comp, price, signals:sigs,
@@ -3328,13 +3336,21 @@ async function doAnalyze(){
   setLoading(ticker);
 
   try {
-    // 取 chart（OHLCV + YF modules 嘗試）
-    // 速度優化：chart 取完後立刻並行取基本面 + 開始計算
+    setProgress('init', '連線中…', ticker);
+
+    // 步驟1：取 K 線數據
+    setProgress('chart', '抓取K線數據…', `${ticker} - Yahoo Finance`);
     const chartJson = await fetchYF(ticker);
+
+    setProgress('parse', '解析K線資料…', `取得 ${chartJson?.chart?.result?.[0]?.timestamp?.length||0} 根K線`);
     const bars      = parseOHLCV(chartJson);
-    // 同時發出基本面請求，不阻塞 analyze 計算
+
+    // 步驟2：並行取基本面
+    setProgress('fund', '取得基本面數據…', '同時執行技術分析');
     const fundPromise = fetchFundamentals(ticker, chartJson);
-    // 先用 chartJson 中的基本面快速 analyze（立即顯示K線和技術面）
+
+    // 步驟3：快速分析（先顯示技術面）
+    setProgress('analyze', '技術指標計算…', 'RSI / MACD / BB / EMA / ICT…');
     const fundQuick = { _src:'chart_json_quick', ...(_extractYFModules(chartJson)) };
     D = analyze(bars, ticker, fundQuick);
     D.ticker = ticker;
@@ -3342,21 +3358,39 @@ async function doAnalyze(){
     _klineCache['1wk'] = null; _klineCache['15m'] = null;
     CHART_INTERVAL = '1d'; _CV.offset=0; _CV.zoom=1;
     D._klineData = bars;
-    renderAll(D); // 先顯示技術面結果
+
+    setProgress('score', '評分系統計算…', '15大類 128個訊號評分中…');
+    await new Promise(r=>setTimeout(r,30)); // 讓 UI 更新
+
+    setProgress('render', '渲染面板…', '產生分析結果');
+    renderAll(D);
     if(window.innerWidth <= 768) showPanel('overview');
-    // 再等基本面完成，更新估值數據
+
+    // 步驟4：等待基本面
+    setProgress('fund', '等待基本面數據回傳…', 'PE / ROE / 52W / EPS…');
     const fund = await fundPromise;
     D._fundSource = fund._src || DATA_MODE;
     D._bars = bars;   // 保存 bars 供籌碼分析用
     D._fund = fund;   // 保存 fund 供借券數據用
     if(fund._count > 0){
-      D = analyze(bars, ticker, fund); // 重新分析（含估值）
+      setProgress('score', '重新評分（含估值）…',
+        `${fund._src||'YF'} | PE=${fund.pe!=null?fund.pe.toFixed(1):'N/A'} EPS=${fund.eps!=null?fund.eps.toFixed(2):'N/A'}`);
+      D = analyze(bars, ticker, fund);
       D.ticker = ticker; D._klineData = bars;
+      setProgress('render', '更新估值面板…', `${fund._count}項財務數據`);
       renderAll(D);
       if(window.innerWidth <= 768) showPanel('overview');
     }
+    setProgress('done', '分析完成！', `${ticker} - ${D.signal}`);
     // 兩階段渲染完成（以上已處理）
   } catch(err){
+    // 顯示錯誤在進度條位置
+    const msgEl = document.getElementById('loadMsg');
+    const detEl = document.getElementById('loadDetail');
+    const fill  = document.getElementById('loadBarFill');
+    if(msgEl) msgEl.textContent = '❌ 分析失敗：' + err.message;
+    if(detEl) detEl.textContent = '請確認股票代碼格式（AAPL / 2330.TW / 0700.HK）';
+    if(fill)  { fill.style.background='var(--red)'; fill.style.width='100%'; }
     showError(err.message);
   } finally {
     btn.disabled=false; btn.textContent='分 析';
@@ -3370,9 +3404,41 @@ async function doAnalyze(){
 
 function setLoading(t){
   document.getElementById('ov-empty').style.display='flex';
-  document.getElementById('ov-empty').innerHTML=`<div class="loading"><div class="spin"></div><div class="load-t">分析中 ${t}…</div></div>`;
+  document.getElementById('ov-empty').innerHTML=`
+  <div class="loading">
+    <div class="spin"></div>
+    <div class="load-t">分析中 ${t}…</div>
+    <div id="loadSteps" style="margin-top:14px;width:100%;max-width:320px">
+      <div id="loadBar" style="height:3px;background:rgba(0,212,255,.15);border-radius:2px;margin-bottom:10px;overflow:hidden">
+        <div id="loadBarFill" style="height:100%;width:0%;background:var(--cyan);border-radius:2px;transition:width .4s ease"></div>
+      </div>
+      <div id="loadMsg" style="font-size:11px;color:var(--text3);font-family:var(--fm);text-align:center">初始化…</div>
+      <div id="loadDetail" style="font-size:10px;color:var(--text3);opacity:.6;font-family:var(--fm);text-align:center;margin-top:3px"></div>
+    </div>
+  </div>`;
   document.getElementById('ov-content').style.display='none';
   document.getElementById('bannerWrap').style.display='none';
+}
+
+// 更新進度
+function setProgress(step, msg, detail=''){
+  const steps = {
+    'init':    {pct:5,  icon:'🔌', text:'初始化連線…'},
+    'chart':   {pct:20, icon:'📡', text:'抓取K線數據…'},
+    'parse':   {pct:35, icon:'📊', text:'解析OHLCV資料…'},
+    'fund':    {pct:50, icon:'💰', text:'取得基本面數據…'},
+    'analyze': {pct:65, icon:'🧮', text:'技術分析計算…'},
+    'score':   {pct:80, icon:'🎯', text:'評分系統計算…'},
+    'render':  {pct:92, icon:'🖥️', text:'渲染面板…'},
+    'done':    {pct:100,icon:'✅', text:'分析完成！'},
+  };
+  const s = steps[step] || {pct:50, icon:'⚙️', text:msg||'處理中…'};
+  const fill = document.getElementById('loadBarFill');
+  const msgEl = document.getElementById('loadMsg');
+  const detEl = document.getElementById('loadDetail');
+  if(fill) fill.style.width = s.pct + '%';
+  if(msgEl) msgEl.textContent = s.icon + ' ' + (msg||s.text);
+  if(detEl) detEl.textContent = detail;
 }
 
 function showError(msg){
