@@ -3186,12 +3186,7 @@ function analyze(bars, ticker, quoteData){
       trend_state:chop<38.2?'趨勢市':chop>61.8?'震盪市':'過渡期',
       sniper_signal:(stDir[n-1]===1&&macdJustCross&&obvTrend==='Bullish')?'✅ 狙擊就緒':'⏳ 等待確認',
     },
-    risk:{
-      stop_loss:+stopLoss.toFixed(4), stop_loss_pct:+stopPct.toFixed(2),
-      var_95:+var95.toFixed(3), cvar_99:+cvar99.toFixed(3),
-      atr:+atr.toFixed(4), position_size:+posSz,
-      target_1:+tgt1.toFixed(4), target_2:+tgt2.toFixed(4),
-    },
+    
     chart_data:    chartBars.slice(-60),
     all_chart_data:chartBars,  // full history for K-line tab
     patterns,
