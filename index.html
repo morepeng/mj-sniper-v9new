@@ -456,7 +456,6 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 </head>
 <body>
 
-<!-- HEADER -->
 <header class="hdr">
   <div class="logo">
     <span class="logo-icon">🎯</span>
@@ -498,12 +497,10 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   </div>
 </header>
 
-<!-- TICKER BAR -->
 <div class="tbar" id="tbar">
   <span style="font-size:10px;color:var(--text3);font-family:var(--fm)">市場數據載入中…</span>
 </div>
 
-<!-- NAV -->
 <nav class="nav">
   <button class="ntab active" data-tab="overview">📊 概覽</button>
   <button class="ntab" data-tab="kline">🕯️ K線型態</button>
@@ -516,10 +513,8 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <button class="ntab" data-tab="scan">🔍 市場掃描</button>
 </nav>
 
-<!-- MAIN -->
 <div class="wrap">
 
-  <!-- Signal Banner (always visible when data loaded) -->
   <div id="bannerWrap" style="display:none">
     <div class="sig-banner" id="sigBanner">
       <div class="sb-left">
@@ -539,7 +534,6 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     </div>
   </div>
 
-  <!-- OVERVIEW -->
   <div class="panel active" id="panel-overview">
     <div class="empty" id="ov-empty">
       <div class="empty-ico">🎯</div>
@@ -547,7 +541,6 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
       <div style="font-size:10px;color:var(--text3);margin-top:4px">AAPL / NVDA / 2330.TW / 0700.HK</div>
     </div>
     <div id="ov-content" style="display:none">
-      <!-- ══ 交易決策欄 ══ -->
       <div id="tradingDecision"></div>
 
       <div class="g2 mb">
@@ -585,42 +578,34 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     </div>
   </div>
 
-  <!-- K-LINE PATTERNS -->
   <div class="panel" id="panel-kline">
     <div id="klineContent"><div class="empty"><div class="empty-ico">🕯️</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- TECH -->
   <div class="panel" id="panel-tech">
     <div id="techContent"><div class="empty"><div class="empty-ico">📈</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- FACTORS -->
   <div class="panel" id="panel-factors">
     <div id="factorsContent"><div class="empty"><div class="empty-ico">🔬</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- DOW -->
   <div class="panel" id="panel-dow">
     <div id="dowContent"><div class="empty"><div class="empty-ico">📚</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- SMC -->
   <div class="panel" id="panel-smc">
     <div id="smcContent"><div class="empty"><div class="empty-ico">🏦</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- LEADING -->
   <div class="panel" id="panel-leading">
     <div id="leadingContent"><div class="empty"><div class="empty-ico">📡</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- RISK -->
   <div class="panel" id="panel-risk">
     <div id="riskContent"><div class="empty"><div class="empty-ico">⚠️</div><div class="empty-t">請先分析股票</div></div></div>
   </div>
 
-  <!-- SCAN -->
   <div class="panel" id="panel-scan">
     <div class="card mb">
       <div class="card-t">🔍 批量市場掃描 (最多 20 支)</div>
@@ -654,9 +639,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
     </div>
   </div>
 
-</div><!-- /wrap -->
-
-<script>
+</div><script>
 // ═══════════════════════════════════════════════════════════════
 //  ICT / SMC 純 JavaScript 引擎
 //  對應 Python ICT_SMC_Strategy 類別
@@ -1434,7 +1417,6 @@ async function fetchYF(ticker, range='1y', interval='1d'){
   DATA_MODE='failed';
   throw new Error(`無法取得 ${ticker} 的數據`);
 }
-
 /* ═══════════════════════════════════════════════
    FUNDAMENTALS ENGINE
    來源優先順序（依據市場自動選擇）：
@@ -2344,7 +2326,7 @@ function analyze(bars, ticker, quoteData){
   if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
 
   // [6] K線型態（在 patterns 計算之前暫用信號代理）
-  const klinePatScore = (rsi<40?20:rsi>60?-20:0)+(stDir[n-1]===1?10:-10); // RSI+Supertrend代理
+  const klinePatScore = score; // proxy（以目前淨分 score 代替）
   if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
   else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
 
@@ -3531,7 +3513,6 @@ function renderBanner(d){
   document.getElementById('bChg').innerHTML=
     `<span style="color:var(--cyan)">多方${d.buy_score}分 / 空方${d.sell_score}分 / 淨分${d.net_score??d.total_score}</span>`;
 }
-
 /* ═══════════════════════════════════════════════
    TRADING DECISION ENGINE
    產生完整交易決策建議
@@ -3668,7 +3649,6 @@ function renderTradeDecision(d){
 
   el.innerHTML = `
   <div class="td-wrap">
-    <!-- Header row -->
     <div class="td-header">
       <div class="td-label">⚡ 交易決策</div>
       <div class="td-decision" style="color:${td.decColor}">【${td.decLabel}】</div>
@@ -3678,10 +3658,8 @@ function renderTradeDecision(d){
         ${td.detail}
       </div>
     </div>
-    <!-- Body segments -->
     <div class="td-body">
 
-      <!-- Segment 1: Price & Risk/Reward -->
       <div class="td-seg" style="flex:2;min-width:220px">
         <div class="td-seg-lbl">📍 現價 · 停損 · 目標 · RR</div>
         <div class="td-rr">
@@ -3693,19 +3671,16 @@ function renderTradeDecision(d){
         </div>
       </div>
 
-      <!-- Segment 2: Filter layers -->
       <div class="td-seg" style="min-width:200px">
         <div class="td-seg-lbl">🔍 過濾層 (${td.layersPassed}/4層通過 · 分數 ${td.score100}/100)</div>
         <div style="display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-top:2px">
           ${pipHtml}
         </div>
-        <!-- Mini score bar -->
         <div style="height:4px;background:var(--bg4);border-radius:2px;margin-top:6px;overflow:hidden">
           <div style="width:${td.score100}%;height:100%;background:${scColor};border-radius:2px;transition:width .6s"></div>
         </div>
       </div>
 
-      <!-- Segment 3: Score ring + timing -->
       <div class="td-seg" style="min-width:130px;align-items:flex-start;flex-direction:row;gap:10px">
         <div>
           <div class="td-seg-lbl">綜合評分</div>
@@ -3720,7 +3695,6 @@ function renderTradeDecision(d){
         </div>
       </div>
 
-      <!-- Segment 4: Rotation -->
       <div class="td-seg" style="min-width:120px">
         <div class="td-seg-lbl">🔄 板塊輪動</div>
         <div style="font-size:13px;font-family:var(--fm);color:${td.rotText.includes('↑')?'var(--green)':td.rotText.includes('↓')?'var(--red)':'var(--text2)'};margin-top:4px">
@@ -3942,7 +3916,6 @@ function renderDoubleDefense(tech){
     </div>
     <div class="dd-body">
 
-      <!-- Score Ring -->
       <div class="dd-seg" style="display:flex;flex-direction:column;align-items:center;justify-content:center;grid-row:span 2;min-width:110px">
         <div class="dd-score-ring" style="color:${scCol};border-color:${scCol}">${score}</div>
         <div class="dd-score-lbl">狙擊評分 /100</div>
@@ -3951,7 +3924,6 @@ function renderDoubleDefense(tech){
         </div>
       </div>
 
-      <!-- Indicator Rows -->
       <div class="dd-seg" style="grid-column:span 2">
         <div class="dd-seg-l">訊號明細</div>
         ${rows.map(([n2,v2,c2])=>`
@@ -3961,7 +3933,6 @@ function renderDoubleDefense(tech){
           </div>`).join('')}
       </div>
 
-      <!-- Reasons -->
       <div class="dd-seg" style="grid-column:span 2">
         <div class="dd-seg-l">觸發原因</div>
         <div style="margin-top:4px">
@@ -4193,7 +4164,6 @@ function renderDow(d){
     </div>
   </div>
 
-  <!-- ══ 道氏三重趨勢 ══ -->
   <div class="card mb">
     <div class="card-t">📐 道氏三重趨勢確認</div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px">
@@ -4219,7 +4189,6 @@ function renderDow(d){
     </div>
   </div>
 
-  <!-- ══ OBV 四大秘訣 ══ -->
   <div class="card mb">
     <div class="card-t">📊 OBV 四大秘訣 + EMA30 交叉</div>
     <div class="g2" style="margin-bottom:8px">
@@ -4244,7 +4213,6 @@ function renderDow(d){
     </div>
   </div>
 
-  <!-- ══ BB + Slope 斜率交點 ══ -->
   <div class="card mb">
     <div class="card-t">📈 布林帶 + Slope 斜率交點</div>
     <div class="mg" style="margin-bottom:8px">
@@ -4272,7 +4240,6 @@ function renderSMC(d){
   const recentGaps = gaps.slice(-3);
 
   document.getElementById('smcContent').innerHTML=`
-  <!-- ══ ICT/SMC 結構 ══ -->
   <div class="g2 mb">
     <div class="card">
       <div class="card-t">🏦 ICT/SMC 智能資金結構</div>
@@ -4300,7 +4267,6 @@ function renderSMC(d){
           <div class="smc-val">${ict['PO3 階段']||'—'} ／ ${ict['ICT 訊號']||'—'}</div></div></div>
     </div>
 
-    <!-- ══ OFI 訂單流 ══ -->
     <div class="card">
       <div class="card-t">📊 OFI 訂單流 (Order Flow Imbalance)</div>
       <div class="smc-item"><span class="smc-ico">⚡</span>
@@ -4325,7 +4291,6 @@ function renderSMC(d){
     </div>
   </div>
 
-  <!-- ══ K線缺口分析 ══ -->
   <div class="card mb">
     <div class="card-t">🕳️ K線缺口分析（共 ${gaps.length} 個）</div>
     ${openGaps.length===0 ? '<div style="color:var(--text3);font-size:12px;padding:8px">目前無未填補缺口</div>' :
@@ -4360,7 +4325,6 @@ function _renderChipPanel(d){
   try{ chip = calcChipAnalysis(bars||[], fund); }catch(e){}
 
   return `
-  <!-- ══ 籌碼分析 ══ -->
   <div class="g2 mb">
     <div class="card">
       <div class="card-t">🏛️ 外資 / 主力 動向（技術估算）</div>
@@ -4454,7 +4418,6 @@ function renderLeading(d){
     ${mc('威科夫階段',    tech.wyPhase||d.wyckoff?.phase||'N/A', '')}
   `)}
 
-  <!-- VaR 快覽 -->
   <div class="card mt" style="margin-top:10px">
     <div class="card-t">⚠️ 風險快覽（VaR）</div>
     <div class="mg">
@@ -4477,7 +4440,6 @@ function renderRisk(d){
   const dn_gaps  = openGaps.filter(g=>g.dir==='down').slice(0,3);
 
   document.getElementById('riskContent').innerHTML=`
-  <!-- ══ VaR / CVaR 風險值 ══ -->
   <div class="g2 mb">
     <div class="card">
       <div class="card-t">📉 風險值（Value at Risk）</div>
@@ -4507,7 +4469,6 @@ function renderRisk(d){
     </div>
   </div>
 
-  <!-- ══ ATR 停損停利 ══ -->
   <div class="card mb">
     <div class="card-t">🛡️ ATR 停損停利參考（現價 ${risk.stop_loss?tech.price||d.price:'N/A'}）</div>
     <div style="overflow-x:auto">
@@ -4547,7 +4508,6 @@ function renderRisk(d){
     </div>
   </div>
 
-  <!-- ══ 缺口分析 ══ -->
   <div class="card mb">
     <div class="card-t">🕳️ K線缺口分析（未填補共 ${openGaps.length} 個）</div>
     ${up_gaps.length||dn_gaps.length ? `
@@ -4573,7 +4533,6 @@ function renderRisk(d){
     </div>` : '<div style="color:var(--text3);font-size:12px;padding:8px">無未填補缺口</div>'}
   </div>
 
-  <!-- ══ 回測結果 ══ -->
   ${bt ? `
   <div class="card mb">
     <div class="card-t">📊 歷史回測（Supertrend+EMA+MACD，ATR 2.5x停損/5x停利）</div>
@@ -4696,7 +4655,6 @@ async function loadIndices(){
     bar.innerHTML = modeTag + parts.join('') +
       `<span style="font-size:10px;color:var(--text3);font-family:var(--fm)">載入中…</span>
 
-  <!-- ══ 簡易回測結果 ══ -->
   ${bt ? `
   <div class="card mb">
     <div class="card-t">📊 歷史回測（技術訊號，僅供參考）</div>
@@ -4869,7 +4827,6 @@ function renderKLine(d){
   const patSignal = patBuyScore>patSellScore+3?'📈 看多':patSellScore>patBuyScore+3?'📉 看空':'⚖️ 中性';
 
   document.getElementById('klineContent').innerHTML=`
-  <!-- Pattern Summary -->
   <div class="pat-sum mb">
     <div>
       <div class="pat-sum-num pos">${buyPats.length}</div>
@@ -4897,31 +4854,26 @@ function renderKLine(d){
     </div>
   </div>
 
-  <!-- Full Candlestick Chart -->
   <div class="card mb">
     <div class="card-t">🕯️ 完整K線圖 — 含型態標記</div>
     <div class="chart-ctrl" style="flex-wrap:wrap;gap:4px">
-      <!-- 時間框架切換 -->
       <span style="font-size:10px;color:var(--text3);font-family:var(--fm)">框架:</span>
       <button class="ccbtn itv-btn ${CHART_INTERVAL==='15m'?'on':''}" data-itv="15m" onclick="setChartInterval('15m')">15分</button>
       <button class="ccbtn itv-btn ${CHART_INTERVAL==='1d'?'on':''}"  data-itv="1d"  onclick="setChartInterval('1d')">日線</button>
       <button class="ccbtn itv-btn ${CHART_INTERVAL==='1wk'?'on':''}" data-itv="1wk" onclick="setChartInterval('1wk')">週線</button>
       <div style="width:1px;height:14px;background:var(--border2);margin:0 2px"></div>
-      <!-- 顯示根數 -->
       <span style="font-size:10px;color:var(--text3);font-family:var(--fm)">根數:</span>
       <button class="ccbtn tf-btn ${CTF===20?'on':''}"  onclick="setTF(20)">20</button>
       <button class="ccbtn tf-btn ${CTF===40?'on':''}"  onclick="setTF(40)">40</button>
       <button class="ccbtn tf-btn ${CTF===60?'on':''}"  onclick="setTF(60)">60</button>
       <button class="ccbtn tf-btn ${CTF===120?'on':''}" onclick="setTF(120)">120</button>
       <div style="width:1px;height:14px;background:var(--border2);margin:0 2px"></div>
-      <!-- 指標切換 -->
       <button class="ccbtn ${CIND.ema?'on':''}"  id="togEma2"  onclick="toggleInd('ema')">EMA</button>
       <button class="ccbtn ${CIND.bb?'on':''}"   id="togBb2"   onclick="toggleInd('bb')">布林</button>
       <button class="ccbtn ${CIND.vol?'on':''}"  id="togVol2"  onclick="toggleInd('vol')">成交量</button>
       <button class="ccbtn ${CIND.macd?'on':''}" id="togMacd2" onclick="toggleInd('macd')">MACD</button>
       <button class="ccbtn ${CIND.pat?'on':''}"  id="togPat2"  onclick="toggleInd('pat')">型態</button>
       <div style="width:1px;height:14px;background:var(--border2);margin:0 2px"></div>
-      <!-- 重設 + 操作提示 -->
       <button class="ccbtn" onclick="_CV.offset=0;_CV.zoom=1;_redrawKLine()" title="重設視圖">⟳</button>
       <span style="font-size:9px;color:var(--text3);font-family:var(--fm);white-space:nowrap">
         🖱️滾輪縮放 | 拖動平移 | 📱雙指捏合
@@ -4942,7 +4894,6 @@ function renderKLine(d){
     </div>
   </div>
 
-  <!-- Pattern List -->
   <div class="g2">
     <div class="card">
       <div class="card-t">📋 近期偵測到的K線型態 (最近30日)</div>
@@ -4982,7 +4933,6 @@ function renderKLine(d){
     </div>
   </div>
 
-  <!-- Pattern Guide -->
   <div class="card" style="margin-top:14px">
     <div class="card-t">📖 K線型態解讀指南 (20種)</div>
     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px">
@@ -5544,7 +5494,6 @@ function wySig(l,active,type){
 }
 </script>
 
-<!-- ══ 手機底部 Tab 導航（滑動式，支援全部9個面板）══ -->
 <nav class="mob-tabbar" id="mobTabbar">
   <button class="mob-tab active" id="mtab-overview"  onclick="mobSwitch('overview')">
     <span class="mob-tab-icon">📊</span><span>總覽</span>
