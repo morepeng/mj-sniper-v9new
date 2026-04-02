@@ -2200,7 +2200,6 @@ function analyze(bars, ticker, quoteData){
   const ret6m  = n>132 ? (price/closes[n-132]-1)*100 : 0;
   const ret12m = n>252 ? (price/closes[n-252]-1)*100 : (price/closes[0]-1)*100;
 
-  // ── SCORING ──────────────────────────────────────
 /* ═══════════════════════════════════════════════════════════
    MJ 狙擊手 v9 — 統一淨分評分系統
    規則：每個指標直接給 正分(看多) 或 負分(看空)
@@ -2219,10 +2218,18 @@ function analyze(bars, ticker, quoteData){
 
   // ── 評分前提前計算（避免 before initialization 錯誤）──
   const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
-  // 修正 1：統一移除 X 後綴，解決 fib618 is not defined 錯誤
+  // 修正：統一變數名稱為 fib618 和 fib786，移除 X
   const fib618 = (hiX-loX)*0.618+loX, fib786 = (hiX-loX)*0.786+loX;
   const inGolden    = price>=fib618 && price<=fib786;
   const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
+
+  // 修正：將 score 變數提前宣告，解決 TDZ 錯誤
+  let score = 0;  // 統一淨分
+  const sigs = [];
+  const S = (pt, label, cat) => {
+    score += pt;
+    sigs.push({ t: label, c: cat, pt });
+  };
 
   /* ══════════════════════════════════════════════
      🛡️ 雙重防衛系統 v8.5
@@ -2543,13 +2550,6 @@ function analyze(bars, ticker, quoteData){
   const patterns = detectKPatterns(bars);
 
 
-
-  let score = 0;
-  const sigs = [];
-  const S = (pt, label, cat) => {
-    score += pt;
-    sigs.push({ t: label, c: cat, pt });
-  };  
 
   // ══════════════════════════════════════════════════════
   // 一、動量指標（Momentum）權重 25%
@@ -2972,7 +2972,7 @@ function analyze(bars, ticker, quoteData){
       vol_ratio:+volRatio.toFixed(2), mfi:+mfi.toFixed(2),
       stoch_rsi:+stochRSI.toFixed(2), hist_vol:+hv.toFixed(2),
       in_golden:inGolden, above_ma200:aboveMA200,
-      fib618:+fib618.toFixed(4),fib786:+fib786.toFixed(4), 
+      fib618:+fib618.toFixed(4), fib786:+fib786.toFixed(4),
       // 雙重防衛系統
       dd_score:         ddScore,
       dd_type:          ddType,
