@@ -2219,8 +2219,9 @@ function analyze(bars, ticker, quoteData){
 
   // ── 評分前提前計算（避免 before initialization 錯誤）──
   const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
-  const fib618X = (hiX-loX)*0.618+loX, fib786X = (hiX-loX)*0.786+loX;
-  const inGolden    = price>=fib618X && price<=fib786X;
+  // 修正 1：統一移除 X 後綴，解決 fib618 is not defined 錯誤
+  const fib618 = (hiX-loX)*0.618+loX, fib786 = (hiX-loX)*0.786+loX;
+  const inGolden    = price>=fib618 && price<=fib786;
   const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
 
   /* ══════════════════════════════════════════════
@@ -2543,12 +2544,12 @@ function analyze(bars, ticker, quoteData){
 
 
 
-  let score = 0;  // 統一淨分
+  let score = 0;
   const sigs = [];
   const S = (pt, label, cat) => {
     score += pt;
     sigs.push({ t: label, c: cat, pt });
-  };
+  };  
 
   // ══════════════════════════════════════════════════════
   // 一、動量指標（Momentum）權重 25%
@@ -2971,7 +2972,7 @@ function analyze(bars, ticker, quoteData){
       vol_ratio:+volRatio.toFixed(2), mfi:+mfi.toFixed(2),
       stoch_rsi:+stochRSI.toFixed(2), hist_vol:+hv.toFixed(2),
       in_golden:inGolden, above_ma200:aboveMA200,
-      fib618:+fib618X.toFixed(4),fib786:+fib786X.toFixed(4),
+      fib618:+fib618.toFixed(4),fib786:+fib786.toFixed(4), 
       // 雙重防衛系統
       dd_score:         ddScore,
       dd_type:          ddType,
