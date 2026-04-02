@@ -2949,6 +2949,10 @@ function analyze(bars, ticker, quoteData){
                  total <= -30? 'Strong Sell'  :
                  total <= -15? 'Sell'          : 'Hold';
 
+  // 整理道氏法則的文字說明，讓介面正確顯示
+  const rule123Text = rule123Bull ? '✅ 確認多頭 (突破前高且低點墊高)' : rule123Bear ? '🔴 確認空頭 (跌破前低且高點下移)' : '⚖️ 條件未成立 (盤整或觀察中)';
+  const rule2bText  = twoBBear ? '✅ 刺穿前低後反轉收高 (2B見底)' : twoBBull ? '🔴 刺穿前高後反轉收低 (2B見頂)' : '⚖️ 無明顯假突破訊號';
+
   return {
     ticker, signal, buy_score:buy, sell_score:sell, net_score:score, total_score:total,
     composite_score:comp, price, signals:sigs,
@@ -3036,33 +3040,34 @@ function analyze(bars, ticker, quoteData){
     },
     // K 線缺口
     gaps: gapAnalysis,
-    // 風控數據
-        risk:{
-          stop_loss:      +stopLoss.toFixed(2),
-          stop_loss_agg:  +stopLossAgg.toFixed(2),
-          stop_loss_con:  +stopLossCon.toFixed(2),
-          stop_pct:       +stopPct.toFixed(2),
-          target1:        +tgt1.toFixed(2),
-          target_1:       +tgt1.toFixed(2),
-          target2:        +tgt2.toFixed(2),
-          target_2:       +tgt2.toFixed(2),
-          target3:        +tgt3.toFixed(2),
-          target_3:       +tgt3.toFixed(2),
-          var95:          +var95.toFixed(2),
-          var_95:         +var95.toFixed(2),
-          var99:          +var99.toFixed(2),
-          cvar95:         +cvar95.toFixed(2),
-          cvar99:         +cvar99.toFixed(2),
-          cvar_99:        +cvar99.toFixed(2),
-          kelly_full:     +(kellyFull*100).toFixed(1),
-          kelly_half:     +kellyHalf.toFixed(1),
-          pos_size:       +posSz,
-          position_size:  +posSz,
-          hv_ann:         +hvAnn,
-          atr_pct:        +atrPct.toFixed(2),
-          atr:            +atr.toFixed(4),
-          rr_ratio:       2.0,
-        },
+    // 風控數據 (修復雙重覆蓋，補齊變數)
+    risk:{
+      stop_loss:      +stopLoss.toFixed(2),
+      stop_loss_agg:  +stopLossAgg.toFixed(2),
+      stop_loss_con:  +stopLossCon.toFixed(2),
+      stop_pct:       +stopPct.toFixed(2),
+      stop_loss_pct:  +stopPct.toFixed(2),
+      target1:        +tgt1.toFixed(2),
+      target_1:       +tgt1.toFixed(2),
+      target2:        +tgt2.toFixed(2),
+      target_2:       +tgt2.toFixed(2),
+      target3:        +tgt3.toFixed(2),
+      target_3:       +tgt3.toFixed(2),
+      var95:          +var95.toFixed(2),
+      var_95:         +var95.toFixed(2),
+      var99:          +var99.toFixed(2),
+      cvar95:         +cvar95.toFixed(2),
+      cvar99:         +cvar99.toFixed(2),
+      cvar_99:        +cvar99.toFixed(2),
+      kelly_full:     +(kellyFull*100).toFixed(1),
+      kelly_half:     +kellyHalf.toFixed(1),
+      pos_size:       +posSz,
+      position_size:  +posSz,
+      hv_ann:         +hvAnn,
+      atr_pct:        +atrPct.toFixed(2),
+      atr:            +atr.toFixed(4),
+      rr_ratio:       2.0,
+    },
     // 五大先行指標評分
     leading:{
       l1_breadth: {
@@ -3173,7 +3178,10 @@ function analyze(bars, ticker, quoteData){
       minor_trend:    minTrend==='Bull'?'Uptrend':minTrend==='Bear'?'Downtrend':'N/A',
       rule123_bull:   rule123Bull, rule123_bear: rule123Bear,
       two_b_bull:     twoBBear,   two_b_bear:   twoBBull,
-      rule_123:{signal:rule123Bull, score:dowScore}},
+      // 補上介面所需的 rule_123 和 rule_2b 格式
+      rule_123:{ signal: rule123Text, score: dowScore },
+      rule_2b: { signal: rule2bText }
+    },
     wyckoff:{
       phase:wyPhase, type:wyType,
       spring:wySpring, upthrust:wyUpthrust,
@@ -3186,13 +3194,11 @@ function analyze(bars, ticker, quoteData){
       trend_state:chop<38.2?'趨勢市':chop>61.8?'震盪市':'過渡期',
       sniper_signal:(stDir[n-1]===1&&macdJustCross&&obvTrend==='Bullish')?'✅ 狙擊就緒':'⏳ 等待確認',
     },
-    
     chart_data:    chartBars.slice(-60),
     all_chart_data:chartBars,  // full history for K-line tab
     patterns,
   };
 }
-
 function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
 
 /* ═══════════════════════════════════════════════
