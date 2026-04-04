@@ -264,10 +264,10 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 @keyframes shieldPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.12)}}
 
 /* ═══ TRADING DECISION BAR ═══ */
-.td-wrap{border-radius:var(--r);margin-bottom:14px;overflow:hidden;border:1px solid var(--border2)}
-.td-header{display:flex;align-items:center;background:var(--bg4);border-bottom:1px solid var(--border2);flex-wrap:wrap}
+.td-wrap{border-radius:var(--r);margin-bottom:18px;overflow:hidden;border:2px solid var(--border2);box-shadow:0 4px 24px rgba(0,212,255,.08)}
+.td-header{display:flex;align-items:center;background:var(--bg4);border-bottom:1px solid var(--border2);flex-wrap:wrap;min-height:50px}
 .td-label{font-family:var(--fh);font-size:10px;letter-spacing:2px;color:var(--cyan);padding:8px 14px;border-right:1px solid var(--border2);flex-shrink:0;white-space:nowrap}
-.td-decision{font-family:var(--fh);font-size:14px;font-weight:700;padding:8px 16px;flex-shrink:0;letter-spacing:1px}
+.td-decision{font-family:var(--fh);font-size:16px;font-weight:700;padding:10px 20px;flex-shrink:0;letter-spacing:2px}
 .td-posture{font-family:var(--fm);font-size:11px;padding:8px 14px;border-left:1px solid var(--border2);color:var(--text2);flex-shrink:0}
 .td-body{display:flex;align-items:stretch;flex-wrap:wrap;background:var(--bg2)}
 .td-seg{display:flex;flex-direction:column;justify-content:center;padding:10px 14px;border-right:1px solid var(--border);flex:1;min-width:140px}
@@ -1021,7 +1021,7 @@ function detectGaps(bars){
 // ══════════════════════════════════════════════════════
 function runBacktest(bars, ticker){
   const n = bars.length;
-  if(n < 30) return null;
+  if(n < 200) return null;  // 200根確保統計可靠
 
   const closes  = bars.map(b=>b.close);
   const highs   = bars.map(b=>b.high);
@@ -1578,6 +1578,28 @@ function _mergeFund(primary, secondary){
   return merged;
 }
 
+
+// ══ 台股估值技術面反推（無財報時備援）══
+function estimateTWValuation(bars, existing){
+  if(!bars||bars.length<30) return existing;
+  const closes = bars.map(b=>b.close);
+  const n = bars.length, price = closes[n-1];
+  const ret12m = n>252?(price/closes[n-252]-1):(price/closes[0]-1);
+  const epsGrP = ret12m*0.6;
+  const estPE  = Math.max(6,Math.min(50, 17*(1+epsGrP*0.5)));
+  const estEPS = price/estPE;
+  const estROE = ret12m>0.3?0.20:ret12m>0.15?0.15:ret12m>0?0.10:ret12m>-0.15?0.06:0.02;
+  return {
+    ...existing,
+    pe:     existing?.pe    ?? +estPE.toFixed(1),
+    eps:    existing?.eps   ?? +estEPS.toFixed(2),
+    roe:    existing?.roe   ?? +estROE.toFixed(3),
+    epsGr:  existing?.epsGr ?? +(epsGrP*0.7).toFixed(3),
+    revGr:  existing?.revGr ?? +(ret12m*0.5).toFixed(3),
+    _estimated:true,
+    _est_basis:`技術代理 12M漲幅${(ret12m*100).toFixed(1)}% 估PE=${estPE.toFixed(1)} EPS=${estEPS.toFixed(2)}`,
+  };
+}
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
 async function fetchFundamentals(ticker, chartJson){
   const t   = encodeURIComponent(ticker);
@@ -1660,7 +1682,19 @@ async function fetchFundamentals(ticker, chartJson){
         beta:      rv(sd.beta)||rv(ks.beta),
         hi52, lo52,
         shortRatio:rv(ks.shortRatio),
+        // 台股：直接從 meta 補讀
+        _mpe:  meta.trailingPE||null,
+        _meps: meta.trailingEps||null,
+        _mcap: meta.marketCap||null,
+        _mbeta:meta.beta||null,
+        _mdivy:meta.dividendYield||null,
       };
+      // meta 補強（台股 meta 比 modules 更可靠）
+      if(!f0.pe   && f0._mpe)   f0.pe   = f0._mpe;
+      if(!f0.eps  && f0._meps)  f0.eps  = f0._meps;
+      if(!f0.mktCap && f0._mcap) f0.mktCap = f0._mcap;
+      if(!f0.beta && f0._mbeta) f0.beta  = f0._mbeta;
+      if(!f0.divY && f0._mdivy) f0.divY  = f0._mdivy;
       f0._count = cntF(f0);
       // 只要 meta 有52W就算有數據（台股base case）
       if(f0._count>=1 || f0.hi52!=null || f0.beta!=null || f0.mktCap!=null){
@@ -1860,8 +1894,24 @@ async function fetchFundamentals(ticker, chartJson){
 
   if(best&&best._count>=1){
     best._count=cntF(best);
+    // 台股估值補強
+    if(/\.(TW|TWO)$/i.test(ticker)){
+      const twB=window._lastBarsCache||[];
+      if(twB.length>30&&(best.pe==null||best.eps==null)){
+        const est=estimateTWValuation(twB,best);
+        if(est._estimated){Object.assign(best,est);best._count=cntF(best);}
+      }
+    }
     console.log(`📊 [Fund Final] ${ticker}: ${best._count}項 src=${best._src} | PE=${best.pe} EPS=${best.eps} 52H=${best.hi52} Beta=${best.beta}`);
     return best;
+  }
+  // 台股純技術反推兜底
+  if(/\.(TW|TWO)$/i.test(ticker)){
+    const twB3=window._lastBarsCache||[];
+    if(twB3.length>30){
+      const est3=estimateTWValuation(twB3,{_src:'estimated',_count:0});
+      if(est3._estimated){est3._count=cntF(est3);return est3;}
+    }
   }
   console.warn(`⚠️ [Fund] ${ticker}: 所有來源均無數據`);
   return { _src:'none', _count:0 };
@@ -3654,95 +3704,181 @@ function generateTradeDecision(d){
    RENDER TRADING DECISION BAR
 ═══════════════════════════════════════════════ */
 function renderTradeDecision(d){
-  const td = generateTradeDecision(d);
-  const el = document.getElementById('tradingDecision');
+  const td  = generateTradeDecision(d);
+  const el  = document.getElementById('tradingDecision');
   if(!el) return;
+  const tech = d.technical||{};
+  const risk = d.risk||{};
+  const bt   = d.backtest||null;
+  const gaps = d.gaps||[];
+  const sigs = d.signals||[];
 
-  // Score ring colour
-  const scColor = td.score100 >= 65 ? 'var(--green)' :
-                  td.score100 >= 45 ? 'var(--cyan)'  :
-                  td.score100 >= 30 ? 'var(--orange)' : 'var(--red)';
-
-  // Layer pips
-  const layerNames = ['宏觀趨勢','技術趨勢','動量共振','量能確認'];
+  // ── 顏色 ──
+  const scColor = td.score100>=65?'var(--green)':td.score100>=45?'var(--cyan)':td.score100>=30?'var(--orange)':'var(--red)';
+  const layerNames=['宏觀趨勢','技術趨勢','動量共振','量能確認'];
   const pipHtml = td.layers.map((pass,i)=>
     `<span class="td-pip" style="background:${pass?'var(--green)':'var(--border2)'}"></span>`+
-    `<span style="font-size:9px;color:${pass?'var(--text2)':'var(--text3)'};margin-right:7px">${layerNames[i]}</span>`
+    `<span style="font-size:9px;color:${pass?'var(--text2)':'var(--text3)'};margin-right:6px">${layerNames[i]}</span>`
   ).join('');
 
-  // Price tags
-  const ptBuy  = `background:rgba(0,255,157,.07);color:var(--green);border-color:rgba(0,255,157,.3)`;
-  const ptSell = `background:rgba(255,59,92,.07);color:var(--red);border-color:rgba(255,59,92,.3)`;
-  const ptNeu  = `background:rgba(0,212,255,.07);color:var(--cyan);border-color:rgba(0,212,255,.25)`;
+  // ── 評分細項（從 sigs 分類整理）──
+  const buyTop  = sigs.filter(s=>s.pt>0).sort((a,b)=>b.pt-a.pt).slice(0,6);
+  const sellTop = sigs.filter(s=>s.pt<0).sort((a,b)=>a.pt-b.pt).slice(0,6);
+  const netScore = d.net_score??d.total_score??0;
+
+  // ── 缺口分析 ──
+  const openGaps = gaps.filter(g=>!g.filled);
+  const upGaps   = openGaps.filter(g=>g.dir==='up').slice(0,2);
+  const dnGaps   = openGaps.filter(g=>g.dir==='down').slice(0,2);
+  const gapPt    = dnGaps.length>0?'+':'';
+  const gapText  = [
+    ...upGaps.map(g=>`↑${g.type.replace('缺口','').trim()} ${g.size}%`),
+    ...dnGaps.map(g=>`↓${g.type.replace('缺口','').trim()} ${g.size}%`),
+  ].join(' / ') || '無未填補缺口';
+
+  // ── 籌碼（外資/融資/借券）──
+  const volRatio = tech.vol_ratio||1;
+  const rsi      = tech.rsi||50;
+  const obvBull  = tech.obv_trend==='Bullish';
+  const shortR   = d._fund?.shortRatio||null;
+  const fiiDir   = (volRatio>1.5&&obvBull)?'📈外資估計買入':(volRatio>1.5&&!obvBull)?'📉外資估計賣出':'⚖️外資中性';
+  const marginS  = rsi>70?'⚠️散戶追高':rsi<30?'✅散戶恐慌（機會）':rsi>55?'融資溫和增':rsi<45?'融資態度弱':'融資中性';
+  const shortSig = shortR!=null?(shortR>10?`🩳空單大(${shortR}天,軋空潛力)`:shortR<3?'空單少':'空單中等'):'—';
+  const chipSig  = rsi>65&&!obvBull?'⚠️散戶追高主力出貨':rsi<35&&obvBull?'✅散戶恐慌主力吸籌':obvBull?'📈主力推升':'📉主力出場/觀望';
+
+  // ── 回測摘要 ──
+  const btHtml = bt ? `
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+      <span style="font-size:10px;color:var(--cyan);font-family:var(--fm)">📊 回測(${bt.total}次)</span>
+      <span style="font-family:var(--fm);font-size:11px;color:${bt.winRate>=55?'var(--green)':'var(--orange)'}">勝率 ${bt.winRate}%</span>
+      <span style="font-family:var(--fm);font-size:11px;color:${bt.profitFactor>=1.5?'var(--green)':'var(--text2)'}">PF ${bt.profitFactor}x</span>
+      <span style="font-family:var(--fm);font-size:11px;color:var(--red)">MDD ${bt.maxDrawdown}%</span>
+      <span style="font-family:var(--fm);font-size:11px;color:${bt.totalReturn>0?'var(--green)':'var(--red)'}">報酬 ${bt.totalReturn>0?'+':''}${bt.totalReturn}%</span>
+      <span style="font-size:9px;color:var(--text3)">ST+EMA+MACD | ATR停損2.5x/停利5x(RR=1:2)</span>
+    </div>` : `<span style="font-size:10px;color:var(--text3)">回測需200根K線</span>`;
 
   el.innerHTML = `
-  <div class="td-wrap">
-    <!-- Header row -->
-    <div class="td-header">
-      <div class="td-label">⚡ 交易決策</div>
-      <div class="td-decision" style="color:${td.decColor}">【${td.decLabel}】</div>
-      <div class="td-posture">${td.posture}</div>
+  <div class="td-wrap" style="border-width:2px;border-color:${td.decColor};box-shadow:0 0 18px ${td.decColor}33">
+    <!-- ══ Header ══ -->
+    <div class="td-header" style="min-height:52px">
+      <div class="td-label" style="font-size:11px;letter-spacing:2px">⚡ 交易決策</div>
+      <div class="td-decision" style="color:${td.decColor};font-size:16px;padding:8px 20px">【${td.decLabel}】</div>
+      <div class="td-posture" style="font-size:12px">${td.posture}</div>
       <div style="flex:1"></div>
-      <div style="padding:8px 14px;font-size:10px;color:var(--text3);font-family:var(--fm);border-left:1px solid var(--border2)">
+      <div style="padding:8px 14px;font-size:11px;color:var(--text2);border-left:1px solid var(--border2)">
         ${td.detail}
       </div>
     </div>
-    <!-- Body segments -->
-    <div class="td-body">
 
-      <!-- Segment 1: Price & Risk/Reward -->
+    <!-- ══ Body Row 1：價格+過濾層+評分環 ══ -->
+    <div class="td-body">
+      <!-- 現價/停損/目標 -->
       <div class="td-seg" style="flex:2;min-width:220px">
         <div class="td-seg-lbl">📍 現價 · 停損 · 目標 · RR</div>
         <div class="td-rr">
-          <span class="td-ptag" style="${ptNeu}">現價 ${fp(td.price)}</span>
-          <span class="td-ptag" style="${ptSell}">停損 ${fp(td.stopLoss)} (${td.slPct.toFixed(1)}%)</span>
-          <span class="td-ptag" style="${ptBuy}">T1=${fp(td.target1)} (+${td.t1Pct.toFixed(1)}%)</span>
-          <span class="td-ptag" style="${ptBuy}">T2=${fp(td.target2)} (+${td.t2Pct.toFixed(1)}%)</span>
+          <span class="td-ptag" style="background:rgba(0,212,255,.07);color:var(--cyan);border-color:rgba(0,212,255,.3)">現價 ${fp(td.price)}</span>
+          <span class="td-ptag" style="background:rgba(255,59,92,.07);color:var(--red);border-color:rgba(255,59,92,.3)">停損 ${fp(td.stopLoss)} (${td.slPct.toFixed(1)}%)</span>
+          <span class="td-ptag" style="background:rgba(0,255,157,.07);color:var(--green);border-color:rgba(0,255,157,.3)">T1=${fp(td.target1)} (+${td.t1Pct.toFixed(1)}%)</span>
+          <span class="td-ptag" style="background:rgba(0,255,157,.07);color:var(--green);border-color:rgba(0,255,157,.3)">T2=${fp(td.target2)} (+${td.t2Pct.toFixed(1)}%)</span>
           <span class="td-ptag" style="background:rgba(255,215,0,.07);color:var(--yellow);border-color:rgba(255,215,0,.3)">RR 1:${td.rr}</span>
         </div>
       </div>
 
-      <!-- Segment 2: Filter layers -->
+      <!-- 過濾層 -->
       <div class="td-seg" style="min-width:200px">
-        <div class="td-seg-lbl">🔍 過濾層 (${td.layersPassed}/4層通過 · 分數 ${td.score100}/100)</div>
-        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-top:2px">
-          ${pipHtml}
-        </div>
-        <!-- Mini score bar -->
-        <div style="height:4px;background:var(--bg4);border-radius:2px;margin-top:6px;overflow:hidden">
-          <div style="width:${td.score100}%;height:100%;background:${scColor};border-radius:2px;transition:width .6s"></div>
+        <div class="td-seg-lbl">🔍 過濾層 (${td.layersPassed}/4通過 · ${td.score100}/100分)</div>
+        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-top:2px">${pipHtml}</div>
+        <div style="height:5px;background:var(--bg4);border-radius:3px;margin-top:6px;overflow:hidden">
+          <div style="width:${td.score100}%;height:100%;background:${scColor};border-radius:3px;transition:width .6s"></div>
         </div>
       </div>
 
-      <!-- Segment 3: Score ring + timing -->
-      <div class="td-seg" style="min-width:130px;align-items:flex-start;flex-direction:row;gap:10px">
-        <div>
-          <div class="td-seg-lbl">綜合評分</div>
-          <div style="display:flex;align-items:center;margin-top:4px">
-            <div class="td-score" style="color:${scColor};border-color:${scColor}">${td.score100}</div>
-            <div style="font-size:10px;color:var(--text3);font-family:var(--fm)">/ 100</div>
+      <!-- 評分環 -->
+      <div class="td-seg" style="min-width:100px;align-items:center">
+        <div class="td-seg-lbl">綜合評分</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+          <div class="td-score" style="color:${scColor};border-color:${scColor};width:42px;height:42px;font-size:14px">${td.score100}</div>
+          <div>
+            <div style="font-size:10px;color:var(--text3);font-family:var(--fm)">/100</div>
+            <div style="font-family:var(--fm);font-size:11px;color:${netScore>0?'var(--green)':'var(--red)'}">淨分${netScore>0?'+':''}${netScore}</div>
           </div>
         </div>
-        <div>
-          <div class="td-seg-lbl">進場時機</div>
-          <div style="font-size:11px;color:var(--text2);font-family:var(--fm);margin-top:4px;line-height:1.5">${td.timing}</div>
+      </div>
+
+      <!-- 進場時機 -->
+      <div class="td-seg" style="min-width:110px">
+        <div class="td-seg-lbl">⏰ 進場時機</div>
+        <div style="font-size:11px;color:var(--text2);font-family:var(--fm);margin-top:4px;line-height:1.6">${td.timing}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">${td.rotText}</div>
+      </div>
+    </div>
+
+    <!-- ══ Body Row 2：評分明細 ══ -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;border-top:1px solid var(--border);background:var(--bg)">
+
+      <!-- 看多訊號 -->
+      <div style="padding:8px 14px;border-right:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:5px;letter-spacing:1px">📈 TOP 看多訊號</div>
+        ${buyTop.map(s=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(30,48,80,.3)">
+            <span style="font-size:11px;color:var(--text2)">${s.t}</span>
+            <span style="font-family:var(--fm);font-size:11px;color:var(--green);font-weight:700">+${s.pt}</span>
+          </div>`).join('')}
+      </div>
+
+      <!-- 看空訊號 -->
+      <div style="padding:8px 14px">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:5px;letter-spacing:1px">📉 TOP 看空訊號</div>
+        ${sellTop.map(s=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:2px 0;border-bottom:1px solid rgba(30,48,80,.3)">
+            <span style="font-size:11px;color:var(--text2)">${s.t}</span>
+            <span style="font-family:var(--fm);font-size:11px;color:var(--red);font-weight:700">${s.pt}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <!-- ══ Body Row 3：缺口 + 籌碼 + 回測 ══ -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;border-top:1px solid var(--border);background:var(--bg2)">
+
+      <!-- 缺口分析 -->
+      <div style="padding:8px 14px;border-right:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">🕳️ K線缺口分析</div>
+        ${upGaps.length>0?upGaps.map(g=>`
+          <div style="font-family:var(--fm);font-size:10px;padding:2px 0">
+            <span style="color:var(--red)">⬆️ ${g.type}</span>
+            <span style="color:var(--text3);margin-left:4px">${g.size}% | ${g.gapLow.toFixed(1)}~${g.gapHigh.toFixed(1)}</span>
+            <span style="color:var(--red);margin-left:4px;font-size:9px">壓力 -3分</span>
+          </div>`).join(''):''}
+        ${dnGaps.length>0?dnGaps.map(g=>`
+          <div style="font-family:var(--fm);font-size:10px;padding:2px 0">
+            <span style="color:var(--green)">⬇️ ${g.type}</span>
+            <span style="color:var(--text3);margin-left:4px">${g.size}% | ${g.gapHigh.toFixed(1)}~${g.gapLow.toFixed(1)}</span>
+            <span style="color:var(--green);margin-left:4px;font-size:9px">支撐 +3分</span>
+          </div>`).join(''):''}
+        ${openGaps.length===0?'<span style="font-size:10px;color:var(--text3)">無未填缺口</span>':''}
+        <div style="font-size:9px;color:var(--text3);margin-top:3px">共${gaps.length}個缺口 | 未填${openGaps.length}個</div>
+      </div>
+
+      <!-- 籌碼分析 -->
+      <div style="padding:8px 14px;border-right:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">🏛️ 籌碼分析</div>
+        <div style="font-size:10px;padding:2px 0"><span style="color:var(--text3)">外資：</span><span style="font-family:var(--fm)">${fiiDir}</span></div>
+        <div style="font-size:10px;padding:2px 0"><span style="color:var(--text3)">融資：</span><span style="font-family:var(--fm)">${marginS}</span></div>
+        <div style="font-size:10px;padding:2px 0"><span style="color:var(--text3)">借券：</span><span style="font-family:var(--fm)">${shortSig}</span></div>
+        <div style="font-size:10px;padding:2px 0;color:${chipSig.startsWith('⚠️')?'var(--orange)':chipSig.startsWith('✅')?'var(--green)':'var(--text2)'}">
+          ${chipSig}${shortR>10?' → 軋空潛力 +3分':''}
         </div>
       </div>
 
-      <!-- Segment 4: Rotation -->
-      <div class="td-seg" style="min-width:120px">
-        <div class="td-seg-lbl">🔄 板塊輪動</div>
-        <div style="font-size:13px;font-family:var(--fm);color:${td.rotText.includes('↑')?'var(--green)':td.rotText.includes('↓')?'var(--red)':'var(--text2)'};margin-top:4px">
-          ${td.rotText}
-        </div>
-        <div style="font-size:10px;color:var(--text3);margin-top:3px;font-family:var(--fm)">
-          7因子 ${d.composite_score>=0?'+':''}${(d.composite_score||0).toFixed(2)}
-        </div>
+      <!-- 回測摘要 -->
+      <div style="padding:8px 14px">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">📊 回測引擎（200根）</div>
+        ${btHtml}
       </div>
-
     </div>
   </div>`;
 }
+
 
 /* ── OVERVIEW ── */
 function renderOverview(d){
