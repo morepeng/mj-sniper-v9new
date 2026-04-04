@@ -514,6 +514,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <button class="ntab" data-tab="leading">📡 五大先行</button>
   <button class="ntab" data-tab="risk">⚠️ 風控管理</button>
   <button class="ntab" data-tab="scan">🔍 市場掃描</button>
+  <button class="ntab" data-tab="nextday">🌅 隔日確認</button>
 </nav>
 
 <!-- MAIN -->
@@ -652,6 +653,11 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
         </table>
       </div>
     </div>
+  </div>
+
+  <!-- NEXT-DAY CONFIRM SCAN -->
+  <div class="panel" id="panel-nextday">
+    <div id="nextdayContent"><div class="empty"><div class="empty-ico">🌅</div><div class="empty-t">請先分析股票，再查看隔日早盤確認</div></div></div>
   </div>
 
 </div><!-- /wrap -->
@@ -2036,6 +2042,63 @@ function calcOBV(closes, vols){
   return obv;
 }
 
+// ═══ 強化版 OBV 四大秘訣（對應 Python check_obv_secrets）═══
+function calcOBVSecretsEnhanced(closes, vols, n){
+  // 計算 OBV
+  const obv = calcOBV(closes, vols);
+  // EMA3（短期）和 EMA30（長期）
+  const obvEMA3  = ema(obv, 3);
+  const obvEMA30 = ema(obv, 30);
+  // 百分位排名（最近60根的百分位）
+  const window60 = obv.slice(Math.max(0, n-60), n);
+  const sorted60 = [...window60].sort((a,b)=>a-b);
+  const rank = sorted60.findIndex(v=>v>=obv[n-1]) / Math.max(sorted60.length-1,1) * 100;
+  // 最近30根的極值
+  const obv30  = obv.slice(Math.max(0,n-30));
+  const cls30  = closes.slice(Math.max(0,n-30));
+  const obvMax30 = Math.max(...obv30);
+  const clsMax30 = Math.max(...cls30);
+
+  // ── 秘訣一：OBV 突破30日EMA（資金進場）
+  // Python: latest['OBV'] > latest['OBV_EMA30'] and prev['OBV'] <= prev['OBV_EMA30']
+  const s1 = obvEMA30[n-1]!=null && obv[n-1]>obvEMA30[n-1] && (n<2||obv[n-2]<=(obvEMA30[n-2]||0));
+
+  // ── 秘訣二：價量齊創新高（主力強勢拉升）
+  // Python: price_new_high and obv_new_high (30日)
+  const s2 = closes[n-1]>=clsMax30*0.999 && obv[n-1]>=obvMax30*0.999;
+
+  // ── 秘訣三：OBV 百分位 > 90%（成交量強勢突破）
+  // Python: latest['OBV_PCT'] > 90
+  const s3_strong = rank > 90;
+  const s3_med    = rank > 75 && !s3_strong;
+
+  // ── 秘訣四：OBV 短均線上穿長均線（短期資金轉強）
+  // Python: latest['OBV_EMA3'] > latest['OBV_EMA30']
+  const s4 = obvEMA3[n-1]!=null && obvEMA30[n-1]!=null && obvEMA3[n-1]>obvEMA30[n-1];
+
+  // ── 評分（對應 Python obv_score）
+  let score = 0;
+  const reasons = [];
+  if(s1){ score+=5; reasons.push('🎯秘訣①OBV突破30均線(+5)'); }
+  if(s2){ score+=8; reasons.push('💎秘訣②價量齊創新高(+8)'); }
+  if(s3_strong){ score+=6; reasons.push('🔥秘訣③OBV百分位>90%(+6)'); }
+  else if(s3_med){ score+=3; reasons.push('👍秘訣③OBV百分位>75%(+3)'); }
+  if(s4){ score+=4; reasons.push('📈秘訣④短均上穿長均(+4)'); }
+
+  // ── AI 建議
+  const trigged = (s1?1:0)+(s2?1:0)+(s3_strong||s3_med?1:0)+(s4?1:0);
+  const conf = score>=15?'極高':score>=10?'高':score>=5?'中':'低';
+  const advice = score>=15?`💰超強OBV訊號(${score}分)-主力重兵集結,積極布局`:
+                 score>=10?`💪強勢OBV訊號(${score}分)-資金持續流入,逢低買進`:
+                 score>=5 ?`👍偏多OBV訊號(${score}分)-量能轉強,小倉試探`:
+                           `➡️OBV中性(${score}分)-量能無明確方向`;
+
+  return { s1, s2, s3:s3_strong||s3_med, s3_strong, s3_med, s4,
+           score, trigged, conf, advice, reasons,
+           obvEMA3: obvEMA3[n-1], obvEMA30: obvEMA30[n-1],
+           obvRank: +rank.toFixed(1), obv_arr: obv };
+}
+
 function calcMFI(highs, lows, closes, vols, p=14){
   const tp = closes.map((_,i)=>(highs[i]+lows[i]+closes[i])/3);
   const rawMF = tp.map((v,i)=>v*vols[i]);
@@ -2208,15 +2271,17 @@ function analyze(bars, ticker, quoteData){
   const obvBelowMA3 = [0,1,2].every(j=>(obvArr[n-1-j]||0)<(obvMA[n-1-j]||0));
   // OBV 四大秘訣
   const volMA20pre  = sma(vols,20);  // 提前計算，供秘訣4使用
-  const priceHi20   = Math.max(...closes.slice(-20));
-  const priceLo20   = Math.min(...closes.slice(-20));
-  const obvHi20     = Math.max(...obvArr.slice(-20));
-  const obvLo20     = Math.min(...obvArr.slice(-20));
-  const obvSecret1  = obvArr[n-1]>=obvHi20*0.98 && price<priceHi20*0.98;
-  const obvSecret2  = obvArr[n-1]<=obvLo20*1.02 && price>priceLo20*1.02;
-  const obvSecret3  = Math.abs(obvArr[n-1])>Math.abs(obvArr[n-6]||1)*1.3;
-  const obvSecret4  = vols[n-1]>(volMA20pre[n-1]||0) && closes[n-1]>closes[n-2] && obvTrend==='Bullish';
-  const obv4Secrets = (obvSecret1?1:0)+(obvSecret2?1:0)+(obvSecret3?1:0)+(obvSecret4?1:0);
+  // ── 強化版 OBV 四大秘訣（對應 Python check_obv_secrets）──
+  const _obvEnh     = calcOBVSecretsEnhanced(closes, vols, n);
+  const obvSecret1  = _obvEnh.s1;   // 秘訣①：OBV突破30日EMA
+  const obvSecret2  = _obvEnh.s2;   // 秘訣②：價量齊創新高
+  const obvSecret3  = _obvEnh.s3;   // 秘訣③：OBV百分位>75%
+  const obvSecret4  = _obvEnh.s4;   // 秘訣④：短均上穿長均
+  const obv4Secrets = _obvEnh.trigged;
+  const obvEnhScore = _obvEnh.score; // 0~23分 AI評分
+  const obvEnhAdvice= _obvEnh.advice;
+  const obvEnhConf  = _obvEnh.conf;
+  const obvEnhReasons= _obvEnh.reasons;
   // BB 中線 + Slope 斜率交點
   const bbMidSlope  = (bbMid[n-1]!=null&&bbMid[n-6]!=null)?bbMid[n-1]-bbMid[n-6]:0;
   const priceSlope5 = linReg(closes.slice(-6));
@@ -2685,12 +2750,15 @@ function analyze(bars, ticker, quoteData){
   else if(obvAboveMA3)   S(+3, 'OBV 連3根 > 均線',       'buy');
   else if(obvBelowMA3)   S(-3, 'OBV 連3根 < 均線',       'sell');
 
-  // OBV 四大秘訣 (最大 +25，空頭版對稱)
-  if(obvSecret1)           S(+7, 'OBV秘訣①：量先行(積聚看多)',  'buy');
-  if(obvSecret2)           S(+8, 'OBV秘訣②：底部背離(看多)',    'buy');
-  if(obvSecret3)           S(+4, 'OBV秘訣③：主力急買',          'buy');
-  if(obvSecret4)           S(+4, 'OBV秘訣④：量價同向',          'buy');
-  if(obv4Secrets >= 3)     S(+5, '🔥 OBV四訣 3+項共振',         'buy');
+  // OBV 四大秘訣（強化版，對應 Python check_obv_secrets）
+  if(obvSecret1) S(+5, '🎯OBV秘訣①：突破30日EMA(資金進場)', 'buy');
+  if(obvSecret2) S(+8, '💎OBV秘訣②：價量齊創新高(主力拉升)', 'buy');
+  if(_obvEnh.s3_strong) S(+6, '🔥OBV秘訣③：百分位>90%(量能強突)', 'buy');
+  else if(_obvEnh.s3_med)   S(+3, '👍OBV秘訣③：百分位>75%(量能偏強)', 'buy');
+  if(obvSecret4) S(+4, '📈OBV秘訣④：短均上穿長均(短期轉強)', 'buy');
+  if(obv4Secrets >= 3) S(+5, '🔥 OBV四訣 3+項共振',         'buy');
+  // AI評分高於15分額外加分
+  if(obvEnhScore >= 15) S(+3, `💰OBV AI超強訊號(${obvEnhScore}分)`, 'buy');
   // 空頭版：OBV 急跌 = 主力急賣
   if(!obvSecret3 && Math.abs(obvArr[n-1]) < Math.abs(obvArr[n-6]||1)*0.7)
     S(-4, 'OBV量能急速萎縮(賣壓)',   'sell');
@@ -3053,6 +3121,13 @@ function analyze(bars, ticker, quoteData){
       obv_secret3:      obvSecret3,
       obv_secret4:      obvSecret4,
       obv_4secrets:     obv4Secrets,
+      obv_enh_score:    obvEnhScore,
+      obv_enh_advice:   obvEnhAdvice,
+      obv_enh_conf:     obvEnhConf,
+      obv_enh_reasons:  obvEnhReasons,
+      obv_ema3:         _obvEnh.obvEMA3!=null?+_obvEnh.obvEMA3.toFixed(0):null,
+      obv_ema30:        _obvEnh.obvEMA30!=null?+_obvEnh.obvEMA30.toFixed(0):null,
+      obv_rank_pct:     _obvEnh.obvRank,
       // BB + Slope
       bb_slope_bull:    bbSlopeBull,
       bb_slope_bear:    bbSlopeBear,
@@ -3569,6 +3644,7 @@ function renderTab(tab, d){
     case 'smc':      renderSMC(d);      break;
     case 'leading':  renderLeading(d);  break;
     case 'risk':     renderRisk(d);     break;
+    case 'nextday':  renderNextDay(d);  break;
   }
 }
 
@@ -4369,24 +4445,30 @@ function renderDow(d){
     <div class="card-t">📊 OBV 四大秘訣 + EMA30 交叉</div>
     <div class="g2" style="margin-bottom:8px">
       ${[
-        ['秘訣1：OBV先行', tech.obv_secret1, 'OBV創新高但價格未創高（積聚）'],
-        ['秘訣2：底部背離', tech.obv_secret2, 'OBV創新低但價格未創低（底部）'],
-        ['秘訣3：主力急買', tech.obv_secret3, 'OBV絕對值急速上升（大量介入）'],
-        ['秘訣4：量價同向', tech.obv_secret4, '放量上漲且OBV多頭（確認趨勢）'],
+        ['秘訣①：突破30EMA', tech.obv_secret1, '🎯OBV突破30日EMA → 資金開始進場'],
+        ['秘訣②：價量新高', tech.obv_secret2, '💎價量齊創30日新高 → 主力強勢拉升'],
+        ['秘訣③：百分位強', tech.obv_secret3, `🔥OBV百分位${tech.obv_rank_pct!=null?tech.obv_rank_pct+'%':''} → ${(tech.obv_rank_pct||0)>90?'超強突破':'量能偏強'}`],
+        ['秘訣④：短均上穿', tech.obv_secret4, '📈OBV短均線>長均線 → 短期資金轉強'],
       ].map(([name,active,desc])=>`
       <div class="mc" style="border-left:3px solid ${active?'var(--green)':'var(--border)'}">
         <div class="mc-l" style="color:${active?'var(--green)':'var(--text3)'}">${active?'✅':'○'} ${name}</div>
         <div style="font-size:9px;color:var(--text3)">${desc}</div>
       </div>`).join('')}
     </div>
-    <div style="display:flex;gap:6px;flex-wrap:wrap">
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px">
       <span class="stag ${tech.obv_cross_up?'buy':tech.obv_cross_down?'sell':'info'}">
         OBV×EMA30: ${tech.obv_cross_up?'📈 金叉':tech.obv_cross_down?'📉 死叉':'中性'}
       </span>
       <span class="stag ${tech.obv_4secrets>=3?'buy':tech.obv_4secrets>=2?'info':'info'}">
-        共振數: ${tech.obv_4secrets||0}/4 ${tech.obv_4secrets>=3?'🔥':''}
+        共振${tech.obv_4secrets||0}/4 ${tech.obv_4secrets>=3?'🔥':''}
       </span>
+      ${tech.obv_rank_pct!=null?`<span class="stag ${(tech.obv_rank_pct||0)>90?'buy':(tech.obv_rank_pct||0)>75?'info':''}">百分位${tech.obv_rank_pct}%</span>`:''}
     </div>
+    ${tech.obv_enh_advice?`<div style="background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.2);border-radius:4px;padding:7px 10px;font-size:10px;font-family:var(--fm);line-height:1.8">
+      <div style="color:var(--cyan);font-size:9px;letter-spacing:1px;margin-bottom:3px">🤖 AI 評分建議（信心度：${tech.obv_enh_conf||'—'}）</div>
+      <div>${tech.obv_enh_advice}</div>
+      ${(tech.obv_enh_reasons||[]).map(r=>`<div style="color:var(--text2)">${r}</div>`).join('')}
+    </div>`:''}
   </div>
 
   <!-- ══ BB + Slope 斜率交點 ══ -->
@@ -4746,6 +4828,247 @@ function renderRisk(d){
     <div style="font-size:9px;color:var(--text3)">⚠️ 歷史回測不代表未來績效，不含手續費及滑點</div>
   </div>` : `<div class="card mb" style="color:var(--text3);font-size:12px;padding:12px">回測數據不足（需30根以上K線）</div>`}`;
 }
+
+
+// ═══════════════════════════════════════════════════════════════
+//  隔日早盤確認掃描模組
+//  五項進場確認條件 (全部通過才建議進場)
+//  條件A：開盤不破位  B：放量  C：突破昨高  D：RSI>50  E：無假突破
+// ═══════════════════════════════════════════════════════════════
+function evalNextDayConditions(d){
+  const tech  = d.technical||{};
+  const risk  = d.risk||{};
+  const bars  = d._bars||d._klineData||[];
+  const n     = bars.length;
+  if(n < 2) return null;
+
+  const prev   = bars[n-2];    // 昨日
+  const curr   = bars[n-1];    // 今日（最新）
+  const price  = curr.close;
+  const atr    = tech.atr || price*0.02;
+  const rsi    = tech.rsi || 50;
+  const volRatio = tech.vol_ratio || 1;
+
+  // ── 條件 A：開盤不破位（開盤 > 昨收 × 0.995）──
+  const A = curr.open > prev.close * 0.995;
+  const A_val = ((curr.open / prev.close - 1)*100).toFixed(2);
+  const A_detail = `開盤${A?'高於':'低於'}昨收 ${A_val}%（需>-0.5%）`;
+
+  // ── 條件 B：今日成交量放大（量比 > 1.2）──
+  const B = volRatio > 1.2;
+  const B_val = volRatio.toFixed(2);
+  const B_detail = `量比 ${B_val}x（需>1.2x）`;
+
+  // ── 條件 C：最高價突破昨日高點 ──
+  const C = curr.high > prev.high;
+  const C_val = ((curr.high/prev.high-1)*100).toFixed(2);
+  const C_detail = `今高 ${curr.high.toFixed(2)} vs 昨高 ${prev.high.toFixed(2)}（差${C_val}%）`;
+
+  // ── 條件 D：RSI(14) > 50（動能偏多）──
+  const D = rsi > 50;
+  const D_val = rsi.toFixed(1);
+  const D_detail = `RSI ${D_val}（需>50）`;
+
+  // ── 條件 E：無假突破（上影線 ≤ 實體 × 1.5）──
+  const body   = Math.abs(curr.close - curr.open);
+  const upperW = curr.high - Math.max(curr.open, curr.close);
+  const E = body > 0 ? upperW <= body * 1.5 : upperW < atr * 0.5;
+  const E_val = body>0 ? (upperW/body).toFixed(2) : '—';
+  const E_detail = `上影/實體比 ${E_val}（需≤1.5，否則暫緩進場）`;
+
+  const passed = [A,B,C,D,E].filter(Boolean).length;
+
+  // ── 進場建議 ──
+  let action, posSize, entryType, color;
+  if(passed === 5){
+    action   = '🚀 積極進場';
+    posSize  = '首批 50% 倉位';
+    entryType= '開盤後15分鐘內市價進場';
+    color    = 'var(--green)';
+  } else if(passed === 4){
+    action   = '✅ 標準進場';
+    posSize  = '首批 33% 倉位';
+    entryType= '設限價單於開盤 ±0.3% 內';
+    color    = '#5af0a0';
+  } else if(passed === 3){
+    action   = '⚡ 保守試探';
+    posSize  = '首批 20% 倉位';
+    entryType= '等待回測昨日高點支撐再進';
+    color    = 'var(--yellow)';
+  } else {
+    action   = '⛔ 放棄進場';
+    posSize  = '0%';
+    entryType= '繼續觀察或等下一根確認K線';
+    color    = 'var(--red)';
+  }
+
+  // ── 停損/目標 ──
+  const stopLoss = risk.stop_loss || (price - 2.5*atr);
+  const target1  = risk.target_1  || (price + 2.5*atr);
+  const target2  = risk.target_2  || (price + 5*atr);
+
+  // ── OBV 強化訊號 ──
+  const obvScore  = tech.obv_enh_score || 0;
+  const obvAdvice = tech.obv_enh_advice || '';
+  const obvConf   = tech.obv_enh_conf  || '';
+  const obvReasons= tech.obv_enh_reasons||[];
+
+  return {
+    conditions:{ A,B,C,D,E },
+    details:{ A:A_detail, B:B_detail, C:C_detail, D:D_detail, E:E_detail },
+    passed, action, posSize, entryType, color,
+    price, stopLoss, target1, target2,
+    obvScore, obvAdvice, obvConf, obvReasons,
+    rsi, volRatio, atr,
+  };
+}
+
+function renderNextDay(d){
+  const el = document.getElementById('nextdayContent');
+  if(!el) return;
+  if(!d || !d.ticker){ el.innerHTML='<div class="empty"><div class="empty-ico">🌅</div><div class="empty-t">請先分析股票</div></div>'; return; }
+
+  const nd = evalNextDayConditions(d);
+  if(!nd){ el.innerHTML='<div class="empty"><div class="empty-ico">📊</div><div class="empty-t">K線數據不足（需2根以上）</div></div>'; return; }
+
+  const condRows = [
+    ['A','開盤不破位','開盤 > 昨收×0.995（微跌可容忍）', nd.conditions.A, nd.details.A],
+    ['B','前15分鐘放量','今日量 > 昨日量×1.2（資金進場）',nd.conditions.B, nd.details.B],
+    ['C','突破昨日高點','開盤15分鐘最高 > 昨高（突破確認）',nd.conditions.C, nd.details.C],
+    ['D','RSI維持偏多','RSI(14) > 50（動能多頭）',          nd.conditions.D, nd.details.D],
+    ['E','無假突破警示','上影線 ≤ 實體×1.5（否則暫緩）',    nd.conditions.E, nd.details.E],
+  ];
+
+  const barW = nd.passed/5*100;
+  const barColor = nd.passed===5?'var(--green)':nd.passed>=3?'var(--yellow)':'var(--red)';
+
+  el.innerHTML=`
+  <!-- ══ 總結卡片 ══ -->
+  <div style="border:2px solid ${nd.color};border-radius:8px;margin-bottom:14px;overflow:hidden;box-shadow:0 4px 20px ${nd.color}22">
+    <div style="background:var(--bg4);border-bottom:1px solid var(--border2);padding:12px 18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <div>
+        <div style="font-family:var(--fh);font-size:11px;color:var(--cyan);letter-spacing:2px;margin-bottom:4px">🌅 隔日早盤確認掃描 — ${d.ticker}</div>
+        <div style="font-family:var(--fh);font-size:20px;font-weight:900;color:${nd.color}">${nd.action}</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-family:var(--fm);font-size:13px;color:var(--text)">通過 <span style="color:${nd.color};font-size:22px;font-weight:700">${nd.passed}</span> / 5 項</div>
+        <div style="width:140px;height:8px;background:var(--bg3);border-radius:4px;overflow:hidden;margin-top:6px">
+          <div style="width:${barW}%;height:100%;background:${barColor};border-radius:4px;transition:width .7s ease"></div>
+        </div>
+      </div>
+    </div>
+    <div style="background:var(--bg2);padding:12px 18px;display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start">
+      <div>
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">建議倉位</div>
+        <div style="font-family:var(--fh);font-size:15px;color:${nd.color}">${nd.posSize}</div>
+      </div>
+      <div>
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">進場方式</div>
+        <div style="font-size:12px;color:var(--text2);font-family:var(--fm)">${nd.entryType}</div>
+      </div>
+      <div>
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">現價 / 停損 / 目標</div>
+        <div style="font-family:var(--fm);font-size:12px">
+          <span style="color:var(--cyan)">${fp(nd.price)}</span>
+          <span style="color:var(--text3)"> / </span>
+          <span style="color:var(--red)">${fp(nd.stopLoss)}</span>
+          <span style="color:var(--text3)"> / </span>
+          <span style="color:var(--green)">${fp(nd.target1)}</span>
+          <span style="color:var(--text3)"> / </span>
+          <span style="color:var(--green)">${fp(nd.target2)}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 五條件明細 ══ -->
+  <div class="card mb">
+    <div class="card-t">📋 五項進場確認條件</div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-family:var(--fm);font-size:12px">
+        <thead>
+          <tr style="background:var(--bg4);color:var(--text3);font-size:10px;letter-spacing:1px">
+            <th style="padding:8px 12px;text-align:center;border-bottom:1px solid var(--border)">條件</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)">名稱</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)">說明</th>
+            <th style="padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)">實際數值</th>
+            <th style="padding:8px 12px;text-align:center;border-bottom:1px solid var(--border)">狀態</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${condRows.map(([id,name,desc,pass,detail])=>`
+          <tr style="border-bottom:1px solid var(--border);background:${pass?'rgba(0,255,157,.03)':'rgba(255,59,92,.03)'}">
+            <td style="padding:9px 12px;text-align:center">
+              <span style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--cyan)">${id}</span>
+            </td>
+            <td style="padding:9px 12px;font-weight:600;color:var(--text)">${name}</td>
+            <td style="padding:9px 12px;color:var(--text3);font-size:11px">${desc}</td>
+            <td style="padding:9px 12px;color:${pass?'var(--green)':'var(--yellow)'}">${detail}</td>
+            <td style="padding:9px 12px;text-align:center">
+              <span style="font-size:16px">${pass?'✅':'❌'}</span>
+            </td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ══ 進場決策說明 ══ -->
+  <div class="g2 mb">
+    <div class="card">
+      <div class="card-t">🎯 進場動作對照表</div>
+      ${[
+        ['5/5','🚀 積極進場','首批 50% 倉位','開盤後15分鐘內市價'],
+        ['4/5','✅ 標準進場','首批 33% 倉位','設限價單於開盤 ±0.3%'],
+        ['3/5','⚡ 保守試探','首批 20% 倉位','等待回測昨高支撐再進'],
+        ['≤2/5','⛔ 放棄進場','0% 觀察','等下一根確認K線'],
+      ].map(([cnt,act,pos,type])=>`
+      <div style="display:flex;align-items:center;justify-content:space-between;padding:7px 0;border-bottom:1px solid var(--border);gap:8px">
+        <span style="font-family:var(--fh);font-size:12px;color:var(--cyan);min-width:32px">${cnt}</span>
+        <span style="font-size:12px;flex:1">${act}</span>
+        <span style="font-family:var(--fm);font-size:11px;color:var(--text2)">${pos}</span>
+        <span style="font-size:10px;color:var(--text3)">${type}</span>
+      </div>`).join('')}
+      <div style="margin-top:10px;padding:8px;background:rgba(255,215,0,.05);border:1px solid rgba(255,215,0,.2);border-radius:4px;font-size:10px;color:var(--text3)">
+        ⚠️ 注意：此為技術面評估，實際進場前請確認基本面無異常事件。<br>
+        策略：Supertrend+EMA+MACD | ATR停損 2.5x / 停利 5x (RR=1:2)
+      </div>
+    </div>
+
+    <!-- OBV AI評分 -->
+    <div class="card">
+      <div class="card-t">🤖 OBV 四大秘訣 AI 評分（${nd.obvScore}分）</div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
+        <div style="width:54px;height:54px;border-radius:50%;border:3px solid ${nd.obvScore>=15?'var(--green)':nd.obvScore>=10?'var(--cyan)':nd.obvScore>=5?'var(--yellow)':'var(--red)'};display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-size:18px;font-weight:900;color:${nd.obvScore>=15?'var(--green)':nd.obvScore>=10?'var(--cyan)':nd.obvScore>=5?'var(--yellow)':'var(--red)'}">
+          ${nd.obvScore}
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--text)">${nd.obvAdvice||'計算中...'}</div>
+          ${nd.obvConf?`<div style="font-size:10px;color:var(--text3);margin-top:2px">信心度：${nd.obvConf}</div>`:''}
+        </div>
+      </div>
+      ${nd.obvReasons.length>0?`
+      <div style="border-top:1px solid var(--border);padding-top:8px">
+        ${nd.obvReasons.map(r=>`<div style="font-size:11px;color:var(--text2);padding:2px 0">${r}</div>`).join('')}
+      </div>`:'<div style="font-size:11px;color:var(--text3)">未觸發OBV秘訣</div>'}
+      <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px">
+        ${[['EMA3',fn(nd.tech?.obv_ema3,0)],['EMA30',fn(nd.tech?.obv_ema30,0)],
+           ['百分位',fn(nd.tech?.obv_rank_pct,1)+'%'],['共振',fn(nd.tech?.obv_4secrets||0,0)+'/4']
+          ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div><div class="mc-v">${v}</div></div>`).join('')}
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 注意事項 ══ -->
+  <div style="padding:12px 16px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;font-size:11px;color:var(--text3);line-height:1.9">
+    <b style="color:var(--yellow)">📌 使用說明</b><br>
+    • 條件 B（放量）使用「今日 vs 昨日平均量比」代替，正式使用需當日實時數據<br>
+    • 條件 C（突破昨高）使用今日最高價，日線分析已是完整交易日數據<br>
+    • 隔日盤前確認建議：在開盤前查看，設好停損再入場<br>
+    • 3/5 以下建議等待，不宜追價或強行進場
+  </div>`;
+}
+
 
 /* ═══════════════════════════════════════════════
    SCAN
@@ -5718,11 +6041,14 @@ function wySig(l,active,type){
   <button class="mob-tab" id="mtab-scan"    onclick="mobSwitch('scan')">
     <span class="mob-tab-icon">🔍</span><span>掃描</span>
   </button>
+  <button class="mob-tab" id="mtab-nextday" onclick="mobSwitch('nextday')">
+    <span class="mob-tab-icon">🌅</span><span>隔日</span>
+  </button>
 </nav>
 
 <script>
 /* ── 手機 Tab 切換 ── */
-const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan'];
+const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday'];
 let _curMobTab = 'overview';
 
 function mobSwitch(tab){
