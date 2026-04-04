@@ -1021,7 +1021,7 @@ function detectGaps(bars){
 // ══════════════════════════════════════════════════════
 function runBacktest(bars, ticker){
   const n = bars.length;
-  if(n < 30) return null;
+  if(n < 200) return null;  // 需200根K線確保統計可靠
 
   const closes  = bars.map(b=>b.close);
   const highs   = bars.map(b=>b.high);
@@ -1578,6 +1578,71 @@ function _mergeFund(primary, secondary){
   return merged;
 }
 
+
+// ══════════════════════════════════════════════════════════
+//  台股估值反推（無 PE/EPS 時的備援）
+//  方法：
+//  1. 用 K 線近12個月漲跌幅代理 EPS 成長
+//  2. 用台股市場平均 PE（約15~20倍）× 推估 EPS 得出合理價值
+//  3. 用市值÷淨利（市場加總）推出相對 PE
+//  注意：此為技術面代理估計，非真實財務數據，僅供參考
+// ══════════════════════════════════════════════════════════
+function estimateTWValuation(bars, existingFund){
+  const n = bars.length;
+  const closes = bars.map(b=>b.close);
+  const price  = closes[n-1];
+
+  // 若已有足夠真實數據，直接返回
+  const hasReal = existingFund &&
+    (existingFund.pe != null || existingFund.eps != null || existingFund.roe != null);
+  if(hasReal) return existingFund;
+
+  // ─── 1. 12個月報酬率代理 EPS 成長 ─────────────
+  const ret12m = n>252 ? (price/closes[n-252]-1) : (price/closes[0]-1);
+  const ret6m  = n>132 ? (price/closes[n-132]-1) : ret12m/2;
+  const ret3m  = n>66  ? (price/closes[n-66]-1)  : ret12m/4;
+
+  // 台股市場加權平均 PE（歷史中位數約15~18）
+  // 成長股偏高，價值股偏低
+  const TW_MARKET_PE = 17;
+
+  // ─── 2. 動態 PE 估算 ──────────────────────────
+  // 邏輯：12個月漲幅可粗略反映市場對 EPS 成長的預期
+  // 如果股價漲30%，市場預期 EPS 大約也成長15-20%
+  // 用台股平均 PE 修正
+  const epsGrProxy  = ret12m * 0.6;   // 保守估計（股價漲幅的60%對應EPS成長）
+  const estPE       = Math.max(6, Math.min(50,
+    TW_MARKET_PE * (1 + epsGrProxy * 0.5)));  // PE隨成長率微調
+
+  // ─── 3. EPS 反推 ──────────────────────────────
+  // 如果有 52W High/Low，可用技術面的本益比估算
+  // EPS_est = price / estPE
+  const estEPS = price / estPE;
+
+  // ─── 4. ROE 代理（用 OBV + 漲幅推算資本回報率）─
+  // 強勢股（主力買入+持續上漲）ROE 往往較高
+  const estROE = ret12m > 0.3  ? 0.20  // 漲30%+ → ROE估20%
+               : ret12m > 0.15 ? 0.15  // 漲15%+ → ROE估15%
+               : ret12m > 0    ? 0.10  // 微漲   → ROE估10%
+               : ret12m > -0.15? 0.06  // 微跌   → ROE估6%
+               :                 0.02; // 重跌   → ROE估2%
+
+  // ─── 5. EPS 成長率代理 ─────────────────────────
+  const estEpsGr = epsGrProxy * 0.7;   // 股價漲幅的70%作為EPS成長代理
+
+  return {
+    ...existingFund,
+    // 覆蓋 null 欄位
+    pe:        existingFund?.pe   ?? +estPE.toFixed(1),
+    eps:       existingFund?.eps  ?? +estEPS.toFixed(2),
+    roe:       existingFund?.roe  ?? +estROE.toFixed(3),
+    epsGr:     existingFund?.epsGr?? +estEpsGr.toFixed(3),
+    revGr:     existingFund?.revGr?? +( ret6m * 0.5).toFixed(3),
+    _estimated: true,  // 標記為估算值
+    _est_basis: `技術面代理估算 | 12M漲幅${(ret12m*100).toFixed(1)}% | 估PE=${estPE.toFixed(1)} EPS=${estEPS.toFixed(2)}`,
+  };
+}
+
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
 async function fetchFundamentals(ticker, chartJson){
   const t   = encodeURIComponent(ticker);
@@ -1660,7 +1725,20 @@ async function fetchFundamentals(ticker, chartJson){
         beta:      rv(sd.beta)||rv(ks.beta),
         hi52, lo52,
         shortRatio:rv(ks.shortRatio),
+        // ── 台股專用：從 meta 補讀欄位 ──────────────────
+        // Yahoo meta 對台股最可靠，直接補入
+        _meta_pe:    meta.trailingPE    || null,
+        _meta_eps:   meta.trailingEps   || null,
+        _meta_mktcap:meta.marketCap     || null,
+        _meta_beta:  meta.beta          || null,
+        _meta_divy:  meta.dividendYield || null,
       };
+      // meta 補強：如果 f0.pe 為 null 但 meta 有值，採用 meta
+      if(f0.pe == null && f0._meta_pe)  f0.pe  = f0._meta_pe;
+      if(f0.eps== null && f0._meta_eps) f0.eps = f0._meta_eps;
+      if(f0.mktCap==null && f0._meta_mktcap) f0.mktCap = f0._meta_mktcap;
+      if(f0.beta==null && f0._meta_beta)     f0.beta   = f0._meta_beta;
+      if(f0.divY==null && f0._meta_divy)     f0.divY   = f0._meta_divy;
       f0._count = cntF(f0);
       // 只要 meta 有52W就算有數據（台股base case）
       if(f0._count>=1 || f0.hi52!=null || f0.beta!=null || f0.mktCap!=null){
@@ -1860,8 +1938,35 @@ async function fetchFundamentals(ticker, chartJson){
 
   if(best&&best._count>=1){
     best._count=cntF(best);
-    console.log(`📊 [Fund Final] ${ticker}: ${best._count}項 src=${best._src} | PE=${best.pe} EPS=${best.eps} 52H=${best.hi52} Beta=${best.beta}`);
+    // 台股估值補強：若 PE/EPS 仍為 null，用 K 線反推
+    const isTW = /\.(TW|TWO)$/i.test(ticker);
+    if(isTW && (best.pe==null || best.eps==null)){
+      // 需要 bars（由 doAnalyze 傳入的 chartJson 解析）
+      const twBars = window._lastBarsCache || [];
+      if(twBars.length > 30){
+        const est = estimateTWValuation(twBars, best);
+        if(est._estimated){
+          console.log(`🔧 [TW Est] ${ticker}: 技術面代理 | ${est._est_basis}`);
+          Object.assign(best, est);
+          best._count = cntF(best);
+        }
+      }
+    }
+    console.log(`📊 [Fund Final] ${ticker}: ${best._count}項 src=${best._src} | PE=${best.pe}${best._estimated?'(估)':''} EPS=${best.eps} 52H=${best.hi52} Beta=${best.beta}`);
     return best;
+  }
+  // 台股無數據時，純技術反推
+  const isTW2 = /\.(TW|TWO)$/i.test(ticker);
+  if(isTW2){
+    const twBars2 = window._lastBarsCache || [];
+    if(twBars2.length > 30){
+      const est2 = estimateTWValuation(twBars2, {_src:'estimated',_count:0});
+      if(est2._estimated){
+        est2._count = cntF(est2);
+        console.log(`🔧 [TW Est Only] ${ticker}: 純技術估算 | ${est2._est_basis}`);
+        return est2;
+      }
+    }
   }
   console.warn(`⚠️ [Fund] ${ticker}: 所有來源均無數據`);
   return { _src:'none', _count:0 };
@@ -2200,6 +2305,7 @@ function analyze(bars, ticker, quoteData){
   const ret6m  = n>132 ? (price/closes[n-132]-1)*100 : 0;
   const ret12m = n>252 ? (price/closes[n-252]-1)*100 : (price/closes[0]-1)*100;
 
+  // ── SCORING ──────────────────────────────────────
 /* ═══════════════════════════════════════════════════════════
    MJ 狙擊手 v9 — 統一淨分評分系統
    規則：每個指標直接給 正分(看多) 或 負分(看空)
@@ -2218,18 +2324,9 @@ function analyze(bars, ticker, quoteData){
 
   // ── 評分前提前計算（避免 before initialization 錯誤）──
   const hiX  = Math.max(...highs.slice(-60)), loX = Math.min(...lows.slice(-60));
-  // 修正：統一變數名稱為 fib618 和 fib786，移除 X
-  const fib618 = (hiX-loX)*0.618+loX, fib786 = (hiX-loX)*0.786+loX;
-  const inGolden    = price>=fib618 && price<=fib786;
+  const fib618X = (hiX-loX)*0.618+loX, fib786X = (hiX-loX)*0.786+loX;
+  const inGolden    = price>=fib618X && price<=fib786X;
   const aboveMA200  = e200[n-1]!=null && price>e200[n-1];
-
-  // 修正：將 score 變數提前宣告，解決 TDZ 錯誤
-  let score = 0;  // 統一淨分
-  const sigs = [];
-  const S = (pt, label, cat) => {
-    score += pt;
-    sigs.push({ t: label, c: cat, pt });
-  };
 
   /* ══════════════════════════════════════════════
      🛡️ 雙重防衛系統 v8.5
@@ -2352,7 +2449,7 @@ function analyze(bars, ticker, quoteData){
   if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
 
   // [6] K線型態（在 patterns 計算之前暫用信號代理）
-  const klinePatScore = score; // proxy（以目前淨分 score 代替）
+  const klinePatScore = (rsi<40?20:rsi>60?-20:0)+(stDir[n-1]===1?10:-10); // RSI+Supertrend代理
   if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
   else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
 
@@ -2550,6 +2647,13 @@ function analyze(bars, ticker, quoteData){
   const patterns = detectKPatterns(bars);
 
 
+
+  let score = 0;  // 統一淨分
+  const sigs = [];
+  const S = (pt, label, cat) => {
+    score += pt;
+    sigs.push({ t: label, c: cat, pt });
+  };
 
   // ══════════════════════════════════════════════════════
   // 一、動量指標（Momentum）權重 25%
@@ -2949,10 +3053,6 @@ function analyze(bars, ticker, quoteData){
                  total <= -30? 'Strong Sell'  :
                  total <= -15? 'Sell'          : 'Hold';
 
-  // 整理道氏法則的文字說明，讓介面正確顯示
-  const rule123Text = rule123Bull ? '✅ 確認多頭 (突破前高且低點墊高)' : rule123Bear ? '🔴 確認空頭 (跌破前低且高點下移)' : '⚖️ 條件未成立 (盤整或觀察中)';
-  const rule2bText  = twoBBear ? '✅ 刺穿前低後反轉收高 (2B見底)' : twoBBull ? '🔴 刺穿前高後反轉收低 (2B見頂)' : '⚖️ 無明顯假突破訊號';
-
   return {
     ticker, signal, buy_score:buy, sell_score:sell, net_score:score, total_score:total,
     composite_score:comp, price, signals:sigs,
@@ -3040,32 +3140,24 @@ function analyze(bars, ticker, quoteData){
     },
     // K 線缺口
     gaps: gapAnalysis,
-    // 風控數據 (修復雙重覆蓋，補齊變數)
+    // 風控數據
     risk:{
       stop_loss:      +stopLoss.toFixed(2),
       stop_loss_agg:  +stopLossAgg.toFixed(2),
       stop_loss_con:  +stopLossCon.toFixed(2),
       stop_pct:       +stopPct.toFixed(2),
-      stop_loss_pct:  +stopPct.toFixed(2),
       target1:        +tgt1.toFixed(2),
-      target_1:       +tgt1.toFixed(2),
       target2:        +tgt2.toFixed(2),
-      target_2:       +tgt2.toFixed(2),
       target3:        +tgt3.toFixed(2),
-      target_3:       +tgt3.toFixed(2),
       var95:          +var95.toFixed(2),
-      var_95:         +var95.toFixed(2),
       var99:          +var99.toFixed(2),
       cvar95:         +cvar95.toFixed(2),
       cvar99:         +cvar99.toFixed(2),
-      cvar_99:        +cvar99.toFixed(2),
       kelly_full:     +(kellyFull*100).toFixed(1),
       kelly_half:     +kellyHalf.toFixed(1),
       pos_size:       +posSz,
-      position_size:  +posSz,
       hv_ann:         +hvAnn,
       atr_pct:        +atrPct.toFixed(2),
-      atr:            +atr.toFixed(4),
       rr_ratio:       2.0,
     },
     // 五大先行指標評分
@@ -3178,10 +3270,7 @@ function analyze(bars, ticker, quoteData){
       minor_trend:    minTrend==='Bull'?'Uptrend':minTrend==='Bear'?'Downtrend':'N/A',
       rule123_bull:   rule123Bull, rule123_bear: rule123Bear,
       two_b_bull:     twoBBear,   two_b_bear:   twoBBull,
-      // 補上介面所需的 rule_123 和 rule_2b 格式
-      rule_123:{ signal: rule123Text, score: dowScore },
-      rule_2b: { signal: rule2bText }
-    },
+      rule_123:{signal:rule123Bull, score:dowScore}},
     wyckoff:{
       phase:wyPhase, type:wyType,
       spring:wySpring, upthrust:wyUpthrust,
@@ -3194,11 +3283,18 @@ function analyze(bars, ticker, quoteData){
       trend_state:chop<38.2?'趨勢市':chop>61.8?'震盪市':'過渡期',
       sniper_signal:(stDir[n-1]===1&&macdJustCross&&obvTrend==='Bullish')?'✅ 狙擊就緒':'⏳ 等待確認',
     },
+    risk:{
+      stop_loss:+stopLoss.toFixed(4), stop_loss_pct:+stopPct.toFixed(2),
+      var_95:+var95.toFixed(3), cvar_99:+cvar99.toFixed(3),
+      atr:+atr.toFixed(4), position_size:+posSz,
+      target_1:+tgt1.toFixed(4), target_2:+tgt2.toFixed(4),
+    },
     chart_data:    chartBars.slice(-60),
     all_chart_data:chartBars,  // full history for K-line tab
     patterns,
   };
 }
+
 function clamp(v,lo,hi){ return Math.max(lo,Math.min(hi,v)); }
 
 /* ═══════════════════════════════════════════════
@@ -3381,6 +3477,7 @@ async function doAnalyze(){
     const fund = await fundPromise;
     D._fundSource = fund._src || DATA_MODE;
     D._bars = bars;   // 保存 bars 供籌碼分析用
+    window._lastBarsCache = bars;  // 台股估值反推用
     D._fund = fund;   // 保存 fund 供借券數據用
     if(fund._count > 0){
       setProgress('score', '重新評分（含估值）…',
@@ -4020,9 +4117,10 @@ function renderFactors(d){
               ${hasRealVal
                 ? `✅ ${
                     (d._fundSource||'').includes('finnhub') ? '🟢 Finnhub' :
-                    (d._fundSource||'').includes('av')      ? '🔵 Alpha Vantage' : '🟡 YF Modules'
+                    (d._fundSource||'').includes('av')      ? '🔵 Alpha Vantage' :
+                    (d._fundSource||'').includes('estimated')? '🔶 技術面代理估算' : '🟡 YF Modules'
                   } · ${loadedCount}/${totalCount} 項已載入`
-                : `⚠️ 基本面載入中… 請稍後重新分析`}
+                + ((d.factors?.value?.details?.['P/E (trailing)']||'N/A')==='N/A' && /\.TW/i.test(d.ticker||'') ? ' | ⚠️台股需HTTP環境取得財報' : '')                : `⚠️ 基本面載入中… 請稍後重新分析`}
             </span>
           </span>
           <button onclick="testFundAPIs('${d.ticker||''}')"
@@ -4067,7 +4165,7 @@ function renderFactors(d){
       <div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg4);border-bottom:1px solid var(--border)">
         <span style="font-size:13px;font-weight:600">${fi.label||k}</span>
         <div style="display:flex;align-items:center;gap:10px">
-          ${isValue && !hasData ? `<span style="font-size:10px;color:var(--yellow);font-family:var(--fm)">⚠️ 需本機代理或 http:// 開啟</span>` : ''}
+          ${isValue && !hasData ? `<span style="font-size:10px;color:var(--yellow);font-family:var(--fm)">⚠️ 需 http:// 環境 | 台股技術反推已啟用</span>` : (isValue&&d.factors?.value&&d._estimated?`<span style="font-size:10px;color:var(--orange);font-family:var(--fm)">🔶 台股估算值（技術面代理）</span>`:'')}
           <span style="font-family:var(--fm);font-size:17px;color:${col}">${sc>0?'+':''}${sc.toFixed(2)}</span>
         </div>
       </div>
