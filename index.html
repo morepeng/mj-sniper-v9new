@@ -1127,8 +1127,117 @@ function runBacktest(bars, ticker){
 //  籌碼分析：借券/外資/融資 散戶關係估算
 //  （基於技術面代理指標，因台股籌碼API需登入）
 // ══════════════════════════════════════════════════════
-function calcChipAnalysis(bars, fund){
+
+// ══════════════════════════════════════════════════════════
+//  台股借券賣出分析（JS 版本，對應 Python 模組）
+//  來源：TWSE TWTB4U API（透過 CORS proxy）
+//  非台股：使用 Yahoo shortRatio 代替
+// ══════════════════════════════════════════════════════════
+const _lendingCache = {};
+
+async function fetchSecuritiesLending(ticker){
+  const isTW = /\.(TW|TWO)$/i.test(ticker);
+  const code = ticker.replace(/\.(TW|TWO)$/i,'');
+  const cacheKey = `lending_${code}`;
+  if(_lendingCache[cacheKey]) return _lendingCache[cacheKey];
+
+  const EMPTY = {
+    lending_sell:0, lending_balance:0, lending_return:0,
+    net_lending:0, vs_margin:0, history:[], signal:'N/A', score:0,
+    data_source: isTW ? 'pending' : 'not_tw'
+  };
+
+  if(!isTW){
+    _lendingCache[cacheKey] = EMPTY;
+    return EMPTY;
+  }
+
+  // 嘗試 TWSE TWTB4U API（透過 CORS proxy）
+  try{
+    const today = new Date();
+    const d = today.toISOString().slice(0,10).replace(/-/g,'');
+    const url = `https://www.twse.com.tw/rwd/zh/marginTrading/TWTB4U?date=${d}&stockNo=${code}&response=json`;
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+    const resp = await fetch(proxyUrl, {cache:'no-store'});
+    const data = await resp.json();
+
+    if(data?.stat === 'OK' && data?.data?.length > 0){
+      for(const r of data.data){
+        if(String(r[0]).trim() === code){
+          const sell    = parseInt(String(r[2]).replace(/,/g,'')) || 0;
+          const ret     = parseInt(String(r[3]).replace(/,/g,'')) || 0;
+          const balance = parseInt(String(r[4]).replace(/,/g,'')) || 0;
+          const result  = {
+            lending_sell: sell, lending_balance: balance,
+            lending_return: ret, net_lending: sell - ret,
+            vs_margin: 0, history: [balance], signal:'N/A', score:0,
+            data_source:'twse_api'
+          };
+          _lendingCache[cacheKey] = result;
+          return result;
+        }
+      }
+    }
+  }catch(e){ console.warn('[Lending]', e.message); }
+
+  _lendingCache[cacheKey] = EMPTY;
+  return EMPTY;
+}
+
+function detectLendingSignal(lendingData, bars, fund){
+  // 加速度偵測 + K線裂縫共振
+  const history = lendingData.history || [];
+  const balance = lendingData.lending_balance || 0;
+  const netLend = lendingData.net_lending || 0;
+  const shortR  = fund?.shortRatio || null;  // 美股 Yahoo
+  const isTW    = lendingData.data_source !== 'not_tw';
+
+  // 美股用 shortRatio
+  if(!isTW && shortR != null){
+    const score = shortR > 10 ? +3 : shortR > 5 ? +1 : shortR < 2 ? -1 : 0;
+    const signal = shortR > 10 ? 'Short_Squeeze_Setup' :
+                   shortR > 5  ? 'Neutral' : 'Low_Short';
+    return { score, signal, reason: `空單回補天數 ${shortR}天`, data_source:'yahoo_short' };
+  }
+
+  // 台股：技術代理（當 TWSE API 無數據時）
+  if(bars && bars.length >= 5){
+    const closes = bars.map(b=>b.close);
+    const vols   = bars.map(b=>b.volume);
+    const n = bars.length;
+    const volMA20 = vols.slice(-20).reduce((a,b)=>a+b,0)/Math.min(20,n);
+    const rsiArr  = calcRSI(closes);
+    const rsiNow  = rsiArr[n-1] ?? 50;
+
+    // 成交量代理借券：大量下跌 = 借券賣出可能
+    const vol = vols[n-1];
+    const volRatio = vol / (volMA20 || 1);
+    const priceDown = closes[n-1] < closes[n-2];
+
+    let score = 0, signal = 'Neutral', reason = '';
+
+    if(netLend > 0){
+      // 有真實台股借券數據
+      if(netLend > balance * 0.05){ score = -4; signal = 'Bearish_Building';
+        reason = `淨借券+${netLend.toLocaleString()}張，外資逐步建空`; }
+      else if(netLend < 0 && Math.abs(netLend) > balance * 0.05){ score = +4;
+        signal = 'Short_Covering'; reason = `借券回補${Math.abs(netLend).toLocaleString()}張，軋空潛力`; }
+    } else {
+      // 技術代理
+      if(volRatio > 1.8 && priceDown){ score = -3; signal = 'Bearish_Building';
+        reason = `放量下跌(${volRatio.toFixed(1)}x)代理借券賣壓`; }
+      else if(rsiNow < 30 && volRatio < 0.8){ score = +2; signal = 'Short_Covering';
+        reason = `RSI超賣+縮量，借券回補機率高`; }
+      else { reason = '技術代理估算（台股借券需 TWSE API）'; }
+    }
+    return { score, signal, reason, data_source: netLend>0?'twse_api':'proxy_estimated' };
+  }
+  return { score:0, signal:'N/A', reason:'無數據', data_source:'none' };
+}
+
+function calcChipAnalysis(bars, fund, ticker=''){
   const n = bars.length;
+  const isTW = /\.(TW|TWO)$/i.test(ticker);
   const closes = bars.map(b=>b.close);
   const vols   = bars.map(b=>b.volume);
   const volMA  = sma(vols, 20);
@@ -1181,6 +1290,12 @@ function calcChipAnalysis(bars, fund){
                         fiiNetBuy < -3               ? '📉 主力出場、謹慎觀望' :
                                                        '⚖️ 多空均衡、觀望為主';
 
+  // 借券訊號（同步代理計算，非同步 TWSE 由 doAnalyze 補充）
+  const lendingProxy = detectLendingSignal(
+    { lending_balance:0, net_lending:0, history:[], data_source: isTW?'pending':'not_tw' },
+    bars, fund
+  );
+
   return {
     fii_net:         +fiiNetBuy.toFixed(1),
     fii_dir:         fiiDir,
@@ -1192,6 +1307,13 @@ function calcChipAnalysis(bars, fund){
     recent_gaps:     recentGaps,
     total_gaps:      gaps.length,
     unfilled_gaps:   openGaps.length,
+    // 借券新增欄位
+    lending_signal:  lendingProxy.signal,
+    lending_score:   lendingProxy.score,
+    lending_reason:  lendingProxy.reason,
+    lending_balance: 0,
+    lending_sell:    0,
+    lending_source:  lendingProxy.data_source,
   };
 }
 
@@ -2946,9 +3068,12 @@ function analyze(bars, ticker, quoteData){
   else if(!aboveMA200&&slope<0&&adx>25)    S(-5,'L4宏觀：趨勢弱勢(MA200+ADX)','sell');
   if(adx<15)                               S(-2,'L4宏觀：ADX極弱(無趨勢)','sell');
   // L5 結構複合
+  // L5: 加入 Wyckoff A/D 線訊號
+  const wyAdBonus = adBullDiv ? 1 : adBearDiv ? -1 : 0;
   const structScore = (ictSmc.score>70?3:ictSmc.score<30?-2:0)
                     + (dowTrend3==='TripleBull'?3:dowTrend3==='TripleBear'?-3:0)
-                    + ((wySpring||wySOS)?2:(wyUpthrust||wySOW)?-2:0);
+                    + ((wySpring||wySOS||isSpring)?2:(wyUpthrust||wySOW||isUTAD)?-2:0)
+                    + wyAdBonus;  // A/D 背離加成
   if(structScore>=5)      S(+6,'L5結構：ICT+道氏+威科夫三重共振','buy');
   else if(structScore>=3) S(+3,'L5結構：結構偏多','buy');
   else if(structScore<=-5)S(-6,'L5結構：結構全面轉空','sell');
@@ -3306,8 +3431,11 @@ function analyze(bars, ticker, quoteData){
       l5_structure:{
         score: ictSmc.score,
         signal: ictSmc.signal,
+        struct_score: structScore,
         details:{ bos:ictSmc.bos, choch:ictSmc.choch, ote:ictSmc.ote, fvg:ictSmc.fvg,
-                  dow_trend3:dowTrend3, wyckoff:wyPhase }
+                  dow_trend3:dowTrend3, wyckoff:wyPhase,
+                  ad_bull_div:adBullDiv, ad_bear_div:adBearDiv,
+                  is_spring:isSpring, is_utad:isUTAD }
       },
     },
     // 回測
@@ -3613,7 +3741,26 @@ async function doAnalyze(){
       if(window.innerWidth <= 768) showPanel('overview');
     }
     setProgress('done', '分析完成！', `${ticker} - ${D.signal}`);
-    // 兩階段渲染完成（以上已處理）
+
+    // 台股借券 TWSE API（非同步追加，不阻塞主流程）
+    if(/\.(TW|TWO)$/i.test(ticker)){
+      fetchSecuritiesLending(ticker).then(lendData => {
+        if(lendData && lendData.data_source === 'twse_api'){
+          const lendSig = detectLendingSignal(lendData, bars, D._fund||{});
+          if(!D._chip) D._chip = {};
+          D._chip.lending_balance = lendData.lending_balance;
+          D._chip.lending_sell    = lendData.lending_sell;
+          D._chip.lending_return  = lendData.lending_return;
+          D._chip.lending_signal  = lendSig.signal;
+          D._chip.lending_score   = lendSig.score;
+          D._chip.lending_reason  = lendSig.reason;
+          D._chip.lending_source  = 'twse_api';
+          console.log('[TWSE 借券]', ticker, lendSig.signal, lendSig.reason);
+          // 重新渲染 SMC 面板
+          try{ renderSMC(D); }catch(e){}
+        }
+      }).catch(()=>{});
+    }
   } catch(err){
     // 顯示錯誤在進度條位置
     const msgEl = document.getElementById('loadMsg');
@@ -3787,9 +3934,12 @@ function generateTradeDecision(d){
   const layersPassed = [l1,l2,l3,l4].filter(Boolean).length;
 
   // ── 2. 0-100 綜合評分 ──────────────────────────
-  // 買賣分 (最高 ~60) → normalize 40分
+  // 籌碼借券評分補正
+  const chip2 = d._chip || {};
+  const lendScore = chip2.lending_score || 0;  // 借券訊號 -10~+10
+
   // 用新淨分系統（正=看多，負=看空，範圍約 ±140）
-  const netSc   = d.net_score ?? d.total_score ?? 0;
+  const netSc   = (d.net_score ?? d.total_score ?? 0) + lendScore * 0.5;
   const rawScore = Math.max(-140, Math.min(140, netSc));
   const scoreNorm = Math.round((rawScore + 140) / 2.8); // 正規化到 0-100
   // 七因子補正 ±20
@@ -4726,7 +4876,7 @@ function _renderChipPanel(d){
   let chip    = { fii_dir:'計算中', margin_sentiment:'計算中',
                   short_signal:'無數據', retail_vs_smart:'計算中',
                   open_gaps:[], unfilled_gaps:0 };
-  try{ chip = calcChipAnalysis(bars||[], fund); }catch(e){}
+  try{ chip = calcChipAnalysis(bars||[], fund, d.ticker||''); }catch(e){}
 
   return `
   <!-- ══ 籌碼分析 ══ -->
@@ -4751,16 +4901,29 @@ function _renderChipPanel(d){
     <div class="card">
       <div class="card-t">📋 借券 / 空單分析</div>
       <div class="smc-item"><span class="smc-ico">🩳</span>
-        <div><div class="smc-lbl">借券空單壓力</div>
-          <div class="smc-val">${chip.short_signal}</div></div></div>
+        <div><div class="smc-lbl">借券空單訊號</div>
+          <div class="smc-val ${chip.lending_signal==='Short_Squeeze_Setup'?'pos':chip.lending_signal==='Short_Covering'?'pos':chip.lending_signal==='Bearish_Building'||chip.lending_signal==='Bearish_Acceleration'?'neg':''}">${
+            chip.lending_signal==='Short_Squeeze_Setup'? '🚀 軋空潛力（借券大量回補）' :
+            chip.lending_signal==='Short_Covering'?      '📈 借券回補（空頭撤退）' :
+            chip.lending_signal==='Bearish_Acceleration'?'🚫 借券暴增（外資主導下殺）':
+            chip.lending_signal==='Bearish_Building'?    '🔴 借券增加（外資逐步建空）':
+            chip.lending_signal==='Low_Short'?           '⚖️ 空單少（趨勢平穩）':
+            chip.short_signal || '—'
+          }</div></div></div>
       <div class="smc-item"><span class="smc-ico">📊</span>
-        <div><div class="smc-lbl">Short Ratio（Yahoo）</div>
-          <div class="smc-val">${chip.short_ratio!=null?chip.short_ratio+'天回補':'N/A (台股不提供)'}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">🧠</span>
-        <div><div class="smc-lbl">散戶放空解讀</div>
+        <div><div class="smc-lbl">借券/空單數據</div>
           <div class="smc-val" style="font-size:11px">
-            空單多 = 軋空潛力大（逆向看多）<br>
-            空單少 = 無壓力，趨勢平穩</div></div></div>
+            ${chip.lending_balance>0 ? '台股借券餘額：'+chip.lending_balance.toLocaleString()+'張' : ''}
+            ${chip.lending_sell>0    ? '｜本日賣出：'+chip.lending_sell.toLocaleString()+'張' : ''}
+            ${chip.short_ratio!=null ? '美股空單回補：'+chip.short_ratio+'天' : ''}
+            ${chip.lending_source==='proxy_estimated'? '<span style="color:var(--yellow)">（技術代理估算）</span>' : ''}
+            ${chip.lending_source==='twse_api'?        '<span style="color:var(--green)">（TWSE即時）</span>'      : ''}
+          </div></div></div>
+      <div class="smc-item"><span class="smc-ico">🧠</span>
+        <div><div class="smc-lbl">借券訊號解讀</div>
+          <div class="smc-val" style="font-size:10px;color:var(--text2);line-height:1.7">${
+            chip.lending_reason || '借券增加先行1~3天，長黑放量=外資主導下殺（A型裂縫）'
+          }<br>借券減+長紅=軋空行情（D型）｜借券增+紅K=散戶多外資空（E型危險）</div></div></div>
     </div>
   </div>`;
 }
@@ -4821,6 +4984,15 @@ function renderLeading(d){
     ${mc('OTE進場',       tech.ote===1?'✅ 多頭':tech.ote===-1?'⚠️ 空頭':'—',
                           tech.ote===1?'pos':tech.ote===-1?'neg':'')}
     ${mc('威科夫階段',    tech.wyPhase||d.wyckoff?.phase||'N/A', '')}
+    ${mc('A/D背離',
+      d.wyckoff?.ad_bull_div?'✅ 底背離(累積)':d.wyckoff?.ad_bear_div?'⚠️ 頂背離(派發)':'—',
+      d.wyckoff?.ad_bull_div?'pos':d.wyckoff?.ad_bear_div?'neg':'')}
+    ${mc('Spring/UTAD',
+      d.wyckoff?.is_spring?'🌸 Spring(彈簧)':d.wyckoff?.is_utad?'🚫 UTAD(假突破)':'—',
+      d.wyckoff?.is_spring?'pos':d.wyckoff?.is_utad?'neg':'')}
+    ${(d._chip?.lending_signal&&d._chip.lending_signal!=='N/A')?mc('借券訊號',
+      d._chip.lending_signal, 
+      d._chip.lending_score>0?'pos':d._chip.lending_score<0?'neg':''):''}
   `)}
 
   <!-- VaR 快覽 -->
