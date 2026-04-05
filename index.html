@@ -3588,7 +3588,7 @@ async function doAnalyze(){
     _klineCache['1d'] = bars;
     _klineCache['1wk'] = null; _klineCache['15m'] = null;
     CHART_INTERVAL = '1d'; _CV.offset=0; _CV.zoom=1;
-    D._klineData = bars;
+    D._klineData = D?.all_chart_data || bars;  // 含指標
 
     setProgress('score', '評分系統計算…', '15大類 128個訊號評分中…');
     await new Promise(r=>setTimeout(r,30)); // 讓 UI 更新
@@ -3607,7 +3607,7 @@ async function doAnalyze(){
       setProgress('score', '重新評分（含估值）…',
         `${fund._src||'YF'} | PE=${fund.pe!=null?fund.pe.toFixed(1):'N/A'} EPS=${fund.eps!=null?fund.eps.toFixed(2):'N/A'}`);
       D = analyze(bars, ticker, fund);
-      D.ticker = ticker; D._klineData = bars;
+      D.ticker = ticker; D._klineData = D.all_chart_data || bars;  // 含指標
       setProgress('render', '更新估值面板…', `${fund._count}項財務數據`);
       renderAll(D);
       if(window.innerWidth <= 768) showPanel('overview');
@@ -5371,6 +5371,48 @@ function toggleInd(key){
   _redrawKLine();
 }
 
+
+// ══════════════════════════════════════════════════════
+//  attachIndicators: 為原始 K 線附加技術指標數據
+//  供 setChartInterval 取得新時間框架時使用
+//  讓 EMA / 布林帶 / MACD 在所有時間框架都能顯示
+// ══════════════════════════════════════════════════════
+function attachIndicators(rawBars){
+  if(!rawBars || rawBars.length < 2) return rawBars;
+  const closes = rawBars.map(b=>b.close);
+  const highs  = rawBars.map(b=>b.high);
+  const lows   = rawBars.map(b=>b.low);
+  const n = rawBars.length;
+
+  // EMA 20 / 50 / 200
+  const e20  = ema(closes, 20);
+  const e50  = ema(closes, 50);
+  const e200 = ema(closes, 200);
+
+  // Bollinger Bands
+  const {upper:bbUp, lower:bbLo} = calcBB(closes);
+
+  // MACD
+  const {macd:macdArr, signal:sigArr, hist:histArr} = calcMACD(closes);
+
+  // RSI
+  const rsiArr = calcRSI(closes);
+
+  // 附加到每根K線
+  return rawBars.map((b, i) => ({
+    ...b,
+    ema20:  e20[i]  != null ? +e20[i].toFixed(4)  : null,
+    ema50:  e50[i]  != null ? +e50[i].toFixed(4)  : null,
+    ema200: e200[i] != null ? +e200[i].toFixed(4) : null,
+    bb_up:  bbUp[i] != null ? +bbUp[i].toFixed(4) : null,
+    bb_lo:  bbLo[i] != null ? +bbLo[i].toFixed(4) : null,
+    macd_h: histArr[i] != null ? +histArr[i].toFixed(4) : null,
+    macd_l: macdArr[i] != null ? +macdArr[i].toFixed(4) : null,
+    sig_l:  sigArr[i]  != null ? +sigArr[i].toFixed(4)  : null,
+    rsi_v:  rsiArr[i]  != null ? +rsiArr[i].toFixed(2)  : null,
+  }));
+}
+
 // 切換 K 線時間框架（日線/週線/15分線）
 async function setChartInterval(interval){
   if(CHART_INTERVAL === interval) return;
@@ -5413,7 +5455,8 @@ async function setChartInterval(interval){
 
   try{
     const json = await fetchYF(tk, range, interval);
-    const newBars = parseOHLCV(json);
+    const rawBars  = parseOHLCV(json);
+    const newBars  = attachIndicators(rawBars);  // ← 附加 EMA/BB/MACD
     _klineCache[interval] = newBars;
     D._klineData = newBars;
     _redrawKLine();
@@ -5424,7 +5467,12 @@ async function setChartInterval(interval){
 
 // 統一重繪 K 線（根據當前狀態）
 function _redrawKLine(){
-  const bars = D?._klineData || D?.all_chart_data || D?.chart_data || [];
+  let bars = D?._klineData || D?.all_chart_data || D?.chart_data || [];
+  // 確保 bars 含有指標欄位（ema20/bb_up/macd_h）
+  if(bars.length > 0 && bars[bars.length-1].ema20 == null){
+    bars = attachIndicators(bars);
+    if(D) D._klineData = bars;  // 更新快取
+  }
   drawCandleChartOn('priceCanvas2','chartTip2', bars, D?.technical||{}, D?.patterns||[]);
   // 同時更新 overview 小圖（用日線）
   const dayBars = _klineCache['1d'] || D?.all_chart_data || D?.chart_data || [];
