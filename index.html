@@ -2646,6 +2646,51 @@ function analyze(bars, ticker, quoteData){
   const wySOS = stDir[n-1]===1&&macdV>0&&rsi>50&&volRatio>1.3;
   const wySOW = stDir[n-1]===-1&&macdV<0&&rsi<50&&volRatio>1.3;
 
+  // ── WYCKOFF A/D 線 + 累積/派發階段識別（JS版本）──────────
+  // 計算 A/D Line（累積/派發線）
+  const mfm_arr = bars.map((b,i)=>{
+    const hl = b.high-b.low;
+    return hl>0 ? ((b.close-b.low)-(b.high-b.close))/hl : 0;
+  });
+  const adLine_arr = mfm_arr.reduce((acc,v,i)=>{
+    acc.push((acc[i-1]||0) + v * vols[i]);
+    return acc;
+  },[]);
+  const adLine = adLine_arr[n-1] || 0;
+  const adLine20 = adLine_arr[Math.max(0,n-21)] || 0;
+  const adTrend  = adLine > adLine20 ? 'up' : 'down';
+
+  // A/D 背離（簡化版）
+  const priceUp10  = closes[n-1] > closes[Math.max(0,n-11)];
+  const adUp10     = adLine > (adLine_arr[Math.max(0,n-11)]||0);
+  const adBullDiv  = !priceUp10 && adUp10;   // 底背離：價跌但AD上
+  const adBearDiv  =  priceUp10 && !adUp10;  // 頂背離：價漲但AD下
+
+  // 累積/派發階段識別（基於成交量+價格結構）
+  const vol60avg  = vols.slice(-60).reduce((a,b)=>a+b,0)/60 || 1;
+  const volSurge  = vols[n-1] > vol60avg * 1.8;
+  const price60hi = Math.max(...closes.slice(-60));
+  const price60lo = Math.min(...closes.slice(-60));
+  const range60   = price60hi - price60lo;
+  // Spring: 跌破60日低後快速收回
+  const isSpring = lows[n-1] < price60lo * 0.99 && closes[n-1] > price60lo;
+  // UTAD: 突破60日高後快速收回
+  const isUTAD   = highs[n-1] > price60hi * 1.01 && closes[n-1] < price60hi;
+  // 橫盤區間（建倉/出貨特徵）
+  const rangeRatio = range60 / (price60lo||1);
+  const isConsolidation = rangeRatio < 0.08 && n > 20;
+
+  // 威科夫綜合評分（新增）
+  let wyAdScore = 0;
+  if(adTrend === 'up')    wyAdScore += 3;
+  if(adTrend === 'down')  wyAdScore -= 3;
+  if(adBullDiv)           wyAdScore += 5;
+  if(adBearDiv)           wyAdScore -= 5;
+  if(isSpring)            wyAdScore += 5;
+  if(isUTAD)              wyAdScore -= 5;
+  if(isConsolidation && adTrend==='up')   wyAdScore += 2; // 橫盤吸籌
+  if(isConsolidation && adTrend==='down') wyAdScore -= 2; // 橫盤出貨
+
   // ── RISK 風控計算 ────────────────────────────────
   const stopLoss    = price - 2.5*atr;          // ATR停損 2.5x
   const stopLossAgg = price - 1.5*atr;          // 積極停損 1.5x
@@ -2817,15 +2862,24 @@ function analyze(bars, ticker, quoteData){
   else if(twoBBull) S(-6, '道氏2B法則：刺低收高(看空)',  'sell');
 
   // ══════════════════════════════════════════════════════
-  // 七、威科夫分析（Wyckoff）權重 10%
+  // 七、威科夫分析（Wyckoff）權重 10%  ★ 含 A/D 線增強
   // ══════════════════════════════════════════════════════
-  if(wySpring)      S(+8, '🔥 威科夫 Spring(彈簧底)',    'buy');
-  else if(wySOW)    S(-6, '威科夫 SOW(弱勢信號)',         'sell');
-  if(wySOS)         S(+7, '威科夫 SOS(強勢信號)',         'buy');
-  else if(wyUpthrust) S(-7, '威科夫 Upthrust(上推陷阱)', 'sell');
-  if(wyPhase === 'Phase E (Markup)')           S(+5, '威科夫 E期(標漲階段)',   'buy');
-  else if(wyPhase === 'Phase A/B (Distribution)') S(-5, '威科夫 AB期(派發)',  'sell');
-  else if(wyPhase === 'Phase C/D (Testing/SOS)')  S(+3, '威科夫 CD期(測試)',  'buy');
+  // 原始威科夫訊號
+  if(wySpring||isSpring) S(+8, '🔥 威科夫 Spring(彈簧底)',    'buy');
+  else if(wySOW)         S(-6, '威科夫 SOW(弱勢信號)',         'sell');
+  if(wySOS)              S(+7, '威科夫 SOS(強勢信號)',         'buy');
+  else if(wyUpthrust||isUTAD) S(-7, '威科夫 Upthrust(上推陷阱)', 'sell');
+  if(wyPhase === 'Phase E (Markup)')               S(+5, '威科夫 E期(標漲階段)',   'buy');
+  else if(wyPhase === 'Phase A/B (Distribution)')  S(-5, '威科夫 AB期(派發)',      'sell');
+  else if(wyPhase === 'Phase C/D (Testing/SOS)')   S(+3, '威科夫 CD期(測試)',      'buy');
+  // A/D 線增強評分（來自 A/D Line 背離）
+  if(adBullDiv)        S(+5, '📈 威科夫A/D底背離(累積訊號)',   'buy');
+  else if(adBearDiv)   S(-5, '📉 威科夫A/D頂背離(派發警示)',   'sell');
+  if(adTrend==='up' && wySOS)   S(+3, '🔥 A/D上升+SOS共振',  'buy');
+  if(adTrend==='down' && wySOW) S(-3, '❄️ A/D下降+SOW共振', 'sell');
+  // 橫盤吸籌/出貨
+  if(isConsolidation && adTrend==='up')   S(+2, '威科夫 B期橫盤吸籌(A/D上)', 'buy');
+  if(isConsolidation && adTrend==='down') S(-2, '威科夫 B期橫盤出貨(A/D下)', 'sell');
 
   // ══════════════════════════════════════════════════════
   // 八、OFI 訂單流（Order Flow）權重 8%
@@ -3346,6 +3400,14 @@ function analyze(bars, ticker, quoteData){
       sos:wySOS, sow:wySOW,
       ad_line:+((obvArr[n-1]-obvArr[n-20])/1e6).toFixed(2)+'M',
       ad_trend:recentSlope>0?'上升':'下降',
+      // A/D Line 新增欄位
+      ad_line_trend: adTrend,
+      ad_bull_div:   adBullDiv,
+      ad_bear_div:   adBearDiv,
+      ad_score:      wyAdScore,
+      is_spring:     isSpring,
+      is_utad:       isUTAD,
+      consolidation: isConsolidation,
     },
     market:{
       vol_regime:hv>50?'High Vol':hv>25?'Normal':'Low Vol',
@@ -4468,6 +4530,13 @@ function renderDow(d){
   <div class="card">
     <div class="card-t">🔬 威科夫市場結構分析</div>
     <div class="g3">
+      <!-- A/D Line 摘要 -->
+      <div class="mc" style="margin-bottom:8px;background:var(--bg3);border-radius:4px;padding:8px 12px">
+        <div style="font-size:9px;color:var(--cyan);font-family:var(--fm)">A/D 累積/派發線</div>
+        <div style="font-size:12px;margin-top:3px;color:${wy.ad_trend==='up'?'var(--green)':'var(--red)'}">${wy.ad_trend==='up'?'📈 A/D上升（資金流入/累積）':'📉 A/D下降（資金流出/派發）'}</div>
+        ${wy.ad_bull_div?'<div style="font-size:10px;color:var(--green)">✅ 底背離：價跌但A/D上升→反轉訊號</div>':''}
+        ${wy.ad_bear_div?'<div style="font-size:10px;color:var(--red)">⚠️ 頂背離：價漲但A/D下降→派發訊號</div>':''}
+      </div>
       <div class="wyc-phase">
         <div class="wyc-name">${wy.phase?.split(' ')[0]||'—'} ${wy.phase?.split(' ')[1]||''}</div>
         <div class="wyc-sub">${wy.phase||'分析中'}</div>
@@ -5235,42 +5304,7 @@ async function loadIndices(){
     // 動態更新模式標籤
     const modeTag = _getModeTag();
     bar.innerHTML = modeTag + parts.join('') +
-      `<span style="font-size:10px;color:var(--text3);font-family:var(--fm)">載入中…</span>
-
-  <!-- ══ 簡易回測結果 ══ -->
-  ${bt ? `
-  <div class="card mb">
-    <div class="card-t">📊 歷史回測（技術訊號，僅供參考）</div>
-    <div class="g2 mb">
-      <div>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
-          ${[
-            ['總交易次數', bt.total+'次'],
-            ['勝率',       bt.winRate+'%'],
-            ['平均獲利',   '+'+bt.avgWin+'%'],
-            ['平均虧損',   bt.avgLoss+'%'],
-            ['獲利因子',   bt.profitFactor+'x'],
-            ['最大回撤',   bt.maxDrawdown+'%'],
-            ['總報酬',     bt.totalReturn>0?'+'+bt.totalReturn+'%':bt.totalReturn+'%'],
-          ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div>
-            <div class="mc-v ${v.startsWith('+')?'pos':v.startsWith('-')?'neg':''}">${v}</div></div>`).join('')}
-        </div>
-      </div>
-      <div>
-        <div style="font-size:10px;color:var(--text3);margin-bottom:6px">最近交易記錄</div>
-        ${bt.trades.slice(-5).reverse().map(t=>`
-        <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border);font-family:var(--fm);font-size:10px">
-          <span>${t.entryDate?.slice(5,10)||''}</span>
-          <span>${t.entry}→${t.exit}</span>
-          <span style="color:${t.pnl>0?'var(--green)':'var(--red)'}">
-            ${t.pnl>0?'+':''}${t.pnl}% (${t.held}天)</span>
-        </div>`).join('')}
-      </div>
-    </div>
-    <div style="font-size:9px;color:var(--text3);padding:4px">
-      ⚠️ 回測使用 Supertrend + EMA + MACD 訊號，ATR停損2.5x/停利5x，不含手續費，不代表未來績效
-    </div>
-  </div>` : '<div class="card mb" style="color:var(--text3);font-size:12px;padding:12px">回測數據不足（需30根以上K線）</div>'}`;
+      `<span style="font-size:10px;color:var(--text3);font-family:var(--fm)">載入中…</span>`
     await new Promise(res=>setTimeout(res, DATA_MODE==='local'?60:200));
   }
 
