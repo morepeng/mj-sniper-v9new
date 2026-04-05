@@ -1591,19 +1591,49 @@ function estimateTWValuation(bars, existing){
   const closes = bars.map(b=>b.close);
   const n = bars.length, price = closes[n-1];
   const ret12m = n>252?(price/closes[n-252]-1):(price/closes[0]-1);
-  const epsGrP = ret12m*0.6;
-  const estPE  = Math.max(6,Math.min(50, 17*(1+epsGrP*0.5)));
-  const estEPS = price/estPE;
-  const estROE = ret12m>0.3?0.20:ret12m>0.15?0.15:ret12m>0?0.10:ret12m>-0.15?0.06:0.02;
+  const ret3m  = n>66 ?(price/closes[n-66]-1) :ret12m;
+  const ret6m  = n>132?(price/closes[n-132]-1):ret12m;
+
+  // 台股分產業 PE 基準（以成長性推斷）
+  // 高成長科技/半導體（年漲>30%）：基準PE 28
+  // 標準成長（年漲15~30%）         ：基準PE 20
+  // 穩定型（年漲0~15%）            ：基準PE 16
+  // 衰退（年跌）                   ：基準PE 12
+  const basePE = ret12m>0.30 ? 28 :
+                 ret12m>0.15 ? 20 :
+                 ret12m>0    ? 16 : 12;
+
+  // EPS 成長代理（股價漲幅的 60%→EPS 成長）
+  const epsGrP = Math.max(-0.5, Math.min(1.5, ret12m * 0.6));
+
+  // 動態 PE：basePE × (1 + EPS成長 × 0.4)
+  const estPE = Math.max(8, Math.min(60, basePE * (1 + epsGrP * 0.4)));
+
+  const estEPS = price / estPE;
+
+  // ROE 代理（提升上限，高成長公司 ROE 可達 30%+）
+  const estROE = ret12m>0.50 ? 0.30 :   // 年漲 50%+ → ROE 估 30%（TSMC 等頂尖）
+                 ret12m>0.30 ? 0.25 :    // 年漲 30%+ → ROE 估 25%
+                 ret12m>0.15 ? 0.18 :    // 年漲 15%+ → ROE 估 18%
+                 ret12m>0    ? 0.12 :    // 微漲      → ROE 估 12%
+                 ret12m>-0.15? 0.07 :    // 微跌      → ROE 估 7%
+                               0.03;     // 重跌      → ROE 估 3%
+
+  // 毛利率代理（高 EPS 成長公司通常高毛利）
+  const estGrossMgn = ret12m>0.30 ? 0.45 :
+                      ret12m>0.15 ? 0.30 :
+                      ret12m>0    ? 0.20 : 0.12;
+
   return {
     ...existing,
-    pe:     existing?.pe    ?? +estPE.toFixed(1),
-    eps:    existing?.eps   ?? +estEPS.toFixed(2),
-    roe:    existing?.roe   ?? +estROE.toFixed(3),
-    epsGr:  existing?.epsGr ?? +(epsGrP*0.7).toFixed(3),
-    revGr:  existing?.revGr ?? +(ret12m*0.5).toFixed(3),
+    pe:        existing?.pe       ?? +estPE.toFixed(1),
+    eps:       existing?.eps      ?? +estEPS.toFixed(2),
+    roe:       existing?.roe      ?? +estROE.toFixed(3),
+    grossMgn:  existing?.grossMgn ?? +estGrossMgn.toFixed(3),
+    epsGr:     existing?.epsGr    ?? +(epsGrP*0.7).toFixed(3),
+    revGr:     existing?.revGr    ?? +(ret12m*0.5).toFixed(3),
     _estimated:true,
-    _est_basis:`技術代理 12M漲幅${(ret12m*100).toFixed(1)}% 估PE=${estPE.toFixed(1)} EPS=${estEPS.toFixed(2)}`,
+    _est_basis:`技術代理 | 12M漲幅${(ret12m*100).toFixed(1)}% | 基準PE=${basePE} → 估PE=${estPE.toFixed(1)} EPS=${estEPS.toFixed(2)} ROE=${(estROE*100).toFixed(0)}%`,
   };
 }
 /** 主要基本面函數：代理優先（完全繞過 CORS），瀏覽器端備用 */
@@ -2467,7 +2497,7 @@ function analyze(bars, ticker, quoteData){
   if(inGolden){ ddScore+=15; ddReasons.push({t:'🔥黃金口袋支撐',c:'buy'}); }
 
   // [6] K線型態（在 patterns 計算之前暫用信號代理）
-  const klinePatScore = score; // proxy（以目前淨分 score 代替）
+  const klinePatScore = (rsi<40?20:rsi>60?-20:0)+(stDir[n-1]===1?10:-10); // RSI+ST代理（避免score TDZ）
   if(klinePatScore>15) { ddScore+=25; ddReasons.push({t:`K線型態看多`,c:'buy'}); }
   else if(klinePatScore<-15){ ddScore-=25; ddReasons.push({t:`K線型態看空`,c:'sell'}); }
 
@@ -2981,15 +3011,18 @@ function analyze(bars, ticker, quoteData){
   // 計算估值評級分數
   let valRatingScore = 0; let valRatingCount = 0;
 
-  // PE 評分（越低越好，但不能虧損）
+  // PE 評分（越低越好，但需區分成長股/價值股）
+  // 高成長股(ROE>15%或EPS成長>15%)給予 PE 溢價，不輕易扣分
+  const isGrowthStock = (roe!=null&&roe>0.15) || (epsGr!=null&&epsGr>0.15) || (revGr!=null&&revGr>0.15);
   if(pe !== null){
     valRatingCount++;
-    if(pe < 0)         valRatingScore += -2;      // 虧損
-    else if(pe < 10)   valRatingScore += 3;        // 極低估
-    else if(pe < 15)   valRatingScore += 2;
-    else if(pe < 25)   valRatingScore += 1;
-    else if(pe < 35)   valRatingScore += 0;
-    else               valRatingScore += -1;       // 高估
+    if(pe < 0)            valRatingScore += -2;   // 虧損
+    else if(pe < 10)      valRatingScore += 3;    // 極低估
+    else if(pe < 15)      valRatingScore += 2;
+    else if(pe < 25)      valRatingScore += 1;
+    else if(pe < 40)      valRatingScore += (isGrowthStock ? 1 : 0);  // 成長股高PE不扣分反加分
+    else if(pe < 60)      valRatingScore += (isGrowthStock ? 0 : -1); // 成長股不扣分
+    else                  valRatingScore += -1;   // 極度高估才扣分
   }
   // ROE 評分（越高越好）
   if(roe !== null){
@@ -3482,6 +3515,7 @@ async function doAnalyze(){
 
     // 步驟2：並行取基本面
     setProgress('fund', '取得基本面數據…', '同時執行技術分析');
+    window._lastBarsCache = bars;  // 台股估值反推用（需在 fundPromise 前設定）
     const fundPromise = fetchFundamentals(ticker, chartJson);
 
     // 步驟3：快速分析（先顯示技術面）
@@ -3950,6 +3984,45 @@ function renderTradeDecision(d){
       <div style="padding:8px 14px">
         <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">📊 回測引擎（200根）</div>
         ${btHtml}
+      </div>
+    </div>
+
+    <!-- ══ Body Row 4：威科夫 A/D 線 ══ -->
+    <div style="display:flex;align-items:stretch;flex-wrap:wrap;border-top:1px solid var(--border);background:var(--bg)">
+      <div style="padding:8px 14px;flex:1;min-width:200px;border-right:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">🔬 威科夫階段</div>
+        <div style="font-size:12px;font-family:var(--fm)">
+          <span style="color:${
+            (d.wyckoff?.phase||'').includes('E')     ?'var(--green)':
+            (d.wyckoff?.phase||'').includes('C')&&d.wyckoff?.spring?'var(--green)':
+            (d.wyckoff?.phase||'').includes('D')&&d.wyckoff?.sos?'var(--cyan)':
+            (d.wyckoff?.phase||'').includes('A')||
+            (d.wyckoff?.phase||'').includes('B')     ?'var(--yellow)':'var(--text2)'}">
+            ${d.wyckoff?.phase||'N/A'} — ${d.wyckoff?.type||''}
+          </span>
+        </div>
+        <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:4px">
+          ${d.wyckoff?.spring?   '<span style="font-size:10px;color:var(--green);font-family:var(--fm)">🌱 Spring</span>':''}
+          ${d.wyckoff?.sos?      '<span style="font-size:10px;color:var(--cyan);font-family:var(--fm)">✅ SOS</span>':''}
+          ${d.wyckoff?.upthrust? '<span style="font-size:10px;color:var(--red);font-family:var(--fm)">⬆️ Upthrust</span>':''}
+          ${d.wyckoff?.sow?      '<span style="font-size:10px;color:var(--red);font-family:var(--fm)">⚠️ SOW</span>':''}
+        </div>
+        <div style="font-size:10px;color:var(--text3);margin-top:3px">A/D線趨勢：${d.wyckoff?.ad_trend||'—'} | ${d.wyckoff?.ad_line!=null?d.wyckoff.ad_line+'M':'—'}</div>
+      </div>
+      <div style="padding:8px 14px;flex:1;min-width:200px">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px;letter-spacing:1px">🌊 A/D 線分析</div>
+        <div style="font-size:10px;padding:2px 0">
+          A/D趨勢：<span style="color:${d.wyckoff?.ad_trend==='Rising'?'var(--green)':'var(--red)'}">
+            ${d.wyckoff?.ad_trend==='Rising'?'📈 上升（累積信號）':'📉 下降（派發壓力）'}
+          </span>
+        </div>
+        <div style="font-size:10px;color:var(--text2);padding:2px 0">
+          ${d.wyckoff?.spring?'✅ 彈簧底 (Spring)：跌破支撐後快速回復，看多信號':
+            d.wyckoff?.upthrust?'⚠️ 推力(Upthrust)：突破阻力後回落，派發警示':
+            d.wyckoff?.sos?'✅ 強度訊號(SOS)：放量突破，趨勢確立':
+            d.wyckoff?.sow?'⚠️ 弱度訊號(SOW)：放量跌破，下跌確立':
+            '觀察階段，等待明確訊號'}
+        </div>
       </div>
     </div>
   </div>`;
@@ -5254,9 +5327,13 @@ function setTF(n){
 
 function toggleInd(key){
   CIND[key] = !CIND[key];
-  const id = 'tog' + key.charAt(0).toUpperCase() + key.slice(1);
+  // 修正：overview 按鈕 id 全大寫，K線 tab 按鈕 id 首字母大寫
+  const idMap = {ema:'togEMA', bb:'togBB', vol:'togVol', macd:'togMACD', pat:'togPat'};
+  const idMap2= {ema:'togEma2',bb:'togBb2',vol:'togVol2',macd:'togMacd2',pat:'togPat2'};
+  const id  = idMap[key]  || ('tog'+key.charAt(0).toUpperCase()+key.slice(1));
+  const id2 = idMap2[key] || (id+'2');
   document.getElementById(id)?.classList.toggle('on', CIND[key]);
-  document.getElementById(id+'2')?.classList.toggle('on', CIND[key]);
+  document.getElementById(id2)?.classList.toggle('on', CIND[key]);
   _redrawKLine();
 }
 
