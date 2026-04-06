@@ -1108,6 +1108,23 @@ function runBacktest(bars, ticker){
     if(dd>maxDD) maxDD=dd;
   }
 
+  // ── 夏普值（Sharpe Ratio）計算 ──────────────────────
+  // Sharpe = (平均報酬 - 無風險利率) / 報酬標準差
+  // 使用無風險利率 2%（年化），轉換為每筆交易等效
+  const pnls       = trades.map(t => t.pnl / 100);
+  const avgPnl     = pnls.reduce((a,b)=>a+b,0) / (pnls.length||1);
+  const riskFree   = 0.0;  // 每筆基準（已扣除手續費概念，0=純粹策略回報）
+  const variance   = pnls.reduce((a,v)=>a+(v-avgPnl)**2,0) / (pnls.length||1);
+  const stdDev     = Math.sqrt(variance) || 1e-8;
+  const sharpeRaw  = (avgPnl - riskFree) / stdDev;
+  // 年化夏普（假設每年約 50 筆交易）
+  const tradePerYr = Math.max(1, (trades.length / Math.max(1, n/252)) * 1);
+  const sharpe     = +(sharpeRaw * Math.sqrt(tradePerYr)).toFixed(2);
+
+  // ── 卡瑪比率（Calmar Ratio）= 年化報酬 / 最大回撤 ──
+  const annReturn  = +((equity-100000)/100000 * (252/Math.max(1,n)) * 100).toFixed(1);
+  const calmar     = maxDD > 0 ? +(annReturn / maxDD).toFixed(2) : 0;
+
   return {
     trades: trades.slice(-10), // 最近10筆
     total:  trades.length,
@@ -1120,6 +1137,9 @@ function runBacktest(bars, ticker){
     maxDrawdown: +maxDD.toFixed(1),
     finalEquity: +equity.toFixed(0),
     totalReturn: +((equity-100000)/100000*100).toFixed(1),
+    sharpe:      sharpe,   // 夏普值（策略品質指標）
+    calmar:      calmar,   // 卡瑪比率（收益/風險比）
+    annReturn:   annReturn,
   };
 }
 
@@ -4977,23 +4997,46 @@ function renderLeading(d){
                           tech.dow_trend3==='TripleBull'?'pos':tech.dow_trend3==='TripleBear'?'neg':'')}
   `)}
 
-  ${tier('L5','市場結構 Structure', lead.l5_structure,`
-    ${mc('ICT/SMC評分',   (tech.obv_4secrets||0)+'pts',  '')}
-    ${mc('BOS突破',       tech.bos?'✅ 是':'—',           tech.bos?'pos':'')}
-    ${mc('CHOCH轉換',     tech.choch?'✅ 是':'—',         tech.choch?'pos':'')}
-    ${mc('OTE進場',       tech.ote===1?'✅ 多頭':tech.ote===-1?'⚠️ 空頭':'—',
-                          tech.ote===1?'pos':tech.ote===-1?'neg':'')}
-    ${mc('威科夫階段',    tech.wyPhase||d.wyckoff?.phase||'N/A', '')}
-    ${mc('A/D背離',
-      d.wyckoff?.ad_bull_div?'✅ 底背離(累積)':d.wyckoff?.ad_bear_div?'⚠️ 頂背離(派發)':'—',
-      d.wyckoff?.ad_bull_div?'pos':d.wyckoff?.ad_bear_div?'neg':'')}
-    ${mc('Spring/UTAD',
-      d.wyckoff?.is_spring?'🌸 Spring(彈簧)':d.wyckoff?.is_utad?'🚫 UTAD(假突破)':'—',
-      d.wyckoff?.is_spring?'pos':d.wyckoff?.is_utad?'neg':'')}
-    ${(d._chip?.lending_signal&&d._chip.lending_signal!=='N/A')?mc('借券訊號',
-      d._chip.lending_signal, 
-      d._chip.lending_score>0?'pos':d._chip.lending_score<0?'neg':''):''}
-  `)}
+  ${(()=>{
+    // L5 正確資料路徑
+    const l5d = lead.l5_structure?.details || {};
+    const l5s = lead.l5_structure?.struct_score ?? 0;
+    const bos   = l5d.bos   || false;
+    const choch = l5d.choch || false;
+    const ote   = l5d.ote   || 0;
+    const wy    = l5d.wyckoff || d.wyckoff?.phase || 'N/A';
+    const adBD  = l5d.ad_bull_div || d.wyckoff?.ad_bull_div || false;
+    const adBrD = l5d.ad_bear_div || d.wyckoff?.ad_bear_div || false;
+    const spr   = l5d.is_spring   || d.wyckoff?.is_spring   || false;
+    const utad  = l5d.is_utad     || d.wyckoff?.is_utad     || false;
+    const dow3  = l5d.dow_trend3  || tech.dow_trend3 || '—';
+    const ictSc = lead.l5_structure?.score || 0;
+    const lendSig = d._chip?.lending_signal;
+    const lendSc  = d._chip?.lending_score || 0;
+    return tier('L5','市場結構 Structure', lead.l5_structure,`
+      ${mc('ICT/SMC評分',   ictSc+'分 ('+lead.l5_structure?.signal+')',
+           ictSc>50?'pos':ictSc<30?'neg':'')}
+      ${mc('結構複合分',    (l5s>0?'+':'')+l5s+'分',
+           l5s>=5?'pos':l5s<=-5?'neg':'')}
+      ${mc('BOS突破',       bos?'✅ 結構突破':'—', bos?'pos':'')}
+      ${mc('CHOCH轉換',     choch?'✅ 趨勢轉換':'—', choch?'pos':'')}
+      ${mc('OTE進場',       ote===1?'✅ 多頭最佳進場':ote===-1?'⚠️ 空頭':'—',
+           ote===1?'pos':ote===-1?'neg':'')}
+      ${mc('道氏三重趨勢',  dow3==='TripleBull'?'🔥 三重多頭':dow3==='TripleBear'?'❄️ 三重空頭':
+           dow3==='MajInterBull'?'📈 主中期多':dow3==='MajInterBear'?'📉 主中期空':'⚖️ 混合', 
+           dow3==='TripleBull'||dow3==='MajInterBull'?'pos':
+           dow3==='TripleBear'||dow3==='MajInterBear'?'neg':'')}
+      ${mc('威科夫階段',    wy, '')}
+      ${mc('A/D背離',
+           adBD?'✅ 底背離(累積訊號)':adBrD?'⚠️ 頂背離(派發警示)':'—',
+           adBD?'pos':adBrD?'neg':'')}
+      ${mc('Spring/UTAD',
+           spr?'🌸 Spring彈簧底':utad?'🚫 UTAD假突破':'—',
+           spr?'pos':utad?'neg':'')}
+      ${lendSig&&lendSig!=='N/A'?mc('借券訊號', lendSig,
+           lendSc>0?'pos':lendSc<0?'neg':''):''}
+    `);
+  })()}
 
   <!-- VaR 快覽 -->
   <div class="card mt" style="margin-top:10px">
@@ -5124,7 +5167,9 @@ function renderRisk(d){
           ${[[`交易次數`,bt.total+`次`],[`勝率`,bt.winRate+`%`],
              [`平均獲利`,`+`+bt.avgWin+`%`],[`平均虧損`,bt.avgLoss+`%`],
              [`獲利因子`,bt.profitFactor+`x`],[`最大回撤`,bt.maxDrawdown+`%`],
-             [`總報酬`,bt.totalReturn+(bt.totalReturn>0?`% ✅`:`% ❌`)]
+             [`總報酬`,bt.totalReturn+(bt.totalReturn>0?`% ✅`:`% ❌`)],
+             [`夏普值`,bt.sharpe!=null?(bt.sharpe>=1?'⭐ ':'')+(bt.sharpe>0?'+':'')+bt.sharpe:'—'],
+             [`卡瑪比率`,bt.calmar!=null?(bt.calmar>=1?'⭐ ':'')+bt.calmar:'—'],
             ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div>
               <div class="mc-v ${v.startsWith('+')||v.endsWith('✅')?'pos':v.includes('-')||v.endsWith('❌')?'neg':''}">${v}</div></div>`).join('')}
         </div>
