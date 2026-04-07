@@ -515,6 +515,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <button class="ntab" data-tab="risk">⚠️ 風控管理</button>
   <button class="ntab" data-tab="scan">🔍 市場掃描</button>
   <button class="ntab" data-tab="nextday">🌅 隔日確認</button>
+  <button class="ntab" data-tab="tx">📈 台指期</button>
 </nav>
 
 <!-- MAIN -->
@@ -658,6 +659,11 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   <!-- NEXT-DAY CONFIRM SCAN -->
   <div class="panel" id="panel-nextday">
     <div id="nextdayContent"><div class="empty"><div class="empty-ico">🌅</div><div class="empty-t">請先分析股票，再查看隔日早盤確認</div></div></div>
+  </div>
+
+  <!-- 台指期面板 -->
+  <div class="panel" id="panel-tx">
+    <div id="txContent"><div class="empty"><div class="empty-ico">📈</div><div class="empty-t">點擊「台指期」分析台指期即時行情</div></div></div>
   </div>
 
 </div><!-- /wrap -->
@@ -1153,6 +1159,76 @@ function runBacktest(bars, ticker){
 //  來源：TWSE TWTB4U API（透過 CORS proxy）
 //  非台股：使用 Yahoo shortRatio 代替
 // ══════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════
+//  📊 Put/Call 比率分析（美股專用）
+//  來源：Yahoo Finance Options API
+//  PCR = 總Put成交量 / 總Call成交量
+//  PCR < 0.6：市場極度樂觀 → 看空逆向訊號 (-5分)
+//  PCR > 1.2：市場極度悲觀 → 看多逆向訊號 (+5分)
+// ══════════════════════════════════════════════════════════════════
+const _pcrCache = {};
+
+async function fetchPCR(ticker){
+  const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
+  if(!isUS) return { pcr:null, signal:'N/A', score:0, reason:'非美股，無PCR數據', source:'not_us' };
+
+  const cacheKey = `pcr_${ticker}`;
+  if(_pcrCache[cacheKey]?.ts && Date.now()-_pcrCache[cacheKey].ts < 300000)
+    return _pcrCache[cacheKey].data;
+
+  try{
+    // Yahoo Finance options endpoint
+    const url   = `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`;
+    const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+    const resp  = await fetch(proxy,{cache:'no-store'});
+    const data  = await resp.json();
+    const chain = data?.optionChain?.result?.[0];
+    if(!chain) return { pcr:null, signal:'N/A', score:0, reason:'無選擇權數據', source:'yahoo_options' };
+
+    const options = chain.options?.[0] || {};
+    const puts    = options.puts   || [];
+    const calls   = options.calls  || [];
+
+    const putVol  = puts.reduce((a,p)=>a+(p.volume||0), 0);
+    const callVol = calls.reduce((a,c)=>a+(c.volume||0), 0);
+    if(callVol === 0) return { pcr:null, signal:'N/A', score:0, reason:'無成交量數據', source:'yahoo_options' };
+
+    const pcr = putVol / callVol;
+    let signal='Neutral', score=0, reason='';
+
+    if(pcr < 0.6){
+      signal='Extreme_Optimism'; score=-5;
+      reason=`⚠️ PCR=${pcr.toFixed(2)} 極低，市場極度樂觀，小心回調（逆向看空）`;
+    } else if(pcr > 1.2){
+      signal='Extreme_Pessimism'; score=+5;
+      reason=`★ PCR=${pcr.toFixed(2)} 極高，市場極度悲觀，底部訊號（逆向看多）`;
+    } else if(pcr > 0.85){
+      signal='Cautious'; score=+2;
+      reason=`○ PCR=${pcr.toFixed(2)}，略偏保守，偏多訊號`;
+    } else {
+      signal='Optimistic'; score=-1;
+      reason=`○ PCR=${pcr.toFixed(2)}，略偏樂觀，謹慎追高`;
+    }
+
+    const result = {
+      pcr:       +pcr.toFixed(2),
+      put_vol:   putVol,
+      call_vol:  callVol,
+      signal,
+      score,
+      reason,
+      exp_date:  chain.expirationDates?.[0]||'',
+      source:    'yahoo_options'
+    };
+    _pcrCache[cacheKey] = { ts:Date.now(), data:result };
+    return result;
+  }catch(e){
+    console.warn('[PCR]', e.message);
+    return { pcr:null, signal:'N/A', score:0, reason:'選擇權API不可用', source:'error' };
+  }
+}
+
 const _lendingCache = {};
 
 async function fetchSecuritiesLending(ticker){
@@ -4098,6 +4174,249 @@ function renderAll(d){
   else setTimeout(next,80);
 }
 
+
+// ══════════════════════════════════════════════════════════════════
+//  📈 台指期（TX）即時分析模組
+//  資料來源：TWSE 加權指數 + TAIFEX 台指期
+//  對應 Python 程式碼邏輯（真實 API，不使用模擬數據）
+// ══════════════════════════════════════════════════════════════════
+
+const TX_CFG = {
+  buy_basis_threshold:  -20,   // basis > -20 偏多
+  sell_basis_threshold: -50,   // basis <= -50 偏空
+  stop_loss_points:      80,
+  take_profit_points:   160,
+};
+
+// ── TWSE 加權指數即時 ─────────────────────────────────────────────
+async function fetchTAIEX(){
+  try{
+    const url  = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0';
+    const proxy= `https://corsproxy.io/?${encodeURIComponent(url)}`;
+    const resp = await fetch(proxy, {cache:'no-store'});
+    const data = await resp.json();
+    const row  = data?.msgArray?.[0];
+    if(!row) return null;
+    const price = parseFloat(String(row.y||'').replace(/,/g,''));
+    return { price, date: row.d, time: row.t, source:'twse' };
+  }catch(e){
+    console.warn('[TAIEX]', e.message);
+    return null;
+  }
+}
+
+// ── TAIFEX 台指期即時 ─────────────────────────────────────────────
+async function fetchTX(){
+  const urls = [
+    'https://openapi.taifex.com.tw/v1/DailyMarketReportFut',
+    'https://openapi.taifex.com.tw/DailyMarketReportFut',
+  ];
+  for(const url of urls){
+    try{
+      const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+      const resp  = await fetch(proxy, {cache:'no-store'});
+      if(!resp.ok) continue;
+      const data  = await resp.json();
+      if(!Array.isArray(data)||!data.length) continue;
+
+      // 篩 TX 近月合約
+      const txRows = data.filter(r=>{
+        const c = r.Contract||r.contract||r.ContractCode||'';
+        return String(c).startsWith('TX');
+      });
+      if(!txRows.length) continue;
+
+      // 日盤優先
+      let rows = txRows;
+      const dayRows = txRows.filter(r=>String(r.TradingSession||'').includes('一般'));
+      if(dayRows.length) rows = dayRows;
+
+      // 最近日期
+      const maxDate = Math.max(...rows.map(r=>Number(r.Date||0)));
+      rows = rows.filter(r=>Number(r.Date||0)===maxDate);
+
+      // 近月優先（月份最小）
+      rows.sort((a,b)=>{
+        const ma = String(a['ContractMonth(Week)']||a.ContractMonth||'');
+        const mb = String(b['ContractMonth(Week)']||b.ContractMonth||'');
+        return ma.localeCompare(mb);
+      });
+      const near = rows[0];
+
+      const price = parseFloat(String(
+        near.Last||near.last||near.Close||near.close||near.SettlementPrice||'0'
+      ).replace(/,/g,'')) || null;
+
+      return {
+        price,
+        contract: near.Contract||near.ContractCode||'TX',
+        date:     near.Date||'',
+        volume:   near.Volume||'—',
+        oi:       near.OpenInterest||'—',
+        source:   'taifex'
+      };
+    }catch(e){ console.warn('[TX]', e.message); }
+  }
+  return null;
+}
+
+// ── 台指期訊號引擎 ────────────────────────────────────────────────
+function generateTXSignal(taiex, tx, basis){
+  if(!taiex||!tx) return { action:'觀望', reason:'資料不足，無法給出建議', color:'var(--cyan)' };
+
+  const now  = new Date();
+  const hour = now.getHours(), min = now.getMinutes();
+  const t    = hour*60+min;
+  // 開盤前15分鐘（日盤 08:45-08:59，夜盤 15:00-15:14）
+  const noChase = (hour===8&&min>=45) || (hour===15&&min<15);
+  if(noChase) return { action:'觀望', reason:'開盤前15分鐘不追單規則啟動', color:'var(--yellow)' };
+
+  const isDaySession  = t>=9*60 && t<=13*60+35;
+  const isNightSession= t>=15*60 || t<=5*60;
+  if(!isDaySession&&!isNightSession)
+    return { action:'觀望', reason:'非交易時段（僅供參考）', color:'var(--text3)' };
+
+  if(basis > TX_CFG.buy_basis_threshold){
+    return {
+      action:     '買進',
+      reason:     `Basis=${basis.toFixed(0)} > ${TX_CFG.buy_basis_threshold}，期貨相對轉強（正/小逆價差）`,
+      entry:      tx,
+      stop_loss:  tx - TX_CFG.stop_loss_points,
+      take_profit:tx + TX_CFG.take_profit_points,
+      color:      'var(--green)',
+      rr:         '1:2'
+    };
+  }
+  if(basis <= TX_CFG.sell_basis_threshold){
+    return {
+      action:     '賣出/放空',
+      reason:     `Basis=${basis.toFixed(0)} <= ${TX_CFG.sell_basis_threshold}，逆價差偏大（空頭佔優）`,
+      entry:      tx,
+      stop_loss:  tx + TX_CFG.stop_loss_points,
+      take_profit:tx - TX_CFG.take_profit_points,
+      color:      'var(--red)',
+      rr:         '1:2'
+    };
+  }
+  return {
+    action: '觀望',
+    reason: `Basis=${basis.toFixed(0)} 介於 ${TX_CFG.sell_basis_threshold}~${TX_CFG.buy_basis_threshold}，方向不明確`,
+    color:  'var(--cyan)'
+  };
+}
+
+// ── 渲染台指期面板 ────────────────────────────────────────────────
+async function renderTX(){
+  const el = document.getElementById('txContent');
+  if(!el) return;
+  el.innerHTML = '<div class="loading"><div class="spin"></div><div class="load-t">抓取台指期即時行情…</div></div>';
+
+  const now = new Date();
+  const nowStr = now.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+  const [taiexData, txData] = await Promise.all([fetchTAIEX(), fetchTX()]);
+
+  const taiex  = taiexData?.price || null;
+  const tx     = txData?.price    || null;
+  const basis  = (taiex&&tx) ? (tx - taiex) : null;
+  const signal = generateTXSignal(taiex, tx, basis||0);
+
+  const signalCol = signal.action.includes('買') ? 'var(--green)' :
+                    signal.action.includes('賣') ? 'var(--red)' : 'var(--cyan)';
+
+  // Basis 顏色
+  const basisCol = basis===null ? 'var(--text3)' :
+                   basis > 0    ? 'var(--green)' :
+                   basis > -20  ? '#7fff7f'      :
+                   basis > -50  ? 'var(--yellow)' : 'var(--red)';
+  const basisTag = basis===null ? '—' :
+                   basis > 0    ? '正價差' :
+                   basis > -20  ? '小逆價差' :
+                   basis > -50  ? '逆價差' : '大逆價差';
+
+  el.innerHTML = `
+  <!-- ══ 即時行情 ══ -->
+  <div class="card mb" style="border-color:${signalCol};box-shadow:0 0 12px ${signalCol}33">
+    <div class="card-t">📈 台指期（TX）× 加權指數（TAIEX）即時比較</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
+      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">加權指數 TAIEX（TWSE）</div>
+        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:var(--cyan)">${taiex?taiex.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}</div>
+        <div style="font-size:9px;color:var(--text3);margin-top:3px">${taiexData?.date||''} ${taiexData?.time||''}</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid var(--border)">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">近月台指期 TX（TAIFEX）</div>
+        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:var(--yellow)">${tx?tx.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:0}):'—'}</div>
+        <div style="font-size:9px;color:var(--text3);margin-top:3px">${txData?.contract||''} | 量:${txData?.volume||'—'}</div>
+      </div>
+      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid ${basisCol}22">
+        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">價差 Basis（TX - TAIEX）</div>
+        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:${basisCol}">${basis!==null?(basis>0?'+':'')+basis.toFixed(0):'—'}</div>
+        <div style="font-size:9px;color:${basisCol};margin-top:3px">${basisTag}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ 交易建議 ══ -->
+  <div class="card mb" style="border-color:${signalCol}88">
+    <div class="card-t">⚡ 即時交易建議（真實資料）</div>
+    <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--border);margin-bottom:12px">
+      <div style="font-family:var(--fh);font-size:28px;font-weight:900;color:${signalCol}">${signal.action}</div>
+      <div style="font-size:12px;color:var(--text2);flex:1">${signal.reason}</div>
+    </div>
+    ${signal.entry ? `
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+      ${[['🎯 進場價', signal.entry?.toFixed(0)||'—', 'var(--cyan)'],
+         ['🛑 停損', signal.stop_loss?.toFixed(0)||'—', 'var(--red)'],
+         ['🎯 停利', signal.take_profit?.toFixed(0)||'—', 'var(--green)'],
+         ['⚖️ 風報比', signal.rr||'1:2', 'var(--yellow)']
+        ].map(([l,v,c])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border:1px solid var(--border)">
+          <div style="font-size:9px;color:var(--text3);margin-bottom:3px">${l}</div>
+          <div style="font-family:var(--fh);font-size:16px;color:${c}">${v}</div>
+        </div>`).join('')}
+    </div>` : ''}
+    <div style="margin-top:10px;font-size:10px;color:var(--text3);font-family:var(--fm)">
+      ⚠️ 風控提醒：單筆風險建議 &le; 總資金 1%~2% | 開盤前15分鐘不追單
+    </div>
+  </div>
+
+  <!-- ══ Basis 解讀 ══ -->
+  <div class="card mb">
+    <div class="card-t">📚 Basis 價差解讀說明</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
+      ${[
+        ['正價差 (Basis > 0)', '期貨 > 現貨，市場偏多樂觀', 'var(--green)'],
+        ['小逆價差 (-20 < B < 0)', '輕微偏空，多空拉鋸', '#7fff7f'],
+        ['逆價差 (-50 < B ≤ -20)', '偏空訊號，外資做空積極', 'var(--yellow)'],
+        ['大逆價差 (B ≤ -50)', '強烈偏空，賣出訊號', 'var(--red)'],
+      ].map(([l,d,c])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border-left:3px solid ${c}">
+          <div style="color:${c};font-weight:600">${l}</div>
+          <div style="color:var(--text3);margin-top:2px">${d}</div>
+        </div>`).join('')}
+    </div>
+  </div>
+
+  <!-- ══ 交易時段 ══ -->
+  <div class="card">
+    <div class="card-t">⏰ 台指期交易時段 × 即時狀態</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
+      ${[
+        ['日盤', '08:45 ~ 13:45', '最直接反映今天台股'],
+        ['夜盤', '15:00 ~ 隔日05:00', '參考次日開盤走勢'],
+        ['開盤前15分不追單', '08:45~08:59 / 15:00~15:14', '高波動防追高殺低'],
+        ['更新時間', nowStr, '每次點選台指期自動更新'],
+      ].map(([l,v,d])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border:1px solid var(--border)">
+          <div style="color:var(--cyan);font-size:9px">${l}</div>
+          <div style="font-family:var(--fm);font-size:12px;color:var(--text)">${v}</div>
+          <div style="color:var(--text3);font-size:9px">${d}</div>
+        </div>`).join('')}
+    </div>
+    <div style="margin-top:8px;font-size:9px;color:var(--text3);font-family:var(--fm)">
+      資料來源：TWSE mis.twse.com.tw（加權指數）| TAIFEX openapi.taifex.com.tw（台指期） | 透過 CORS Proxy 存取
+    </div>
+  </div>`;
+}
+
 function renderTab(tab, d){
   switch(tab){
     case 'overview': renderOverview(d); break;
@@ -4109,6 +4428,7 @@ function renderTab(tab, d){
     case 'leading':  renderLeading(d);  break;
     case 'risk':     renderRisk(d);     break;
     case 'nextday':  renderNextDay(d);  break;
+    case 'tx':       renderTX();         break;
   }
 }
 
@@ -5096,6 +5416,51 @@ function renderSMC(d){
   // 動態加入籌碼分析（需要 fund 數據）
   const chipHtml = _renderChipPanel(d);
   document.getElementById('smcContent').innerHTML += chipHtml;
+
+  // PCR 分析（美股非同步）
+  const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(d.ticker||'');
+  if(isUS){
+    const pcrCard = document.getElementById('pcrCard');
+    const pcrEl   = document.getElementById('pcrContent');
+    if(pcrCard) pcrCard.style.display='block';
+    fetchPCR(d.ticker||'').then(pcr => {
+      if(!pcrEl) return;
+      if(!pcr.pcr){
+        pcrEl.innerHTML = `<div style="color:var(--text3)">${pcr.reason}</div>`;
+        return;
+      }
+      const pcrCol = pcr.signal==='Extreme_Pessimism'?'var(--green)':
+                     pcr.signal==='Extreme_Optimism' ?'var(--red)'  :
+                     pcr.signal==='Cautious'         ?'#7fff7f'     : 'var(--yellow)';
+      const pcrBar = Math.min(100, (pcr.pcr/2)*100);
+      const pcrLabel = pcr.signal==='Extreme_Pessimism'?'★ 市場極度悲觀（逆向看多）':
+                     pcr.signal==='Extreme_Optimism' ?'⚠️ 市場極度樂觀（逆向看空）':
+                     pcr.signal==='Cautious'         ?'略偏保守（偏多）':'略偏樂觀（謹慎）';
+      const scoreStr = (pcr.score>0?'+':'')+pcr.score+'分';
+      const scoreC   = pcr.score>0?'var(--green)':pcr.score<0?'var(--red)':'var(--text3)';
+      const rowItems = [['Put量',(pcr.put_vol||0).toLocaleString(),'var(--red)'],
+                        ['Call量',(pcr.call_vol||0).toLocaleString(),'var(--green)'],
+                        ['到期日',pcr.exp_date||'—','var(--text2)']];
+      pcrEl.innerHTML =
+        '<div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">'
+          +'<div style="font-family:var(--fh);font-size:36px;font-weight:900;color:'+pcrCol+'">'+pcr.pcr+'</div>'
+          +'<div><div style="font-size:12px;font-weight:600;color:'+pcrCol+'">'+pcrLabel+'</div>'
+          +'<div style="font-size:10px;color:var(--text3)">'+pcr.reason+'</div></div>'
+          +'<div style="margin-left:auto;font-family:var(--fh);font-size:18px;color:'+scoreC+'">'+scoreStr+'</div>'
+        +'</div>'
+        +'<div style="height:6px;background:var(--bg3);border-radius:3px;margin-bottom:8px">'
+          +'<div style="width:'+pcrBar+'%;height:100%;background:'+pcrCol+';border-radius:3px;transition:width .5s"></div>'
+        +'</div>'
+        +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:10px">'
+          +rowItems.map(([l,v,c])=>'<div style="background:var(--bg3);padding:5px 8px;border-radius:3px">'
+            +'<div style="color:var(--text3)">'+l+'</div>'
+            +'<div style="color:'+c+';font-family:var(--fm)">'+v+'</div></div>').join('')
+        +'</div>'
+        +'<div style="margin-top:8px;font-size:9px;color:var(--text3)">'
+          +'PCR = Put成交量/Call成交量 | &lt;0.6=極度樂觀(警示) | &gt;1.2=極度悲觀(底部機會) | 來源:Yahoo Options'
+        +'</div>';
+    });
+  }
 }
 
 function _renderChipPanel(d){
@@ -6658,6 +7023,9 @@ function wySig(l,active,type){
   <button class="mob-tab" id="mtab-scan"    onclick="mobSwitch('scan')">
     <span class="mob-tab-icon">🔍</span><span>掃描</span>
   </button>
+  <button class="mob-tab" id="mtab-tx"      onclick="mobSwitch('tx')">
+    <span class="mob-tab-icon">📈</span><span>台指期</span>
+  </button>
   <button class="mob-tab" id="mtab-nextday" onclick="mobSwitch('nextday')">
     <span class="mob-tab-icon">🌅</span><span>隔日</span>
   </button>
@@ -6665,7 +7033,7 @@ function wySig(l,active,type){
 
 <script>
 /* ── 手機 Tab 切換 ── */
-const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday'];
+const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday','tx'];
 let _curMobTab = 'overview';
 
 function mobSwitch(tab){
