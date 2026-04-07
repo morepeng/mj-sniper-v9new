@@ -1440,6 +1440,67 @@ let activeTab = 'overview';
 /* ═══════════════════════════════════════════════
    CLOCK
 ═══════════════════════════════════════════════ */
+
+// ══════════════════════════════════════════════════════
+//  即時報價自動刷新（每60秒，台股09:00~13:30, 美股22:00~05:00）
+// ══════════════════════════════════════════════════════
+let _liveRefreshTimer = null;
+
+async function refreshLivePrice(){
+  if(!D || !D.ticker) return;
+  const ticker = D.ticker;
+  try{
+    // 只抓 1d range 確保有最新 meta.regularMarketPrice
+    let meta0 = null;
+    for(const base of ['query1','query2']){
+      const d0 = await tryFetchJSON(
+        `https://${base}.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=1d&interval=1m`,
+        5000);
+      if(d0?.chart?.result?.[0]?.meta){ meta0=d0.chart.result[0].meta; break; }
+    }
+    if(!meta0) return;
+
+    const liveP = meta0.regularMarketPrice || null;
+    if(!liveP || liveP <= 0) return;
+
+    // 更新 banner 價格（不重新分析）
+    const priceEl = document.getElementById('bPrice');
+    if(priceEl && Math.abs(liveP - D.price) > 0.001){
+      priceEl.textContent = liveP.toFixed(liveP > 100 ? 2 : 2);
+      priceEl.style.color = liveP > D.price ? 'var(--green)' : liveP < D.price ? 'var(--red)' : '';
+      console.log('[即時刷新]', ticker, liveP, '(前:', D.price+')');
+
+      // 更新 bMeta 顯示
+      const metaEl = document.getElementById('bMeta');
+      if(metaEl){
+        const now = new Date().toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'});
+        metaEl.innerHTML = `Yahoo Finance · 即時 <span style="color:var(--green);font-size:9px">${now} ✓</span>`;
+      }
+    }
+  }catch(e){ console.warn('[livePrice]', e.message); }
+}
+
+function startLivePriceRefresh(){
+  if(_liveRefreshTimer) clearInterval(_liveRefreshTimer);
+  _liveRefreshTimer = setInterval(()=>{
+    // 台股：09:00~13:35 (UTC+8)
+    // 美股：21:30~04:00 (UTC+8)
+    const now  = new Date();
+    const hour = now.getHours();  // 本地時間
+    const min  = now.getMinutes();
+    const t    = hour*60 + min;
+    const isTW = /\.(TW|TWO)$/i.test(D?.ticker||'');
+    const isUS = !isTW && !/\.HK$/i.test(D?.ticker||'');
+    const twMkt  = t >= 9*60 && t <= 13*60+35;        // 台股盤中
+    const usMkt  = t >= 21*60+30 || t <= 4*60;         // 美股盤中 (UTC+8)
+    const hkMkt  = t >= 9*60+30 && t <= 16*60;         // 港股盤中
+    const inMkt  = (isTW&&twMkt)||(isUS&&usMkt)||(!isTW&&!isUS&&hkMkt);
+    if(inMkt) refreshLivePrice();
+  }, 60000); // 每60秒
+  // 立即執行一次
+  refreshLivePrice();
+}
+
 function tick(){ document.getElementById('clockEl').textContent = new Date().toLocaleTimeString('zh-TW',{hour12:false}); }
 setInterval(tick,1000); tick();
 
@@ -3812,7 +3873,51 @@ async function doAnalyze(){
     const chartJson = await fetchYF(ticker);
 
     setProgress('parse', '解析K線資料…', `取得 ${chartJson?.chart?.result?.[0]?.timestamp?.length||0} 根K線`);
-    const bars      = parseOHLCV(chartJson);
+    let bars      = parseOHLCV(chartJson);
+
+    // ── 即時價格補入（解決日線收盤後顯示舊價問題）─────────
+    // 從 chartJson meta 取即時成交價，覆蓋最後一根K棒
+    try{
+      const meta0  = chartJson?.chart?.result?.[0]?.meta || {};
+      const liveP  = meta0.regularMarketPrice || meta0.postMarketPrice || null;
+      const liveT  = meta0.regularMarketTime  || null;  // Unix timestamp
+      if(liveP && liveP > 0 && bars.length > 0){
+        const lastBar = bars[bars.length - 1];
+        // 若即時價與最後K棒日期不同（新交易日），補一根今日K棒
+        const liveDate = liveT
+          ? new Date(liveT*1000).toLocaleDateString('zh-TW',{year:'numeric',month:'2-digit',day:'2-digit'}).replace(/\//g,'-')
+          : new Date().toISOString().slice(0,10);
+
+        const lastDate = lastBar.date.slice(0,10);
+        if(liveDate !== lastDate){
+          // 新交易日：補入今日K棒（open=前日收，high/low/close=即時價）
+          bars.push({
+            date:   liveDate + ' 即時',
+            open:   lastBar.close,
+            high:   Math.max(lastBar.close, liveP),
+            low:    Math.min(lastBar.close, liveP),
+            close:  liveP,
+            volume: 0,
+            _live:  true
+          });
+          console.log('[即時] 補入今日K棒:', liveDate, liveP);
+        } else {
+          // 同日：更新最後K棒的 close 為即時價
+          bars[bars.length-1] = {
+            ...lastBar,
+            close:  liveP,
+            high:   Math.max(lastBar.high || liveP, liveP),
+            low:    Math.min(lastBar.low  || liveP, liveP),
+            date:   lastBar.date,
+            _live:  true
+          };
+          console.log('[即時] 更新今日K棒:', lastDate, liveP);
+        }
+        window._livePrice    = liveP;
+        window._liveTicker   = ticker;
+        window._liveDate     = liveDate;
+      }
+    }catch(e){ console.warn('[即時價]', e.message); }
 
     // 步驟2：並行取基本面
     setProgress('fund', '取得基本面數據…', '同時執行技術分析');
@@ -3852,6 +3957,7 @@ async function doAnalyze(){
       if(window.innerWidth <= 768) showPanel('overview');
     }
     setProgress('done', '分析完成！', `${ticker} - ${D.signal}`);
+    startLivePriceRefresh();  // 啟動即時報價自動刷新
 
     // 台股借券 TWSE API（非同步追加，不阻塞主流程）
     if(/\.(TW|TWO)$/i.test(ticker)){
@@ -4016,11 +4122,19 @@ function renderBanner(d){
   const badge=document.getElementById('bBadge');
   badge.textContent=sig.toUpperCase();
   badge.className='sig-badge '+(sig.includes('Buy')?'sig-buy':sig.includes('Sell')?'sig-sell':'sig-hold');
-  document.getElementById('bDate').textContent=d.date;
+  const lastBarLive = d.all_chart_data?.at(-1)?._live || d.chart_data?.at(-1)?._live;
+  const displayDate = lastBarLive
+    ? d.date.replace(' 即時','') + ' 即時報價'
+    : d.date;
+  document.getElementById('bDate').textContent = displayDate;
   const sc=document.getElementById('bScore');
   sc.textContent=(d.composite_score>=0?'+':'')+d.composite_score.toFixed(2);
   sc.style.color=color;
   document.getElementById('bPrice').textContent=fp(d.price);
+  // 即時價標記
+  const isLive = d.chart_data?.at(-1)?._live || d.all_chart_data?.at(-1)?._live;
+  const liveBadge = isLive ? '<span style="font-size:9px;color:var(--green);font-family:var(--fm);border:1px solid var(--green);padding:1px 5px;border-radius:3px;margin-left:6px;animation:blink 2s infinite">即時</span>' : '';
+  document.getElementById('bMeta').innerHTML = `Yahoo Finance · 直連${liveBadge}`;
   document.getElementById('bChg').innerHTML=
     `<span style="color:var(--cyan)">多方${d.buy_score}分 / 空方${d.sell_score}分 / 淨分${d.net_score??d.total_score}</span>`;
 }
