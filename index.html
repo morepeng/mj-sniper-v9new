@@ -5417,9 +5417,16 @@ function renderSMC(d){
   const chipHtml = _renderChipPanel(d);
   document.getElementById('smcContent').innerHTML += chipHtml;
 
-  // PCR 分析（美股非同步）
+  // PCR 分析（美股非同步）- 動態插入卡片
   const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(d.ticker||'');
   if(isUS){
+    // 先插入 PCR 卡片容器
+    document.getElementById('smcContent').innerHTML +=
+      '<div class="card mb" id="pcrCard">'
+      +'<div class="card-t">📊 Put/Call 比率（PCR）— 美股選擇權情緒</div>'
+      +'<div id="pcrContent" style="font-family:var(--fm);font-size:12px;color:var(--text3);padding:8px">'
+      +'<div class="loading" style="height:60px"><div class="spin" style="width:20px;height:20px;border-width:2px"></div>'
+      +'<div style="font-size:10px">載入選擇權數據…</div></div></div></div>';
     const pcrCard = document.getElementById('pcrCard');
     const pcrEl   = document.getElementById('pcrContent');
     if(pcrCard) pcrCard.style.display='block';
