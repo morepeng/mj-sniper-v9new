@@ -1178,11 +1178,17 @@ async function fetchPCR(ticker){
     return _pcrCache[cacheKey].data;
 
   try{
-    // Yahoo Finance options endpoint
-    const url   = `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`;
-    const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-    const resp  = await fetch(proxy,{cache:'no-store'});
-    const data  = await resp.json();
+    // Yahoo Finance options - try multiple endpoints
+    let data = null;
+    const optUrls = [
+      `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`,
+      `https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`,
+    ];
+    for(const u of optUrls){
+      data = await tryFetchJSON(u, 8000);
+      if(data?.optionChain?.result?.[0]) break;
+    }
+    if(!data) throw new Error('Options API 無回應');
     const chain = data?.optionChain?.result?.[0];
     if(!chain) return { pcr:null, signal:'N/A', score:0, reason:'無選擇權數據', source:'yahoo_options' };
 
@@ -4190,19 +4196,36 @@ const TX_CFG = {
 
 // ── TWSE 加權指數即時 ─────────────────────────────────────────────
 async function fetchTAIEX(){
+  // 策略1: Yahoo Finance ^TWII（最穩定，直連）
   try{
-    const url  = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0';
-    const proxy= `https://corsproxy.io/?${encodeURIComponent(url)}`;
-    const resp = await fetch(proxy, {cache:'no-store'});
-    const data = await resp.json();
-    const row  = data?.msgArray?.[0];
-    if(!row) return null;
-    const price = parseFloat(String(row.y||'').replace(/,/g,''));
-    return { price, date: row.d, time: row.t, source:'twse' };
-  }catch(e){
-    console.warn('[TAIEX]', e.message);
-    return null;
-  }
+    for(const base of ['query1','query2']){
+      const d = await tryFetchJSON(
+        `https://${base}.finance.yahoo.com/v8/finance/chart/%5ETWII?range=1d&interval=1m`, 6000);
+      const meta = d?.chart?.result?.[0]?.meta;
+      if(meta?.regularMarketPrice){
+        const ts   = meta.regularMarketTime ? new Date(meta.regularMarketTime*1000) : new Date();
+        return {
+          price: meta.regularMarketPrice,
+          date:  ts.toLocaleDateString('zh-TW'),
+          time:  ts.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit'}),
+          source:'yahoo_twii'
+        };
+      }
+    }
+  }catch(e){ console.warn('[TAIEX-YF]', e.message); }
+
+  // 策略2: TWSE mis API（透過多個 proxy）
+  try{
+    const url = 'https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0';
+    const d   = await tryFetchJSON(url, 7000);  // tryFetchJSON 自帶多 proxy 重試
+    const row = d?.msgArray?.[0];
+    if(row){
+      const price = parseFloat(String(row.z||row.y||'0').replace(/,/g,'')) || null;
+      if(price) return { price, date:row.d||'', time:row.t||'', source:'twse' };
+    }
+  }catch(e){ console.warn('[TAIEX-TWSE]', e.message); }
+
+  return null;
 }
 
 // ── TAIFEX 台指期即時 ─────────────────────────────────────────────
@@ -4210,13 +4233,18 @@ async function fetchTX(){
   const urls = [
     'https://openapi.taifex.com.tw/v1/DailyMarketReportFut',
     'https://openapi.taifex.com.tw/DailyMarketReportFut',
+    'https://openapi.taifex.com.tw/v1/MarketRealtimeFut', // 即時備援
   ];
   for(const url of urls){
     try{
-      const proxy = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-      const resp  = await fetch(proxy, {cache:'no-store'});
-      if(!resp.ok) continue;
-      const data  = await resp.json();
+      // TAIFEX 支援 CORS，先直連；失敗再用 proxy
+      let data = null;
+      try{
+        const r = await fetch(url, {cache:'no-store',
+          headers:{'Accept':'application/json','Origin':'https://morepeng.github.io'}});
+        if(r.ok){ const t=await r.text(); if(!t.startsWith('<')) data=JSON.parse(t); }
+      }catch(_){}
+      if(!data) data = await tryFetchJSON(url, 8000);
       if(!Array.isArray(data)||!data.length) continue;
 
       // 篩 TX 近月合約
@@ -4257,6 +4285,20 @@ async function fetchTX(){
       };
     }catch(e){ console.warn('[TX]', e.message); }
   }
+  // 策略B: 若 TAIFEX 全部失敗，用 Yahoo Finance TX futures ticker
+  // Yahoo tx ticker: 'TX=F' or '^TWII' derivative
+  try{
+    for(const base of ['query1','query2']){
+      const d = await tryFetchJSON(
+        `https://${base}.finance.yahoo.com/v8/finance/chart/TX=F?range=1d&interval=1m`, 6000);
+      const meta = d?.chart?.result?.[0]?.meta;
+      const p = meta?.regularMarketPrice;
+      if(p && p>0){
+        return { price:p, contract:'TX=F(Yahoo)', date:'', volume:'—', oi:'—', source:'yahoo_txf' };
+      }
+    }
+  }catch(e){ console.warn('[TX-Yahoo]',e.message); }
+
   return null;
 }
 
@@ -4309,14 +4351,17 @@ function generateTXSignal(taiex, tx, basis){
 async function renderTX(){
   const el = document.getElementById('txContent');
   if(!el) return;
-  el.innerHTML = '<div class="loading"><div class="spin"></div><div class="load-t">抓取台指期即時行情…</div></div>';
+  el.innerHTML = '<div class="loading"><div class="spin"></div><div class="load-t">連接 TAIFEX + TWSE 即時行情…</div></div>';
 
   const now = new Date();
   const nowStr = now.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
 
   const [taiexData, txData] = await Promise.all([fetchTAIEX(), fetchTX()]);
+  console.log('[TX Debug] TAIEX:', taiexData, '| TX:', txData);
 
   const taiex  = taiexData?.price || null;
+  // 顯示 API 狀態（用於診斷）
+  const srcTag  = (taiexData?.source||'—') + ' | ' + (txData?.source||'—');
   const tx     = txData?.price    || null;
   const basis  = (taiex&&tx) ? (tx - taiex) : null;
   const signal = generateTXSignal(taiex, tx, basis||0);
@@ -4412,7 +4457,7 @@ async function renderTX(){
         </div>`).join('')}
     </div>
     <div style="margin-top:8px;font-size:9px;color:var(--text3);font-family:var(--fm)">
-      資料來源：TWSE mis.twse.com.tw（加權指數）| TAIFEX openapi.taifex.com.tw（台指期） | 透過 CORS Proxy 存取
+      資料來源：${taiexData?.source==='yahoo_twii'?'Yahoo ^TWII':'TWSE mis.twse.com.tw'}（加權指數）| ${txData?.source?.includes('yahoo')?'Yahoo TX=F':'TAIFEX openapi.taifex.com.tw'}（台指期）| 更新：${nowStr}
     </div>
   </div>`;
 }
