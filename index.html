@@ -1500,10 +1500,14 @@ function calcChipAnalysis(bars, fund, ticker=''){
     recent_gaps:     recentGaps,
     total_gaps:      gaps.length,
     unfilled_gaps:   openGaps.length,
-    // 借券新增欄位
+    // 借券五型裂縫完整欄位
+    lending_pattern: lendingProxy.pattern || 'NEUTRAL',
     lending_signal:  lendingProxy.signal,
     lending_score:   lendingProxy.score,
     lending_reason:  lendingProxy.reason,
+    lending_action:  lendingProxy.action  || '—',
+    lending_detail:  lendingProxy.detail  || '',
+    lending_chg5d:   lendingProxy.chg5d   || 0,
     lending_balance: 0,
     lending_sell:    0,
     lending_source:  lendingProxy.data_source,
@@ -5522,7 +5526,21 @@ function _renderChipPanel(d){
   let chip    = { fii_dir:'計算中', margin_sentiment:'計算中',
                   short_signal:'無數據', retail_vs_smart:'計算中',
                   open_gaps:[], unfilled_gaps:0 };
-  try{ chip = calcChipAnalysis(bars||[], fund, d.ticker||''); }catch(e){}
+  try{
+    chip = calcChipAnalysis(bars||[], fund, d.ticker||'');
+    // 合併 doAnalyze 非同步抓到的真實借券數據（TWSE）
+    if(d._chip){
+      chip.lending_pattern = d._chip.lending_pattern || chip.lending_pattern || 'NEUTRAL';
+      chip.lending_signal  = d._chip.lending_signal  || chip.lending_signal;
+      chip.lending_score   = d._chip.lending_score   ?? chip.lending_score;
+      chip.lending_action  = d._chip.lending_action  || chip.lending_action;
+      chip.lending_detail  = d._chip.lending_detail  || chip.lending_detail;
+      chip.lending_reason  = d._chip.lending_reason  || chip.lending_reason;
+      chip.lending_balance = d._chip.lending_balance || chip.lending_balance;
+      chip.lending_sell    = d._chip.lending_sell    || chip.lending_sell;
+      chip.lending_source  = d._chip.lending_source  || chip.lending_source;
+    }
+  }catch(e){}
 
   return `
   <!-- ══ 籌碼分析 ══ -->
