@@ -283,7 +283,7 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
 .smc-item{display:flex;align-items:flex-start;gap:9px;padding:11px;background:var(--bg3);border:1px solid var(--border);border-radius:4px;margin-bottom:7px}
 .smc-ico{font-size:18px}
 .smc-lbl{font-size:9px;color:var(--text3);font-family:var(--fm)}
-.smc-val{font-size:13px;color:var(--text);font-weight:500}
+.smc-val{font-size:13px;word-break:break-all;color:var(--text);font-weight:500}
 
 /* TOOLTIP */
 .tooltip-wrap{position:relative}
@@ -299,6 +299,20 @@ body::before{content:'';position:fixed;inset:0;background:repeating-linear-gradi
   .g2,.g3,.g4{grid-template-columns:1fr}
   .sig-banner{flex-direction:column;gap:14px;align-items:flex-start}
   .qtickers{display:none}
+}
+@media(max-width:640px){
+  /* OFI / 微觀結構 / ML動量 / 波動率 卡片內部 grid 手機強制單欄 */
+  .card [style*="grid-template-columns:1fr 1fr"],
+  .card [style*="grid-template-columns: 1fr 1fr"]{grid-template-columns:1fr!important}
+  .card [style*="grid-template-columns:1fr 1fr 1fr"],
+  .card [style*="grid-template-columns: 1fr 1fr 1fr"]{grid-template-columns:1fr 1fr!important}
+  /* 期權 PCR / 融資融券 3欄 → 2欄 */
+  .card [style*="grid-template-columns:1fr 1fr 1fr"]{grid-template-columns:1fr 1fr!important}
+  /* 流動性評分大字 縮小 */
+  .card [style*="font-size:28px"]{font-size:22px!important}
+  .card [style*="font-size:36px"]{font-size:28px!important}
+  /* Z-Score bar 文字 */
+  .card [style*="font-size:9px"]{font-size:8px!important}
 }
 
 /* ══════════════════════════════════════════════
@@ -1855,6 +1869,188 @@ async function fetchOptionsFlow(ticker){
   }catch(e){
     return { ...EMPTY, reason:`錯誤：${e.message}` };
   }
+}
+
+
+// ============================================================
+// OFI + 市場微觀結構 + ML動量 + 波動率政權 計算引擎
+// 填充 d.technical 對應欄位供 renderSMC UI 使用
+// ============================================================
+function calcOFIAndRegime(bars, existingTech){
+  const tech = existingTech || {};
+  if(!bars || bars.length < 25) return tech;
+
+  const close  = bars.map(b => b.close || b.c || 0);
+  const high   = bars.map(b => b.high  || b.h || 0);
+  const low    = bars.map(b => b.low   || b.l || 0);
+  const volume = bars.map(b => b.volume|| b.v || 0);
+  const n = close.length;
+
+  // ── 1. OFI 訂單流失衡
+  const ofi = [], ofiCum = [];
+  for(let i = 1; i < n; i++){
+    const dir = close[i] > close[i-1] ? 1 : close[i] < close[i-1] ? -1 : 0;
+    ofi.push(volume[i] * dir);
+  }
+  const win = 20;
+  for(let i = 0; i < ofi.length; i++){
+    const sl = ofi.slice(Math.max(0, i-win+1), i+1);
+    ofiCum.push(sl.reduce((a,b)=>a+b, 0));
+  }
+  // Z-Score (60期)
+  const zWin = 60;
+  const lastOfiCum = ofiCum.slice(-zWin);
+  const mean = lastOfiCum.reduce((a,b)=>a+b,0)/lastOfiCum.length;
+  const std  = Math.sqrt(lastOfiCum.reduce((a,b)=>a+(b-mean)**2,0)/lastOfiCum.length) + 1e-9;
+  const lastZ = +((ofiCum[ofiCum.length-1] - mean) / std).toFixed(2);
+
+  // 流動性風險
+  const vol20 = volume.slice(-20);
+  const volMean = vol20.reduce((a,b)=>a+b,0)/20;
+  const volStd  = Math.sqrt(vol20.reduce((a,b)=>a+(b-volMean)**2,0)/20);
+  const liqRisk = volStd / (volMean + 1e-9) > 0.5 ? 1 : 0;
+
+  let ofiSig = 'NEUTRAL';
+  if(lastZ > 2) ofiSig = 'Strong Buy';
+  else if(lastZ > 1) ofiSig = 'BUY';
+  else if(lastZ < -2) ofiSig = 'Strong Sell';
+  else if(lastZ < -1) ofiSig = 'SELL';
+
+  tech.ofi_z = lastZ;
+  tech.ofi_signal = ofiSig;
+  tech.ofi_trend  = lastZ > 0.5 ? 'bullish' : lastZ < -0.5 ? 'bearish' : 'neutral';
+  tech.liquidity_risk = liqRisk;
+
+  // 背離偵測（最後20根OFI累積趨勢 vs 價格趨勢）
+  const priceChange = (close[n-1] - close[Math.max(0,n-11)]) / (close[Math.max(0,n-11)] + 1e-9);
+  const ofiChange   = (ofiCum[ofiCum.length-1] - ofiCum[Math.max(0,ofiCum.length-11)]) / (Math.abs(ofiCum[Math.max(0,ofiCum.length-11)]) + 1e-9);
+  tech.ofi_bull_div = priceChange < -0.02 && ofiChange > 0.1;
+  tech.ofi_bear_div = priceChange >  0.02 && ofiChange < -0.1;
+
+  // ── 2. 市場微觀結構
+  const hlSpread = (high[n-1] - low[n-1]) / (close[n-1] + 1e-9);
+  const hlAvg = high.slice(-20).map((h,i)=>(h - low.slice(-20)[i]) / (close.slice(-20)[i] + 1e-9)).reduce((a,b)=>a+b,0)/20;
+  const volMa50 = volume.slice(-50).reduce((a,b)=>a+b,0) / Math.min(50, volume.length);
+  const priceImpact = Math.abs((close[n-1]-close[n-2])/(close[n-2]+1e-9)) / ((volume[n-1]/(volMa50+1e-9)) + 1e-9);
+  const volVol = volStd / (volMean + 1e-9);
+  const depthQual = volVol < 0.3 ? 'Deep 深厚' : volVol < 0.6 ? 'Moderate 中等' : 'Shallow 薄弱';
+
+  let liqScore = 0;
+  if(hlSpread < hlAvg) liqScore += 2;
+  if(volVol < 0.3) liqScore += 3;
+  else if(volVol < 0.6) liqScore += 1;
+  if(priceImpact < 0.001) liqScore += 2;
+
+  tech.hl_spread = hlSpread;
+  tech.price_impact = priceImpact;
+  tech.market_depth = depthQual;
+  tech.liquidity_score = liqScore;
+  tech.info_asymmetry = +(priceChange * -((close[n-1]-close[Math.max(0,n-2)])/(close[Math.max(0,n-2)]+1e-9))).toFixed(5);
+
+  // ── 3. ML增強型動量
+  const mom = (d) => close.length > d ? (close[n-1] - close[n-1-d]) / (close[n-1-d] + 1e-9) : 0;
+  const mom5 = mom(5), mom10 = mom(10), mom20 = mom(20), mom60 = mom(60);
+  const momScore = mom5*0.4 + mom10*0.3 + mom20*0.2 + mom60*0.1;
+
+  // 動量百分位（120期）
+  const momScores = [];
+  for(let i = 60; i < n; i++){
+    const c = close[i], p5=close[Math.max(0,i-5)], p10=close[Math.max(0,i-10)], p20=close[Math.max(0,i-20)], p60=close[Math.max(0,i-60)];
+    momScores.push(((c-p5)/(p5+1e-9))*0.4 + ((c-p10)/(p10+1e-9))*0.3 + ((c-p20)/(p20+1e-9))*0.2 + ((c-p60)/(p60+1e-9))*0.1);
+  }
+  const momPct = momScores.length > 0 ? momScores.filter(s=>s<=momScore).length / momScores.length * 100 : 50;
+
+  const volConf = momScore > 0 && volume[n-1] > volMean ? 1 : 0;
+  const rsi = tech.rsi || 50;
+  const revRisk = momPct > 95 && rsi > 70 ? 1 : momPct < 5 && rsi < 30 ? -1 : 0;
+
+  let mlSig = 'Neutral';
+  if(momPct > 75 && volConf && !revRisk) mlSig = 'Strong Uptrend';
+  else if(momPct > 60 && volConf) mlSig = 'Uptrend';
+  else if(momPct < 25 && !revRisk) mlSig = 'Downtrend';
+
+  tech.mom_5d = +mom5.toFixed(4);
+  tech.mom_20d = +mom20.toFixed(4);
+  tech.mom_60d = +mom60.toFixed(4);
+  tech.mom_percentile = +momPct.toFixed(1);
+  tech.volume_confirmation = volConf;
+  tech.reversal_risk = revRisk;
+  tech.ml_momentum_signal = mlSig;
+
+  // ── 4. 波動率政權
+  const ret = close.slice(1).map((c,i)=>c/(close[i]+1e-9)-1);
+  const rv20 = ret.slice(-20);
+  const rvVal = Math.sqrt(rv20.reduce((a,b)=>a+b**2,0)/20 * 252);
+  // 近252日分位
+  const allRV = [];
+  for(let i = 20; i < n; i++){
+    const sl = ret.slice(i-20, i);
+    allRV.push(Math.sqrt(sl.reduce((a,b)=>a+b**2,0)/20*252));
+  }
+  allRV.sort((a,b)=>a-b);
+  const rv75 = allRV[Math.floor(allRV.length*0.75)] || 0.3;
+  const rv25 = allRV[Math.floor(allRV.length*0.25)] || 0.1;
+
+  let volRegime = 'Normal', volStrategy = 'Trend Following';
+  if(rvVal > rv75){ volRegime = 'High Vol'; volStrategy = 'Mean Reversion'; }
+  else if(rvVal < rv25){ volRegime = 'Low Vol'; volStrategy = 'Breakout'; }
+
+  const atrStop = high.slice(-14).map((h,i)=>h-low.slice(-14)[i]).reduce((a,b)=>a+b,0)/14*2;
+
+  tech.realized_vol = +rvVal.toFixed(4);
+  tech.vol_regime   = volRegime;
+  tech.vol_strategy = volStrategy;
+  tech.regime_change = 0; // 可後續比對 sessionStorage 實作
+  tech.atr_stop = +atrStop.toFixed(2);
+
+  return tech;
+}
+
+
+// OFI + ML動量 + 波動率政權 → 評分注入
+function applyOFIScoring(D){
+  const tech = D.technical || {};
+  const bars  = D._bars || [];
+  if(bars.length < 25) return;
+
+  // Run calculations to fill tech fields
+  D.technical = calcOFIAndRegime(bars, tech);
+  const t = D.technical;
+
+  let bonus = 0;
+  const sigs = D.signals || (D.signals = []);
+
+  // OFI Score
+  const ofiZ = t.ofi_z || 0;
+  if(ofiZ > 2)      { bonus += 5; sigs.push({t:'🐋 OFI極端買壓(Z>2)',c:'ofi',pt:5}); }
+  else if(ofiZ > 1) { bonus += 3; sigs.push({t:'📈 OFI買壓確認',c:'ofi',pt:3}); }
+  else if(ofiZ < -2){ bonus -= 5; sigs.push({t:'⚠️ OFI極端賣壓(Z<-2)',c:'ofi',pt:-5}); }
+  else if(ofiZ < -1){ bonus -= 3; sigs.push({t:'📉 OFI賣壓確認',c:'ofi',pt:-3}); }
+
+  // ML Momentum Score
+  const momPct = t.mom_percentile || 50;
+  const volConf = t.volume_confirmation || 0;
+  if(momPct > 75 && volConf){ bonus += 4; sigs.push({t:`🚀 ML動量強勢(${momPct.toFixed(0)}%分位+量能)`,c:'mom',pt:4}); }
+  else if(momPct > 60)       { bonus += 2; sigs.push({t:`📈 ML動量偏強(${momPct.toFixed(0)}%分位)`,c:'mom',pt:2}); }
+  else if(momPct < 25)       { bonus -= 3; sigs.push({t:`📉 ML動量偏弱(${momPct.toFixed(0)}%分位)`,c:'mom',pt:-3}); }
+  if(t.reversal_risk === 1)  { bonus -= 2; sigs.push({t:'🚨 超買反轉風險',c:'mom',pt:-2}); }
+  if(t.reversal_risk === -1) { bonus += 2; sigs.push({t:'🔄 超賣反彈機會',c:'mom',pt:2}); }
+
+  // Vol Regime Score
+  if(t.vol_regime === 'Low Vol')   { bonus += 1; sigs.push({t:'😴 低波動等待突破',c:'vol',pt:1}); }
+  if(t.vol_regime === 'High Vol')  { bonus -= 1; sigs.push({t:'⚡ 高波動政權降低部位',c:'vol',pt:-1}); }
+
+  D.net_score   = (D.net_score   || 0) + bonus;
+  D.total_score = (D.total_score || 0) + bonus;
+  if(bonus > 0) D.buy_score  = (D.buy_score  || 0) + bonus;
+  if(bonus < 0) D.sell_score = (D.sell_score || 0) + Math.abs(bonus);
+
+  const ns = D.net_score;
+  if(ns >= 8) D.signal = '強力做多';
+  else if(ns >= 4) D.signal = '偏多觀察';
+  else if(ns <= -8) D.signal = '強力做空';
+  else if(ns <= -4) D.signal = '偏空觀察';
+  else D.signal = '觀望';
 }
 
 function renderCrossborderCard(cb, ticker){
@@ -4408,11 +4604,14 @@ async function doAnalyze(){
               reasons.forEach(r => D.signals.push({ t:r, c:'chip', pt: bonus > 0 ? Math.ceil(bonus/reasons.length) : Math.floor(bonus/reasons.length) }));
               D._inst3 = { signal:inst.signal, score:inst.score, foreign_consec_buy:fBuy, foreign_consec_sell:fSell, trust_consec_buy:tBuy, margin_change_pct:mbChg, margin_balance:inst.margin_balance || 0, short_balance:inst.short_balance || 0, bonus, reasons, data_source:inst.data_source };
               try{ renderAll(D); }catch(e){}
-              try{ renderSMC(D); }catch(e){}
+          try{ renderSMC(D); }catch(e){}
             }
             if(window._INST3_CACHE?.[instKey]){ applyInstScore(window._INST3_CACHE[instKey]); }
             else { setTimeout(()=>{ if(window._INST3_CACHE?.[instKey]) applyInstScore(window._INST3_CACHE[instKey]); }, 4000); }
           })();
+          // ── OFI + ML動量 + 波動率政權（即時同步計算，所有市場）
+          try{ D.technical = calcOFIAndRegime(D._bars||[], D.technical||{}); }catch(e){}
+          try{ applyOFIScoring(D); }catch(e){}
           // 重新渲染 SMC 面板
           try{ renderSMC(D); }catch(e){}
         }
@@ -5767,30 +5966,178 @@ function renderSMC(d){
           <div class="smc-val">${ict['PO3 階段']||'—'} ／ ${ict['ICT 訊號']||'—'}</div></div></div>
     </div>
 
-    <!-- ══ OFI 訂單流 ══ -->
-    <div class="card">
-      <div class="card-t">📊 OFI 訂單流 (Order Flow Imbalance)</div>
-      <div class="smc-item"><span class="smc-ico">⚡</span>
-        <div><div class="smc-lbl">OFI 訊號 / 分數</div>
-          <div class="smc-val ${tech.ofi_signal==='BUY'?'pos':tech.ofi_signal==='SELL'?'neg':''}">
-            ${tech.ofi_signal==='BUY'?'📈 買壓強勢':tech.ofi_signal==='SELL'?'📉 賣壓強勢':'⚖️ 中性'}
-            <span style="font-size:10px;color:var(--cyan)">&nbsp;${tech.ofi_score||50}分</span></div></div></div>
-      <div class="smc-item"><span class="smc-ico">📈</span>
-        <div><div class="smc-lbl">OFI 趨勢 / Z值</div>
-          <div class="smc-val ${tech.ofi_trend==='bullish'?'pos':tech.ofi_trend==='bearish'?'neg':''}">
-            ${tech.ofi_trend==='bullish'?'買壓連續':tech.ofi_trend==='bearish'?'賣壓連續':'中性'}
-            <span style="font-size:10px">&nbsp;Z=${tech.ofi_z||0}</span></div></div></div>
-      <div class="smc-item"><span class="smc-ico">🔍</span>
-        <div><div class="smc-lbl">OFI 背離訊號</div>
-          <div class="smc-val ${tech.ofi_bull_div?'pos':tech.ofi_bear_div?'neg':''}">
-            ${tech.ofi_bull_div?'✅ 底背離（看多）':tech.ofi_bear_div?'⚠️ 頂背離（看空）':'無背離'}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">💡</span>
-        <div><div class="smc-lbl">說明</div>
-          <div class="smc-val" style="font-size:10px;color:var(--text2)">
-            OFI = 買量 - 賣量，用K線高低收估算主力資金方向<br>
-            Z>2=極端買壓，Z&lt;-2=極端賣壓，背離=趨勢反轉信號</div></div></div>
+    <!-- ══ OFI 訂單流 + 市場微觀結構 + ML動量 + 波動率政權 ══ -->
+    <div class="card mb">
+      <div class="card-t">⚡ OFI 訂單流失衡（Order Flow Imbalance）</div>
+      ${(()=>{
+        const ofi = tech.ofi_score || 50;
+        const ofiZ = tech.ofi_z || 0;
+        const ofiSig = tech.ofi_signal || 'NEUTRAL';
+        const ofiTrend = tech.ofi_trend || 'neutral';
+        const bullDiv = tech.ofi_bull_div || false;
+        const bearDiv = tech.ofi_bear_div || false;
+        const liqRisk = tech.liquidity_risk || 0;
+
+        const sigCol = ofiSig==='BUY'||ofiSig==='Strong Buy'?'var(--green)':ofiSig==='SELL'||ofiSig==='Strong Sell'?'var(--red)':'var(--cyan)';
+        const sigEmoji = ofiSig==='Strong Buy'||ofiSig==='BUY'?'🐋':ofiSig==='Strong Sell'||ofiSig==='SELL'?'⚠️':'⚖️';
+        const sigLabel = ofiSig==='Strong Buy'?'機構大量吸籌（Z>2）':ofiSig==='BUY'?'機構緩步建倉':ofiSig==='Strong Sell'?'機構大量出貨（Z<-2）':ofiSig==='SELL'?'機構緩步出清':'訂單流平衡';
+        const advice = ofiSig==='Strong Buy'&&!liqRisk?`🐋 機構大量吸籌(Z=${ofiZ}) - 跟單機會`:ofiSig==='BUY'?'📈 機構緩步建倉 - 可分批進場':ofiSig==='Strong Sell'?`⚠️ 機構大量出貨(Z=${ofiZ}) - 避險`:liqRisk?'💧 流動性不足 - 謹慎交易':'⚖️ 訂單流平衡';
+        const zBarW = Math.min(100, Math.abs(ofiZ) / 3 * 100);
+        const zBarC = ofiZ > 0 ? 'var(--green)' : 'var(--red)';
+
+        return `
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <div style="font-size:28px">${sigEmoji}</div>
+          <div style="flex:1">
+            <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:${sigCol}">${sigLabel}</div>
+            <div style="font-size:10px;color:var(--text3);margin-top:2px">${advice}</div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-family:var(--fh);font-size:20px;color:${sigCol}">${ofiZ > 0?'+':''}${ofiZ}</div>
+            <div style="font-size:9px;color:var(--text3)">Z-Score</div>
+          </div>
+        </div>
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-bottom:3px">
+            <span>賣壓 Z=-3</span><span>中性 0</span><span>買壓 Z=+3</span>
+          </div>
+          <div style="height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;position:relative">
+            <div style="position:absolute;left:50%;top:0;width:2px;height:100%;background:var(--border2)"></div>
+            <div style="position:absolute;${ofiZ>=0?'left:50%':'right:'+Math.min(50,Math.abs(ofiZ)/3*50)+'%'};width:${zBarW/2}%;height:100%;background:${zBarC};${ofiZ<0?'right:50%;left:auto':'left:50%'}"></div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
+          <div class="smc-item"><span class="smc-ico">📈</span>
+            <div><div class="smc-lbl">OFI 趨勢</div>
+              <div class="smc-val ${ofiTrend==='bullish'?'pos':ofiTrend==='bearish'?'neg':''}">
+                ${ofiTrend==='bullish'?'買壓連續':ofiTrend==='bearish'?'賣壓連續':'中性'}
+              </div></div></div>
+          <div class="smc-item"><span class="smc-ico">🔍</span>
+            <div><div class="smc-lbl">背離訊號</div>
+              <div class="smc-val ${bullDiv?'pos':bearDiv?'neg':''}">
+                ${bullDiv?'✅ 底背離（看多）':bearDiv?'⚠️ 頂背離（看空）':'無背離'}
+              </div></div></div>
+        </div>
+        ${liqRisk?'<div style="background:rgba(255,140,0,.1);border:1px solid rgba(255,140,0,.3);border-radius:4px;padding:6px 10px;font-size:10px;color:var(--orange);margin-bottom:6px">💧 流動性風險偵測：成交量波動率偏高，滑價風險上升</div>':''}
+        <div style="font-size:9px;color:var(--text3)">OFI = 買量−賣量加權｜Z>2=極端買壓｜Z&lt;-2=極端賣壓｜背離=趨勢反轉信號</div>`;
+      })()}
     </div>
-  </div>
+
+    <!-- ══ 市場微觀結構 ══ -->
+    <div class="card mb">
+      <div class="card-t">🔬 市場微觀結構品質</div>
+      ${(()=>{
+        const liqScore = tech.liquidity_score || 0;
+        const depthQual = tech.market_depth || '—';
+        const spread = tech.hl_spread != null ? (tech.hl_spread*100).toFixed(2)+'%' : '—';
+        const priceImpact = tech.price_impact != null ? tech.price_impact.toFixed(4) : '—';
+        const infoAsym = tech.info_asymmetry != null ? tech.info_asymmetry.toFixed(4) : '—';
+        const liqLabel = liqScore>=6?'💎 極佳流動性 - 適合大額交易':liqScore>=4?'✅ 良好流動性 - 正常交易':liqScore<=2?'⚠️ 流動性不足 - 滑價風險高':'🔶 流動性普通';
+        const liqCol = liqScore>=6?'var(--green)':liqScore>=4?'var(--cyan)':liqScore<=2?'var(--red)':'var(--yellow)';
+        return `
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;padding:10px;background:var(--bg3);border-radius:5px">
+          <div style="font-family:var(--fh);font-size:28px;font-weight:900;color:${liqCol}">${liqScore}/7</div>
+          <div>
+            <div style="font-family:var(--fh);font-size:13px;font-weight:700;color:${liqCol}">${liqLabel}</div>
+            <div style="font-size:10px;color:var(--text3);margin-top:2px">流動性綜合評分</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          <div class="smc-item"><span class="smc-ico">📏</span>
+            <div><div class="smc-lbl">有效價差（HL）</div><div class="smc-val">${spread}</div></div></div>
+          <div class="smc-item"><span class="smc-ico">💥</span>
+            <div><div class="smc-lbl">價格衝擊成本</div><div class="smc-val">${priceImpact}</div></div></div>
+          <div class="smc-item"><span class="smc-ico">🏊</span>
+            <div><div class="smc-lbl">報價深度</div><div class="smc-val">${depthQual}</div></div></div>
+          <div class="smc-item"><span class="smc-ico">🔐</span>
+            <div><div class="smc-lbl">資訊不對稱</div><div class="smc-val">${infoAsym}</div></div></div>
+        </div>`;
+      })()}
+    </div>
+
+    <!-- ══ ML動量 ══ -->
+    <div class="card mb">
+      <div class="card-t">🤖 ML增強型動量系統</div>
+      ${(()=>{
+        const mlSig = tech.ml_momentum_signal || 'Neutral';
+        const momPct = tech.mom_percentile != null ? tech.mom_percentile.toFixed(0) : '—';
+        const mom5 = tech.mom_5d != null ? (tech.mom_5d*100).toFixed(2)+'%' : '—';
+        const mom20 = tech.mom_20d != null ? (tech.mom_20d*100).toFixed(2)+'%' : '—';
+        const mom60 = tech.mom_60d != null ? (tech.mom_60d*100).toFixed(2)+'%' : '—';
+        const volConf = tech.volume_confirmation || 0;
+        const revRisk = tech.reversal_risk || 0;
+        const sigCol = mlSig==='Strong Uptrend'?'var(--green)':mlSig==='Uptrend'?'#7fff7f':mlSig==='Downtrend'?'var(--red)':'var(--cyan)';
+        const sigEmoji = mlSig==='Strong Uptrend'?'🚀':mlSig==='Uptrend'?'📈':mlSig==='Downtrend'?'📉':'⚖️';
+        const pctNum = parseFloat(momPct) || 50;
+        return `
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <div style="font-size:28px">${sigEmoji}</div>
+          <div style="flex:1">
+            <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:${sigCol}">${mlSig}</div>
+            <div style="font-size:10px;color:var(--text3);margin-top:2px">
+              ${volConf?'✅ 量能確認':'⚠️ 量能未確認'} 
+              ${revRisk===1?'｜🚨 超買反轉風險':revRisk===-1?'｜🔄 超賣反彈機會':''}
+            </div>
+          </div>
+          <div style="text-align:right">
+            <div style="font-family:var(--fh);font-size:20px;color:${sigCol}">${momPct}%</div>
+            <div style="font-size:9px;color:var(--text3)">動量百分位</div>
+          </div>
+        </div>
+        <div style="margin-bottom:10px">
+          <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-bottom:3px">
+            <span>0%（最弱）</span><span>動量百分位</span><span>100%（最強）</span>
+          </div>
+          <div style="height:8px;background:var(--bg3);border-radius:4px;overflow:hidden">
+            <div style="width:${pctNum}%;height:100%;background:linear-gradient(90deg,var(--red),var(--yellow),var(--green));border-radius:4px;transition:width .6s"></div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px">
+          <div><div style="color:var(--text3);font-size:9px">5日動量</div>
+            <div style="font-family:var(--fm);color:${mom5.startsWith('-')?'var(--red)':'var(--green)'}">${mom5}</div></div>
+          <div><div style="color:var(--text3);font-size:9px">20日動量</div>
+            <div style="font-family:var(--fm);color:${mom20.startsWith('-')?'var(--red)':'var(--green)'}">${mom20}</div></div>
+          <div><div style="color:var(--text3);font-size:9px">60日動量</div>
+            <div style="font-family:var(--fm);color:${mom60.startsWith('-')?'var(--red)':'var(--green)'}">${mom60}</div></div>
+        </div>
+        <div style="font-size:9px;color:var(--text3);margin-top:8px">加權：5D×40% + 10D×30% + 20D×20% + 60D×10%｜百分位>75+量能確認=強勢</div>`;
+      })()}
+    </div>
+
+    <!-- ══ 波動率政權 ══ -->
+    <div class="card mb">
+      <div class="card-t">🌊 波動率政權識別</div>
+      ${(()=>{
+        const regime = tech.vol_regime || 'Normal';
+        const strategy = tech.vol_strategy || 'Trend Following';
+        const regimeChange = tech.regime_change || 0;
+        const rv = tech.realized_vol != null ? (tech.realized_vol*100).toFixed(1)+'%' : '—';
+        const atrStop = tech.atr_stop != null ? tech.atr_stop.toFixed(2) : '—';
+        const regCol = regime==='High Vol'?'var(--red)':regime==='Low Vol'?'var(--cyan)':'var(--yellow)';
+        const regEmoji = regime==='High Vol'?'⚡':regime==='Low Vol'?'😴':'📊';
+        const advice = regimeChange?`🔄 政權轉換至【${regime}】— 調整策略為${strategy}`:regime==='High Vol'?'⚡ 高波動環境 — 降低部位/擴大止損':regime==='Low Vol'?'😴 低波動環境 — 等待突破/縮小止損':`📊 正常波動 — 適用${strategy}`;
+        const stratMap = {'Trend Following':'趨勢跟隨','Mean Reversion':'均值回歸','Breakout':'突破策略'};
+        const stratLabel = stratMap[strategy] || strategy;
+        return `
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;padding:10px;background:var(--bg3);border-radius:5px;${regimeChange?'border:1px solid var(--orange)':''}">
+          <div style="font-size:30px">${regEmoji}</div>
+          <div style="flex:1">
+            <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:${regCol}">${regime} Regime</div>
+            <div style="font-size:10px;color:var(--text2);margin-top:2px">${advice}</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">
+          <div class="smc-item"><span class="smc-ico">📉</span>
+            <div><div class="smc-lbl">已實現波動率</div><div class="smc-val">${rv}</div></div></div>
+          <div class="smc-item"><span class="smc-ico">🛡️</span>
+            <div><div class="smc-lbl">ATR動態止損</div><div class="smc-val">${atrStop}</div></div></div>
+          <div class="smc-item"><span class="smc-ico">🎯</span>
+            <div><div class="smc-lbl">推薦策略</div><div class="smc-val" style="color:${regCol}">${stratLabel}</div></div></div>
+        </div>
+        ${regimeChange?`<div style="background:rgba(255,140,0,.1);border:1px solid rgba(255,140,0,.3);border-radius:4px;padding:6px 10px;font-size:10px;color:var(--orange)">🔄 政權轉換偵測！已從前一政權切換至【${regime}】，建議立即調整持倉策略。</div>`:''}
+        <div style="font-size:9px;color:var(--text3);margin-top:6px">RV=已實現波動率(252日年化)｜High Vol>75%分位→均值回歸｜Low Vol&lt;25%→等待突破</div>`;
+      })()}
+    </div>
 
   <!-- ══ K線缺口分析 ══ -->
   <div class="card mb">
