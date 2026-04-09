@@ -1723,6 +1723,214 @@ async function fetchTWSEThreeInstitution(ticker, days=20){
   return result;
 }
 
+// ============================================================
+// 🇨🇳🇭🇰 南北向資金 + 期權分析模組
+// - 港股(.HK) → 南向資金（陸資南下）
+// - A股(.SS/.SZ) → 北向資金（港資北上）
+// - 美股 → Put/Call Ratio + 異常期權流
+// ============================================================
+
+async function fetchCrossborderFlow(ticker){
+  const isHK = /\.HK$/i.test(ticker);
+  const isCN = /\.(SS|SZ)$/i.test(ticker);
+  const EMPTY = { signal:'N/A', flow:0, flow_type:'N/A', score:0, details:[] };
+  if(!isHK && !isCN) return EMPTY;
+
+  const flowType = isHK ? '南向資金' : '北向資金';
+  const cacheKey = `cb_${ticker}_${new Date().toISOString().slice(0,10)}`;
+  if(window._CB_CACHE?.[cacheKey]) return window._CB_CACHE[cacheKey];
+  if(!window._CB_CACHE) window._CB_CACHE = {};
+
+  // 嘗試 Yahoo Finance 機構持股代理估算（無直接南北向 API）
+  let flow = 0, score = 0, details = [];
+  try{
+    const url = `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=netSharePurchaseActivity,institutionOwnership`;
+    let data = null;
+    for(const tryUrl of [url, ...CORS_PROXIES.map(mk=>mk(url))]){
+      try{
+        const r = await fetchWithTimeout(tryUrl, {cache:'no-store'}, 8000);
+        if(!r || !r.ok) continue;
+        const t = await r.text();
+        let parsed = null;
+        try{ parsed = JSON.parse(t); }catch(_){ continue; }
+        if(parsed?.contents) try{ parsed = JSON.parse(parsed.contents); }catch(_){}
+        if(parsed?.quoteSummary?.result?.[0]){ data = parsed.quoteSummary.result[0]; break; }
+      }catch(_){}
+    }
+    if(data){
+      const net = data.netSharePurchaseActivity;
+      if(net){
+        const buyPct  = net.buyInfoShares?.raw || 0;
+        const sellPct = net.sellInfoShares?.raw || 0;
+        flow = (buyPct - sellPct) / 1e6;
+        if(flow > 50){ score += 8; details.push(`🔥 機構大幅淨買入 +${flow.toFixed(0)}M股`); }
+        else if(flow > 10){ score += 5; details.push(`✅ 機構淨買入 +${flow.toFixed(0)}M股`); }
+        else if(flow < -50){ score -= 8; details.push(`🚨 機構大幅淨賣出 ${flow.toFixed(0)}M股`); }
+        else if(flow < -10){ score -= 5; details.push(`⚠️ 機構淨賣出 ${flow.toFixed(0)}M股`); }
+        else{ details.push(`機構持股變化中性 (${flow.toFixed(1)}M股)`); }
+      }
+    }
+  }catch(e){}
+
+  let signal = 'Neutral';
+  if(score >= 8) signal = 'Strong Buy';
+  else if(score >= 4) signal = 'Buy';
+  else if(score <= -8) signal = 'Strong Sell';
+  else if(score <= -4) signal = 'Sell';
+
+  const result = { signal, flow, flow_type: flowType, score, details };
+  window._CB_CACHE[cacheKey] = result;
+  return result;
+}
+
+async function fetchOptionsFlow(ticker){
+  const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
+  const EMPTY = { signal:'N/A', score:0, put_call_ratio:0, call_volume:0, put_volume:0, unusual_activity:false, reason:'非美股市場', details:[] };
+  if(!isUS) return EMPTY;
+
+  const cacheKey = `opt_${ticker}_${new Date().toISOString().slice(0,10)}`;
+  if(window._OPT_CACHE?.[cacheKey]) return window._OPT_CACHE[cacheKey];
+  if(!window._OPT_CACHE) window._OPT_CACHE = {};
+
+  try{
+    // Yahoo Finance Options
+    const url = `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`;
+    let data = null;
+    for(const tryUrl of [url, ...CORS_PROXIES.map(mk=>mk(url))]){
+      try{
+        const r = await fetchWithTimeout(tryUrl, {cache:'no-store'}, 8000);
+        if(!r || !r.ok) continue;
+        const t = await r.text();
+        let parsed = null;
+        try{ parsed = JSON.parse(t); }catch(_){ continue; }
+        if(parsed?.contents) try{ parsed = JSON.parse(parsed.contents); }catch(_){}
+        const res = parsed?.optionChain?.result?.[0];
+        if(res){ data = res; break; }
+      }catch(_){}
+    }
+    if(!data) return { ...EMPTY, reason:'無法取得期權數據（CORS 限制）' };
+
+    const chain = data.options?.[0];
+    if(!chain) return { ...EMPTY, reason:'無期權鏈數據' };
+
+    const calls = chain.calls || [];
+    const puts  = chain.puts  || [];
+    const callVol = calls.reduce((s,x)=>s+(x.volume||0), 0);
+    const putVol  = puts.reduce((s,x)=>s+(x.volume||0), 0);
+    const callOI  = calls.reduce((s,x)=>s+(x.openInterest||0), 0);
+    const putOI   = puts.reduce((s,x)=>s+(x.openInterest||0), 0);
+    const expDate = chain.expirationDate ? new Date(chain.expirationDate*1000).toISOString().slice(0,10) : '—';
+
+    const pcr = callVol > 0 ? putVol / callVol : 999;
+    const totalVol = callVol + putVol;
+    const avgOI = (callOI + putOI) / 2;
+    const unusual = avgOI > 0 && totalVol > avgOI * 0.2;
+
+    let score = 0;
+    const details = [];
+
+    if(pcr < 0.5){       score += 5; details.push(`🔥 極低 PCR(${pcr.toFixed(2)})，強烈看多`); }
+    else if(pcr < 0.7){  score += 3; details.push(`✅ 低 PCR(${pcr.toFixed(2)})，偏多`); }
+    else if(pcr <= 1.0){ score += 1; details.push(`⚖️ 中性 PCR(${pcr.toFixed(2)})`); }
+    else if(pcr <= 1.2){ score -= 3; details.push(`⚠️ 高 PCR(${pcr.toFixed(2)})，偏空`); }
+    else{                score += 6; details.push(`🚨 極高 PCR(${pcr.toFixed(2)})，逆向軋空機會`); }
+
+    if(unusual){
+      if(callVol > putVol * 1.5){ score += 4; details.push('🔥 大單 Call 異常湧入'); }
+      else if(putVol > callVol * 1.5){ score -= 4; details.push('⚠️ 大單 Put 異常湧入（避險）'); }
+      else{ details.push('異常期權活動偵測'); }
+    }
+    if(callOI > putOI * 2){ score += 2; details.push('Call 未平倉佔優'); }
+    else if(putOI > callOI * 2){ score -= 2; details.push('Put 未平倉佔優'); }
+
+    let signal = 'Neutral';
+    if(score >= 8) signal = 'Strong Buy';
+    else if(score >= 4) signal = 'Buy';
+    else if(score <= -8) signal = 'Strong Sell';
+    else if(score <= -4) signal = 'Sell';
+
+    const result = { signal, score, put_call_ratio:+pcr.toFixed(3), call_volume:callVol, put_volume:putVol, call_oi:callOI, put_oi:putOI, unusual_activity:unusual, exp_date:expDate, total_volume:totalVol, reason:details[0]||'中性', details };
+    window._OPT_CACHE[cacheKey] = result;
+    return result;
+  }catch(e){
+    return { ...EMPTY, reason:`錯誤：${e.message}` };
+  }
+}
+
+function renderCrossborderCard(cb, ticker){
+  const isHK = /\.HK$/i.test(ticker), isCN = /\.(SS|SZ)$/i.test(ticker);
+  const flag = isHK ? '🇨🇳→🇭🇰' : isCN ? '🇭🇰→🇨🇳' : '';
+  const sigColor = cb.signal.includes('Buy')?'var(--green)':cb.signal.includes('Sell')?'var(--red)':'var(--cyan)';
+  const sigEmoji = cb.signal==='Strong Buy'?'🔥':cb.signal==='Buy'?'✅':cb.signal==='Strong Sell'?'🚨':cb.signal==='Sell'?'⚠️':'⚖️';
+  const scoreCol = cb.score>0?'var(--green)':cb.score<0?'var(--red)':'var(--text3)';
+  return `
+  <div class="card mb">
+    <div class="card-t">${flag} ${cb.flow_type}（跨境資金）</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px">
+      <div style="font-size:28px">${sigEmoji}</div>
+      <div>
+        <div style="font-family:var(--fh);font-size:15px;font-weight:700;color:${sigColor}">${cb.signal}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">${cb.flow_type} 機構持股變化</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-family:var(--fh);font-size:18px;color:${scoreCol}">${cb.score>0?'+':''}${cb.score}</div>
+        <div style="font-size:9px;color:var(--text3)">評分</div>
+      </div>
+    </div>
+    ${cb.details.length>0?`<div style="font-size:10px;color:var(--text2);line-height:2">${cb.details.map(s=>`<div>${s}</div>`).join('')}</div>`:''}
+    <div style="font-size:9px;color:var(--text3);margin-top:6px">ℹ️ 來源：Yahoo Finance 機構持股｜CORS Proxy 自動備援</div>
+  </div>`;
+}
+
+function renderOptionsCard(opt){
+  if(opt.signal === 'N/A') return '';
+  const pcrCol = opt.put_call_ratio < 0.6 ? 'var(--green)' : opt.put_call_ratio > 1.2 ? 'var(--red)' : 'var(--yellow)';
+  const sigColor = opt.signal.includes('Buy')?'var(--green)':opt.signal.includes('Sell')?'var(--red)':'var(--cyan)';
+  const sigEmoji = opt.signal==='Strong Buy'?'🔥':opt.signal==='Buy'?'✅':opt.signal==='Strong Sell'?'🚨':opt.signal==='Sell'?'⚠️':'⚖️';
+  const scoreCol = opt.score>0?'var(--green)':opt.score<0?'var(--red)':'var(--text3)';
+  const unusualBadge = opt.unusual_activity ? '<span style="color:var(--orange);font-size:10px;margin-left:6px">🔥 異常活動</span>' : '';
+  const callPct = opt.total_volume>0 ? Math.round(opt.call_volume/opt.total_volume*100) : 50;
+  const putPct  = 100 - callPct;
+  return `
+  <div class="card mb">
+    <div class="card-t">📊 期權情緒分析（Put/Call Ratio）${unusualBadge}</div>
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <div style="font-family:var(--fh);font-size:36px;font-weight:900;color:${pcrCol}">${opt.put_call_ratio}</div>
+      <div>
+        <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:${sigColor}">${sigEmoji} ${opt.signal}</div>
+        <div style="font-size:10px;color:var(--text3);margin-top:2px">${opt.reason}</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-family:var(--fh);font-size:18px;color:${scoreCol}">${opt.score>0?'+':''}${opt.score}</div>
+        <div style="font-size:9px;color:var(--text3)">評分</div>
+      </div>
+    </div>
+    <div style="background:var(--bg3);border-radius:6px;padding:10px 14px;margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:6px">
+        <span style="color:var(--green)">📈 Call ${callPct}%（${opt.call_volume.toLocaleString()}）</span>
+        <span style="color:var(--red)">📉 Put ${putPct}%（${opt.put_volume.toLocaleString()}）</span>
+      </div>
+      <div style="height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;display:flex">
+        <div style="width:${callPct}%;background:var(--green);border-radius:4px 0 0 4px;transition:width .6s"></div>
+        <div style="width:${putPct}%;background:var(--red);border-radius:0 4px 4px 0;transition:width .6s"></div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;margin-bottom:8px">
+      <div><div style="color:var(--text3);font-size:9px">Call 未平倉</div>
+        <div style="font-family:var(--fm);color:var(--green)">${(opt.call_oi||0).toLocaleString()}</div></div>
+      <div><div style="color:var(--text3);font-size:9px">Put 未平倉</div>
+        <div style="font-family:var(--fm);color:var(--red)">${(opt.put_oi||0).toLocaleString()}</div></div>
+      <div><div style="color:var(--text3);font-size:9px">最近到期日</div>
+        <div style="font-family:var(--fm)">${opt.exp_date||'—'}</div></div>
+    </div>
+    ${opt.details.length>1?`<div style="font-size:10px;color:var(--text2);line-height:2">${opt.details.slice(1).map(s=>`<div>${s}</div>`).join('')}</div>`:''}
+    <div style="font-size:9px;color:var(--text3);margin-top:6px">
+      ℹ️ PCR &lt; 0.6 = 極度樂觀（警示）｜PCR &gt; 1.2 = 極度悲觀（底部機會）｜來源：Yahoo Options
+    </div>
+  </div>`;
+}
+
+
 
 const YF_CORS_PROXIES = [
   u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
@@ -5658,6 +5866,67 @@ function renderSMC(d){
           +'PCR = Put成交量/Call成交量 | &lt;0.6=極度樂觀(警示) | &gt;1.2=極度悲觀(底部機會) | 來源:Yahoo Options'
         +'</div>';
     });
+  }
+
+  // 南北向資金（港股 / A股）
+  const isHK2 = /\.HK$/i.test(d.ticker||'');
+  const isCN2 = /\.(SS|SZ)$/i.test(d.ticker||'');
+  if(isHK2 || isCN2){
+    const cbCid = 'cb_' + Math.random().toString(36).slice(2,8);
+    document.getElementById('smcContent').innerHTML +=
+      `<div class="card mb" id="${cbCid}">
+        <div class="card-t">${isHK2?'🇨🇳→🇭🇰 南向資金':'🇭🇰→🇨🇳 北向資金'}（載入中）</div>
+        <div style="display:flex;align-items:center;gap:8px;padding:12px;color:var(--text3);font-size:11px">
+          <div class="spin" style="width:16px;height:16px;border-width:2px;flex-shrink:0"></div>
+          跨境資金數據載入中…
+        </div>
+      </div>`;
+    fetchCrossborderFlow(d.ticker||'').then(cb => {
+      const el = document.getElementById(cbCid);
+      if(el) el.outerHTML = renderCrossborderCard(cb, d.ticker||'');
+      // 注入評分
+      if(cb.score !== 0){
+        D.net_score   = (D.net_score   || 0) + cb.score;
+        D.total_score = (D.total_score || 0) + cb.score;
+        if(cb.score > 0) D.buy_score  = (D.buy_score  || 0) + cb.score;
+        if(cb.score < 0) D.sell_score = (D.sell_score || 0) + Math.abs(cb.score);
+        D._crossborder = cb;
+        try{ renderAll(D); }catch(e){}
+      }
+    }).catch(()=>{});
+  }
+
+  // 期權評分（美股）— 增強版顯示卡
+  const isUS2 = !/\.(TW|TWO|HK|SS|SZ)$/i.test(d.ticker||'');
+  if(isUS2){
+    const optCid = 'opt_' + Math.random().toString(36).slice(2,8);
+    document.getElementById('smcContent').innerHTML +=
+      `<div class="card mb" id="${optCid}">
+        <div class="card-t">📊 期權情緒分析（Put/Call Ratio）</div>
+        <div style="display:flex;align-items:center;gap:8px;padding:12px;color:var(--text3);font-size:11px">
+          <div class="spin" style="width:16px;height:16px;border-width:2px;flex-shrink:0"></div>
+          期權數據載入中（CORS Proxy 自動備援）…
+        </div>
+      </div>`;
+    fetchOptionsFlow(d.ticker||'').then(opt => {
+      const el = document.getElementById(optCid);
+      if(el) el.outerHTML = renderOptionsCard(opt);
+      // 注入評分
+      if(opt.score !== 0){
+        D.net_score   = (D.net_score   || 0) + opt.score;
+        D.total_score = (D.total_score || 0) + opt.score;
+        if(opt.score > 0) D.buy_score  = (D.buy_score  || 0) + opt.score;
+        if(opt.score < 0) D.sell_score = (D.sell_score || 0) + Math.abs(opt.score);
+        D._options = opt;
+        const ns = D.net_score;
+        if(ns >= 8) D.signal = '強力做多';
+        else if(ns >= 4) D.signal = '偏多觀察';
+        else if(ns <= -8) D.signal = '強力做空';
+        else if(ns <= -4) D.signal = '偏空觀察';
+        else D.signal = '觀望';
+        try{ renderAll(D); }catch(e){}
+      }
+    }).catch(()=>{});
   }
 }
 
