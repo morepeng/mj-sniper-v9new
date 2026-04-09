@@ -1500,14 +1500,10 @@ function calcChipAnalysis(bars, fund, ticker=''){
     recent_gaps:     recentGaps,
     total_gaps:      gaps.length,
     unfilled_gaps:   openGaps.length,
-    // 借券五型裂縫完整欄位
-    lending_pattern: lendingProxy.pattern || 'NEUTRAL',
+    // 借券新增欄位
     lending_signal:  lendingProxy.signal,
     lending_score:   lendingProxy.score,
     lending_reason:  lendingProxy.reason,
-    lending_action:  lendingProxy.action  || '—',
-    lending_detail:  lendingProxy.detail  || '',
-    lending_chg5d:   lendingProxy.chg5d   || 0,
     lending_balance: 0,
     lending_sell:    0,
     lending_source:  lendingProxy.data_source,
@@ -5520,108 +5516,270 @@ function renderSMC(d){
 }
 
 function _renderChipPanel(d){
-  const fund  = d._fund||{};
-  const tech  = d.technical||{};
-  const bars  = d._bars||[];
-  let chip    = { fii_dir:'計算中', margin_sentiment:'計算中',
-                  short_signal:'無數據', retail_vs_smart:'計算中',
-                  open_gaps:[], unfilled_gaps:0 };
-  try{
-    chip = calcChipAnalysis(bars||[], fund, d.ticker||'');
-    // 合併 doAnalyze 非同步抓到的真實借券數據（TWSE）
-    if(d._chip){
-      chip.lending_pattern = d._chip.lending_pattern || chip.lending_pattern || 'NEUTRAL';
-      chip.lending_signal  = d._chip.lending_signal  || chip.lending_signal;
-      chip.lending_score   = d._chip.lending_score   ?? chip.lending_score;
-      chip.lending_action  = d._chip.lending_action  || chip.lending_action;
-      chip.lending_detail  = d._chip.lending_detail  || chip.lending_detail;
-      chip.lending_reason  = d._chip.lending_reason  || chip.lending_reason;
-      chip.lending_balance = d._chip.lending_balance || chip.lending_balance;
-      chip.lending_sell    = d._chip.lending_sell    || chip.lending_sell;
-      chip.lending_source  = d._chip.lending_source  || chip.lending_source;
+  const isTW = /\.(TW|TWO)$/i.test(d.ticker || '');
+  const containerId = 'chipDyn_' + Math.random().toString(36).slice(2,8);
+
+  async function fetchTWSEInst(ticker, days=20){
+    const code = ticker.replace(/\.(TW|TWO)$/i,'');
+    const cacheKey = `inst3_${code}_${new Date().toISOString().slice(0,10)}`;
+    if(window._INST3_CACHE && window._INST3_CACHE[cacheKey]) return window._INST3_CACHE[cacheKey];
+    if(!window._INST3_CACHE) window._INST3_CACHE = {};
+
+    const EMPTY = {
+      foreign_net:[], trust_net:[], dealer_net:[], three_total:[],
+      foreign_consec_buy:0, foreign_consec_sell:0, trust_consec_buy:0,
+      data_source:'none', signal:'N/A', score:0, details:[],
+      margin_balance:0, margin_change_pct:0, short_balance:0,
+    };
+    const si = s => { try{ return parseInt(String(s).replace(/,/g,'').replace(/\+/g,'')); }catch(e){ return 0; }};
+
+    // 直連 + CORS_PROXIES 三層自動備援（手機免本地代理）
+    async function fetchJSON(url){
+      try{
+        const r = await fetchWithTimeout(url,{mode:'cors',credentials:'omit',cache:'no-store'}, 6000);
+        if(r.ok){ const t=await r.text(); if(t&&t[0]==='{')return JSON.parse(t); }
+      }catch(_){}
+      for(const mk of CORS_PROXIES){
+        try{
+          const r = await fetchWithTimeout(mk(url),{cache:'no-store'}, 8000);
+          if(r.ok){
+            let t=await r.text(), parsed;
+            try{ parsed=JSON.parse(t); }catch(_){ continue; }
+            if(parsed && typeof parsed.contents==='string') try{ parsed=JSON.parse(parsed.contents); }catch(_){ continue; }
+            if(parsed && typeof parsed==='object') return parsed;
+          }
+        }catch(_){}
+      }
+      return null;
     }
-  }catch(e){}
+
+    const result = { ...EMPTY, details:[] };
+
+    // A. 三大法人 TWT38U
+    try{
+      const url = `https://www.twse.com.tw/rwd/zh/fund/TWT38U?stockNo=${code}&response=json&_=${Date.now()}`;
+      const jdata = await fetchJSON(url);
+      const rows  = jdata?.data || [];
+      if(rows.length > 0){
+        const recent = rows.slice(-days);
+        result.foreign_net  = recent.map(r=>si(r[3]));
+        result.trust_net    = recent.map(r=>si(r[6]));
+        result.dealer_net   = recent.map(r=>si(r[9]));
+        result.three_total  = recent.map(r=>si(r[10]));
+        result.data_source  = 'twse_api';
+      }
+    }catch(e){}
+
+    // B. 融資融券 MI_MARGN
+    try{
+      const url2 = `https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN?stockNo=${code}&response=json&_=${Date.now()}`;
+      const jdata2 = await fetchJSON(url2);
+      const rows2  = jdata2?.data || [];
+      if(rows2.length >= 2){
+        const latest=rows2[rows2.length-1], prev=rows2[rows2.length-2];
+        const mbNow=si(latest[4]), mbPrev=si(prev[4]);
+        result.margin_balance    = mbNow;
+        result.margin_change_pct = Math.round((mbNow-mbPrev)/(mbPrev+1)*10000)/100;
+        result.short_balance     = latest.length>7 ? si(latest[7]) : 0;
+      }
+    }catch(e){}
+
+    // C. 計算連買/賣天數與評分
+    const foreign=result.foreign_net, trust=result.trust_net;
+    let fBuy=0,fSell=0;
+    for(let i=foreign.length-1;i>=0;i--){
+      const v=foreign[i];
+      if(v>0){if(fSell>0)break;fBuy++;}
+      else if(v<0){if(fBuy>0)break;fSell++;}
+      else break;
+    }
+    let tBuy=0;
+    for(let i=trust.length-1;i>=0;i--){ if(trust[i]>0)tBuy++; else break; }
+    result.foreign_consec_buy=fBuy; result.foreign_consec_sell=fSell; result.trust_consec_buy=tBuy;
+
+    let score=0; const det=result.details;
+    if(fBuy>=5){score+=8;det.push(`🔥 外資連買 ${fBuy} 日（強烈機構進場）`);}
+    else if(fBuy>=3){score+=5;det.push(`✅ 外資連買 ${fBuy} 日`);}
+    else if(fBuy>=1){score+=2;det.push(`外資買超 ${fBuy} 日`);}
+    else if(fSell>=5){score-=8;det.push(`🚨 外資連賣 ${fSell} 日（大量撤離）`);}
+    else if(fSell>=3){score-=5;det.push(`⚠️ 外資連賣 ${fSell} 日`);}
+    else if(fSell>=1){score-=2;det.push(`外資賣超 ${fSell} 日`);}
+    if(tBuy>=3){score+=3;det.push(`✅ 投信連買 ${tBuy} 日`);}
+    else if(tBuy>=1){score+=1;det.push(`投信買超 ${tBuy} 日`);}
+
+    const mbChg=result.margin_change_pct||0;
+    if(fBuy>=3&&mbChg<-2){score+=5;det.push('🌟 核心信號：外資連買≥3日 且 融資減少（機構建倉，散戶賣出）');}
+    else if(fBuy>=3&&mbChg>5){det.push('⚠️ 外資買但融資同步增加（散戶追漲，可能過熱）');}
+    else if(fSell>=3&&mbChg>5){score-=5;det.push('🚨 警報：外資連賣≥3日 且 融資增加（主力出貨、散戶接盤）');}
+    if(mbChg<-5&&fBuy>0){score+=2;det.push(`融資減少 ${Math.abs(mbChg).toFixed(1)}%（籌碼乾淨）`);}
+    else if(mbChg>10){score-=2;det.push(`融資暴增 ${mbChg.toFixed(1)}%（槓桿風險上升）`);}
+
+    result.score=score;
+    result.signal=score>=8?'Strong Bullish':score>=4?'Bullish':score<=-8?'Strong Bearish':score<=-4?'Bearish':'Neutral';
+    window._INST3_CACHE[cacheKey]=result;
+    return result;
+  }
+
+  function renderInstHTML(inst){
+    const sigColor=inst.signal.includes('Bullish')?'var(--green)':inst.signal.includes('Bearish')?'var(--red)':'var(--cyan)';
+    const sigEmoji=inst.signal==='Strong Bullish'?'🔥':inst.signal==='Bullish'?'✅':inst.signal==='Strong Bearish'?'🚨':inst.signal==='Bearish'?'⚠️':'⚖️';
+    const srcBadge=inst.data_source==='twse_api'
+      ?'<span style="color:var(--green);font-size:9px;margin-left:6px">● TWSE 即時</span>'
+      :'<span style="color:var(--yellow);font-size:9px;margin-left:6px">⚠️ 代理估算</span>';
+    const fmt=v=>{
+      const n=Number(v)||0;
+      const s=n>0?`+${n.toLocaleString()}`:n.toLocaleString();
+      const c=n>0?'var(--green)':n<0?'var(--red)':'var(--text3)';
+      return `<span style="color:${c};font-family:var(--fm)">${s} 張</span>`;
+    };
+    const lastF=inst.foreign_net.length?inst.foreign_net[inst.foreign_net.length-1]:null;
+    const lastT=inst.trust_net.length?inst.trust_net[inst.trust_net.length-1]:null;
+    const lastD=inst.dealer_net.length?inst.dealer_net[inst.dealer_net.length-1]:null;
+    const lastTot=inst.three_total.length?inst.three_total[inst.three_total.length-1]:null;
+    const mb=inst.margin_balance||0,mbChg=inst.margin_change_pct||0,sb=inst.short_balance||0;
+    const mbChgStr=mbChg>0?`+${mbChg.toFixed(2)}%`:`${mbChg.toFixed(2)}%`;
+    const mbCol=mbChg<-2?'var(--green)':mbChg>5?'var(--red)':'var(--text3)';
+    const fBuy=inst.foreign_consec_buy||0,fSell=inst.foreign_consec_sell||0;
+    const streakHtml=fBuy>0
+      ?`<span style="color:var(--green)">外資連買 ${fBuy} 日 ${'▲'.repeat(Math.min(fBuy,8))}</span>`
+      :fSell>0
+      ?`<span style="color:var(--red)">外資連賣 ${fSell} 日 ${'▼'.repeat(Math.min(fSell,8))}</span>`
+      :'<span style="color:var(--text3)">外資無明顯趨勢</span>';
+    const noData=lastF===null;
+    return `
+    <div class="card-t">🏛️ 台股三大法人 + 融資融券${srcBadge}</div>
+    ${noData?`<div style="color:var(--yellow);font-size:11px;padding:10px">
+      ⚠️ TWSE 暫無數據（可能非交易日或個股無記錄）<br>
+      <span style="font-size:9px;color:var(--text3)">已嘗試：直連 + corsproxy.io + allorigins + codetabs</span>
+    </div>`:`
+    <div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border);margin-bottom:10px">
+      <div style="font-size:30px">${sigEmoji}</div>
+      <div>
+        <div style="font-family:var(--fh);font-size:16px;font-weight:900;color:${sigColor}">${inst.signal}</div>
+        <div style="font-size:11px;margin-top:2px">${streakHtml}</div>
+      </div>
+      <div style="margin-left:auto;text-align:right">
+        <div style="font-family:var(--fh);font-size:20px;color:${sigColor}">${inst.score>0?'+':''}${inst.score}</div>
+        <div style="font-size:9px;color:var(--text3)">籌碼分數</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div class="smc-item"><span class="smc-ico">🌍</span>
+        <div><div class="smc-lbl">外資買賣超</div><div class="smc-val">${fmt(lastF)}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">🏦</span>
+        <div><div class="smc-lbl">投信買賣超</div><div class="smc-val">${fmt(lastT)}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">🏢</span>
+        <div><div class="smc-lbl">自營商買賣超</div><div class="smc-val">${fmt(lastD)}</div></div></div>
+      <div class="smc-item"><span class="smc-ico">📊</span>
+        <div><div class="smc-lbl">三大合計</div><div class="smc-val">${fmt(lastTot)}</div></div></div>
+    </div>
+    <div style="background:var(--bg3);border-radius:6px;padding:10px 14px;margin-bottom:10px">
+      <div style="font-size:10px;color:var(--cyan);font-weight:700;margin-bottom:8px">💳 融資融券（MI_MARGN）</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px">
+        <div><div style="color:var(--text3);font-size:9px">融資餘額</div>
+          <div style="font-family:var(--fm)">${mb.toLocaleString()} 張</div></div>
+        <div><div style="color:var(--text3);font-size:9px">融資增減%</div>
+          <div style="font-family:var(--fm);color:${mbCol}">${mbChgStr}</div></div>
+        <div><div style="color:var(--text3);font-size:9px">融券餘額</div>
+          <div style="font-family:var(--fm)">${sb.toLocaleString()} 張</div></div>
+      </div>
+      ${mb>0?`<div style="height:4px;background:var(--bg2);border-radius:2px;margin-top:8px">
+        <div style="width:${Math.min(100,Math.abs(mbChg)*5)}%;height:100%;background:${mbCol};border-radius:2px;transition:width .6s"></div>
+      </div>`:''}
+    </div>
+    ${fBuy>=3&&mbChg<-2?`<div style="background:rgba(0,255,157,.08);border:1px solid rgba(0,255,157,.35);border-radius:5px;padding:8px 12px;margin-bottom:8px;font-size:10px;color:var(--green)">
+      🌟 <strong>強烈多頭籌碼信號</strong>：外資連買≥3日 + 融資持續減少，機構建倉、散戶退出。
+    </div>`:''}
+    ${fSell>=3&&mbChg>5?`<div style="background:rgba(255,59,92,.08);border:1px solid rgba(255,59,92,.35);border-radius:5px;padding:8px 12px;margin-bottom:8px;font-size:10px;color:var(--red)">
+      🚨 <strong>逃跑訊號</strong>：外資連賣≥3日 + 融資持續增加，主力出貨、散戶接盤。
+    </div>`:''}
+    ${inst.details.length>0?`<div style="font-size:10px;color:var(--text2);line-height:2">${inst.details.map(s=>`<div>${s}</div>`).join('')}</div>`:''}
+    <div style="margin-top:8px;font-size:9px;color:var(--text3)">
+      ℹ️ TWSE TWT38U + MI_MARGN｜直連 → corsproxy.io → allorigins → codetabs 自動備援
+    </div>`}`;
+  }
+
+  function renderTechProxy(){
+    const fund=d._fund||{},bars=d._bars||[];
+    let chip={fii_dir:'N/A',margin_sentiment:'N/A',short_signal:'N/A',retail_vs_smart:'N/A'};
+    try{ chip=calcChipAnalysis(bars,fund,d.ticker||''); }catch(e){}
+    return `
+    <div class="card-t">🏛️ 外資 / 主力 動向（技術估算）</div>
+    <div class="smc-item"><span class="smc-ico">🌍</span>
+      <div><div class="smc-lbl">外資動向估算</div><div class="smc-val">${chip.fii_dir}</div></div></div>
+    <div class="smc-item"><span class="smc-ico">⚖️</span>
+      <div><div class="smc-lbl">散戶 vs 主力</div><div class="smc-val">${chip.retail_vs_smart}</div></div></div>
+    <div class="smc-item"><span class="smc-ico">💰</span>
+      <div><div class="smc-lbl">融資餘額估算</div><div class="smc-val">${chip.margin_sentiment}</div></div></div>
+    <div style="font-size:9px;color:var(--text3);margin-top:8px">⚠️ 非台股：技術代理估算，非實際籌碼數據。</div>`;
+  }
+
+  function renderLendingCard(){
+    const fund=d._fund||{},bars=d._bars||[];
+    let chip2={lending_pattern:'NEUTRAL',lending_score:0,lending_detail:'',lending_action:'',lending_source:'none'};
+    try{ chip2=calcChipAnalysis(bars,fund,d.ticker||''); }catch(e){}
+    const pat=chip2.lending_pattern||'NEUTRAL';
+    const patMap={
+      'A_FOREIGN_DUMP':        {icon:'🚫',label:'A型裂縫（外資傾倒）',  color:'var(--red)',    bg:'rgba(255,59,92,.12)',  border:'rgba(255,59,92,.4)'},
+      'B_STEALTH_SHORT':       {icon:'🔴',label:'B型裂縫（隱形做空）',  color:'var(--orange)', bg:'rgba(255,140,0,.10)',  border:'rgba(255,140,0,.35)'},
+      'C_RETAIL_PANIC_BOTTOM': {icon:'👀',label:'C型裂縫（散戶恐慌底）',color:'var(--yellow)', bg:'rgba(255,215,0,.08)',  border:'rgba(255,215,0,.3)'},
+      'D_SHORT_SQUEEZE':       {icon:'🚀',label:'D型裂縫（軋空）',      color:'var(--green)',  bg:'rgba(0,255,157,.12)',  border:'rgba(0,255,157,.4)'},
+      'E_DIVERGENCE_DANGER':   {icon:'⚠️',label:'E型裂縫（背離危機）', color:'#ff6b35',       bg:'rgba(255,107,53,.12)', border:'rgba(255,107,53,.4)'},
+      'NEUTRAL':               {icon:'⚖️',label:'觀察中（無明顯信號）',color:'var(--cyan)',   bg:'rgba(0,212,255,.06)',  border:'rgba(0,212,255,.2)'},
+    };
+    const p=patMap[pat]||patMap['NEUTRAL'];
+    const sN=chip2.lending_score||0;
+    return `
+    <div class="card mb">
+      <div class="card-t">📋 借券賣出 × K線裂縫共振（五型）</div>
+      <div style="border:1px solid ${p.border};border-radius:5px;background:${p.bg};padding:10px 14px;margin-bottom:8px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:20px">${p.icon}</span>
+            <div style="font-family:var(--fh);font-size:13px;font-weight:700;color:${p.color}">${p.label}</div>
+          </div>
+          <div style="font-family:var(--fh);font-size:18px;color:${sN>0?'var(--green)':sN<0?'var(--red)':'var(--text3)'}">${(sN>0?'+':'')+sN}</div>
+        </div>
+        <div style="font-size:11px;color:var(--text2)">${chip2.lending_detail||''}</div>
+        ${chip2.lending_action?`<div style="font-size:11px;font-weight:600;color:${p.color};margin-top:4px">${chip2.lending_action}</div>`:''}
+      </div>
+      <div style="font-size:9px;color:var(--text3)">資料來源：${chip2.lending_source==='twse_api'?'TWSE 真實借券數據':'技術估算代理'}</div>
+    </div>`;
+  }
+
+  if(isTW){
+    setTimeout(()=>{
+      const el=document.getElementById(containerId);
+      if(!el) return;
+      el.innerHTML='<div class="card-t">🏛️ 台股三大法人 + 融資融券</div>'
+        +'<div style="display:flex;align-items:center;gap:8px;padding:12px;color:var(--text3);font-size:11px">'
+        +'<div class="spin" style="width:16px;height:16px;border-width:2px;flex-shrink:0"></div>'
+        +'嘗試 TWSE API（直連 → 3層 CORS Proxy 自動備援）…</div>';
+      fetchTWSEInst(d.ticker).then(inst=>{
+        const el2=document.getElementById(containerId);
+        if(el2) el2.innerHTML=renderInstHTML(inst);
+      }).catch(err=>{
+        const el2=document.getElementById(containerId);
+        if(el2) el2.innerHTML=`<div class="card-t">🏛️ 台股三大法人</div>
+          <div style="color:var(--red);padding:8px;font-size:11px">⚠️ 載入失敗：${err.message}</div>`;
+      });
+    },0);
+  } else {
+    setTimeout(()=>{
+      const el=document.getElementById(containerId);
+      if(el) el.innerHTML=renderTechProxy();
+    },0);
+  }
 
   return `
-  <!-- ══ 籌碼分析 ══ -->
-  <div class="g2 mb">
-    <div class="card">
-      <div class="card-t">🏛️ 外資 / 主力 動向（技術估算）</div>
-      <div class="smc-item"><span class="smc-ico">🌍</span>
-        <div><div class="smc-lbl">外資動向估算</div>
-          <div class="smc-val">${chip.fii_dir}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">⚖️</span>
-        <div><div class="smc-lbl">散戶 vs 主力</div>
-          <div class="smc-val">${chip.retail_vs_smart}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">💰</span>
-        <div><div class="smc-lbl">融資餘額估算（散戶情緒）</div>
-          <div class="smc-val">${chip.margin_sentiment}</div></div></div>
-      <div class="smc-item"><span class="smc-ico">📝</span>
-        <div><div class="smc-lbl" style="font-size:9px;color:var(--text3)">
-          ⚠️ 以上為技術指標代理估算，非實際籌碼數據。<br>
-          實際外資/融資/借券數據請至台灣證交所 TWSE 查詢。
-        </div></div></div>
+  <div class="card mb" id="${containerId}">
+    <div class="card-t">🏛️ ${isTW?'台股三大法人 + 融資融券（TWSE）':'外資 / 主力 動向'}</div>
+    <div style="display:flex;align-items:center;gap:8px;padding:12px;color:var(--text3);font-size:11px">
+      <div class="spin" style="width:16px;height:16px;border-width:2px;flex-shrink:0"></div>
+      ${isTW?'載入 TWSE 真實籌碼數據（自動 CORS Proxy）…':'載入籌碼估算…'}
     </div>
-    <div class="card">
-      <div class="card-t">📋 借券賣出 × K線裂縫共振（五型）</div>
-
-      <!-- ══ 裂縫型態主卡 ══ -->
-      ${(()=>{
-        const pat = chip.lending_pattern || 'NEUTRAL';
-        const patMap = {
-          'A_FOREIGN_DUMP':        { icon:'🚫', label:'A型裂縫', color:'var(--red)',    bg:'rgba(255,59,92,.12)',  border:'rgba(255,59,92,.4)' },
-          'B_STEALTH_SHORT':       { icon:'🔴', label:'B型裂縫', color:'var(--orange)', bg:'rgba(255,140,0,.10)', border:'rgba(255,140,0,.35)' },
-          'C_RETAIL_PANIC_BOTTOM': { icon:'👀', label:'C型裂縫', color:'var(--yellow)', bg:'rgba(255,215,0,.08)', border:'rgba(255,215,0,.3)'  },
-          'D_SHORT_SQUEEZE':       { icon:'🚀', label:'D型裂縫', color:'var(--green)',  bg:'rgba(0,255,157,.12)', border:'rgba(0,255,157,.4)'  },
-          'E_DIVERGENCE_DANGER':   { icon:'⚠️', label:'E型裂縫', color:'#ff6b35',       bg:'rgba(255,107,53,.12)','border':'rgba(255,107,53,.4)'},
-          'NEUTRAL':               { icon:'⚖️', label:'觀察中',  color:'var(--cyan)',   bg:'rgba(0,212,255,.06)', border:'rgba(0,212,255,.2)'  },
-        };
-        const p = patMap[pat] || patMap['NEUTRAL'];
-        const score = chip.lending_score || 0;
-        const scoreNum = chip.lending_score||0;
-        const scoreStr = (scoreNum>0?'+':'')+scoreNum;
-        const scoreCol = scoreNum>0?'var(--green)':scoreNum<0?'var(--red)':'var(--text3)';
-        const isEarly  = ['A_FOREIGN_DUMP','B_STEALTH_SHORT','E_DIVERGENCE_DANGER'].includes(pat);
-        return '<div style="border:1px solid '+p.border+';border-radius:5px;background:'+p.bg+';padding:10px 14px;margin-bottom:8px">'
-          +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">'
-            +'<div style="display:flex;align-items:center;gap:8px">'
-              +'<span style="font-size:20px">'+p.icon+'</span>'
-              +'<div>'
-                +'<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+p.color+'">'+p.label+'</div>'
-                +(isEarly?'<div style="font-size:10px;color:var(--text3);font-family:var(--fm)">借券先行信號，1~3日K線確認</div>':'')
-              +'</div>'
-            +'</div>'
-            +'<div style="font-family:var(--fh);font-size:18px;font-weight:900;color:'+scoreCol+'">'+scoreStr+'</div>'
-          +'</div>'
-          +'<div style="font-size:11px;color:'+p.color+';font-weight:600;margin-bottom:3px">'+(chip.lending_action||'—')+'</div>'
-          +'<div style="font-size:10px;color:var(--text2)">'+(chip.lending_detail||'')+'</div>'
-        +'</div>';
-      })()}
-
-      <!-- ══ 數值明細 ══ -->
-      <div class="smc-item"><span class="smc-ico">📊</span>
-        <div><div class="smc-lbl">借券餘額 / 數據來源</div>
-          <div class="smc-val" style="font-size:11px">
-            ${chip.lending_balance>0?'台股借券餘額：'+chip.lending_balance.toLocaleString()+'張':''}
-            ${chip.lending_sell>0?'｜本日賣出：'+chip.lending_sell.toLocaleString()+'張':''}
-            ${chip.short_ratio!=null?'美股空單回補：'+chip.short_ratio+'天':''}
-            <span style="color:${chip.lending_source==='twse_api'?'var(--green)':chip.lending_source==='yahoo_short'?'var(--cyan)':'var(--yellow)'}">&nbsp;(${
-              chip.lending_source==='twse_api'?'TWSE即時':
-              chip.lending_source==='yahoo_short'?'Yahoo':
-              chip.lending_source==='proxy_estimated'?'技術代理':'—'
-            })</span>
-          </div></div></div>
-      <div class="smc-item"><span class="smc-ico">🗂️</span>
-        <div><div class="smc-lbl">五型裂縫說明</div>
-          <div style="font-size:9px;color:var(--text3);line-height:1.9;font-family:var(--fm)">
-            🚫 A型：借券增+長黑放量 → 外資主導下殺 <b style="color:var(--red)">-9</b><br>
-            🔴 B型：借券增+縮量橫盤 → 悄悄建空 <b style="color:var(--orange)">-5</b><br>
-            👀 C型：借券減+長黑放量 → 底部背離 <b style="color:var(--yellow)">+4</b><br>
-            🚀 D型：借券減+長紅放量 → 軋空行情 <b style="color:var(--green)">+8</b><br>
-            ⚠️ E型：借券大增+紅K逆勢 → 最危險 <b style="color:#ff6b35">-6</b>
-          </div></div></div>
-    </div>
-  </div>`;
+  </div>
+  ${renderLendingCard()}`;
 }
 
 /* ── LEADING ── */
