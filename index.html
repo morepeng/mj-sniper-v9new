@@ -4599,6 +4599,9 @@ async function doAnalyze(){
     const fundQuick = { _src:'chart_json_quick', ...(_extractYFModules(chartJson)) };
     D = analyze(bars, ticker, fundQuick);
     D.ticker = ticker;
+    D.price  = bars[bars.length-1]?.close || 0;
+    D.name   = ticker;
+    window._mjD = D;
     _klineCache['1d'] = bars;
     _klineCache['1wk'] = null; _klineCache['15m'] = null;
     CHART_INTERVAL = '1d'; _CV.offset=0; _CV.zoom=1;
@@ -4609,6 +4612,7 @@ async function doAnalyze(){
 
     setProgress('render', '渲染面板…', '產生分析結果');
     renderAll(D);
+    if(activeTab==='tx') try{renderTX();}catch(e){}
     if(window.innerWidth <= 768) showPanel('overview');
 
     // 步驟4：等待基本面
@@ -4621,9 +4625,10 @@ async function doAnalyze(){
       setProgress('score', '重新評分（含估值）…',
         `${fund._src||'YF'} | PE=${fund.pe!=null?fund.pe.toFixed(1):'N/A'} EPS=${fund.eps!=null?fund.eps.toFixed(2):'N/A'}`);
       D = analyze(bars, ticker, fund);
-      D.ticker = ticker; D._klineData = D.all_chart_data || bars;  // 含指標
+      D.ticker = ticker; D.price = bars[bars.length-1]?.close||0; window._mjD = D; D._klineData = D.all_chart_data || bars;  // 含指標
       setProgress('render', '更新估值面板…', `${fund._count}項財務數據`);
       renderAll(D);
+    if(activeTab==='tx') try{renderTX();}catch(e){}
       // ── OFI + ML動量 + 波動率政權（主流程即時計算，所有市場通用）
       try{ D.technical = calcOFIAndRegime(D._bars||[], D.technical||{}); }catch(e){}
       try{ applyOFIScoring(D); }catch(e){}
@@ -4694,7 +4699,7 @@ async function doAnalyze(){
               if(!D.signals) D.signals = [];
               reasons.forEach(r => D.signals.push({ t:r, c:'chip', pt: bonus > 0 ? Math.ceil(bonus/reasons.length) : Math.floor(bonus/reasons.length) }));
               D._inst3 = { signal:inst.signal, score:inst.score, foreign_consec_buy:fBuy, foreign_consec_sell:fSell, trust_consec_buy:tBuy, margin_change_pct:mbChg, margin_balance:inst.margin_balance || 0, short_balance:inst.short_balance || 0, bonus, reasons, data_source:inst.data_source };
-              try{ renderAll(D); }catch(e){}
+              try{ renderAll(D); if(activeTab==='tx') try{renderTX();}catch(e){} }catch(e){}
           try{ renderSMC(D); }catch(e){}
             }
             if(window._INST3_CACHE?.[instKey]){ applyInstScore(window._INST3_CACHE[instKey]); }
@@ -4874,76 +4879,71 @@ async function fetchTAIEX(){
 
 // ── TAIFEX 台指期即時 ─────────────────────────────────────────────
 async function fetchTX(){
-  const urls = [
-    'https://openapi.taifex.com.tw/v1/DailyMarketReportFut',
-    'https://openapi.taifex.com.tw/DailyMarketReportFut',
-    'https://openapi.taifex.com.tw/v1/MarketRealtimeFut', // 即時備援
+  const CORS=[
+    u=>`https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u=>`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,
+    u=>`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
   ];
-  for(const url of urls){
-    try{
-      // TAIFEX 支援 CORS，先直連；失敗再用 proxy
-      let data = null;
+  // ── TAIFEX 台指期 ──
+  let txPrice=null,txPrevSettle=null,txContract='—',txSettle='—',txVolume=0,txOI=0,txDate='—';
+  const txUrls=['https://openapi.taifex.com.tw/v1/DailyMarketReportFut',
+                'https://openapi.taifex.com.tw/DailyMarketReportFut'];
+  outer:for(const base of txUrls){
+    for(const url of [base,...CORS.map(f=>f(base))]){
       try{
-        const r = await fetch(url, {cache:'no-store',
-          headers:{'Accept':'application/json','Origin':'https://morepeng.github.io'}});
-        if(r.ok){ const t=await r.text(); if(!t.startsWith('<')) data=JSON.parse(t); }
-      }catch(_){}
-      if(!data) data = await tryFetchJSON(url, 8000);
-      if(!Array.isArray(data)||!data.length) continue;
-
-      // 篩 TX 近月合約
-      const txRows = data.filter(r=>{
-        const c = r.Contract||r.contract||r.ContractCode||'';
-        return String(c).startsWith('TX');
-      });
-      if(!txRows.length) continue;
-
-      // 日盤優先
-      let rows = txRows;
-      const dayRows = txRows.filter(r=>String(r.TradingSession||'').includes('一般'));
-      if(dayRows.length) rows = dayRows;
-
-      // 最近日期
-      const maxDate = Math.max(...rows.map(r=>Number(r.Date||0)));
-      rows = rows.filter(r=>Number(r.Date||0)===maxDate);
-
-      // 近月優先（月份最小）
-      rows.sort((a,b)=>{
-        const ma = String(a['ContractMonth(Week)']||a.ContractMonth||'');
-        const mb = String(b['ContractMonth(Week)']||b.ContractMonth||'');
-        return ma.localeCompare(mb);
-      });
-      const near = rows[0];
-
-      const price = parseFloat(String(
-        near.Last||near.last||near.Close||near.close||near.SettlementPrice||'0'
-      ).replace(/,/g,'')) || null;
-
-      return {
-        price,
-        contract: near.Contract||near.ContractCode||'TX',
-        date:     near.Date||'',
-        volume:   near.Volume||'—',
-        oi:       near.OpenInterest||'—',
-        source:   'taifex'
-      };
-    }catch(e){ console.warn('[TX]', e.message); }
-  }
-  // 策略B: 若 TAIFEX 全部失敗，用 Yahoo Finance TX futures ticker
-  // Yahoo tx ticker: 'TX=F' or '^TWII' derivative
-  try{
-    for(const base of ['query1','query2']){
-      const d = await tryFetchJSON(
-        `https://${base}.finance.yahoo.com/v8/finance/chart/TX=F?range=1d&interval=1m`, 6000);
-      const meta = d?.chart?.result?.[0]?.meta;
-      const p = meta?.regularMarketPrice;
-      if(p && p>0){
-        return { price:p, contract:'TX=F(Yahoo)', date:'', volume:'—', oi:'—', source:'yahoo_txf' };
-      }
+        const r=await fetchWithTimeout(url,{cache:'no-store'},12000);
+        if(!r?.ok) continue;
+        let parsed=null;
+        try{parsed=JSON.parse(await r.text());}catch{continue;}
+        if(parsed?.contents)try{parsed=JSON.parse(parsed.contents);}catch{}
+        if(!Array.isArray(parsed)) continue;
+        const df=parsed.filter(x=>x.Contract?.startsWith('TX'));
+        if(!df.length) continue;
+        df.sort((a,b)=>a.Contract.localeCompare(b.Contract));
+        const n=df[0];
+        txPrice=parseFloat(n.Last||n.SettlementPrice||0)||null;
+        txSettle=n.SettlementPrice||'—';
+        txPrevSettle=parseFloat(n.SettlementPrice||0)||null;
+        txVolume=parseInt(n.Volume||0);
+        txOI=parseInt(n.OpenInterest||0);
+        txDate=n.Date||'—';
+        txContract=n.Contract||'—';
+        if(txPrice>0) break outer;
+      }catch{}
     }
-  }catch(e){ console.warn('[TX-Yahoo]',e.message); }
-
-  return null;
+  }
+  // ── TWSE TAIEX ──
+  let taiex=null;
+  const taiexUrl='https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_t00.tw&json=1&delay=0';
+  for(const url of [taiexUrl,...CORS.map(f=>f(taiexUrl))]){
+    try{
+      const r=await fetchWithTimeout(url,{cache:'no-store'},10000);
+      if(!r?.ok) continue;
+      let parsed=null;
+      try{parsed=JSON.parse(await r.text());}catch{continue;}
+      if(parsed?.contents)try{parsed=JSON.parse(parsed.contents);}catch{}
+      const msg=parsed?.msgArray?.[0];
+      if(msg?.y&&msg.y!=='-'){taiex=parseFloat(msg.y);break;}
+    }catch{}
+  }
+  // ── 台灣時段判斷（對應 Python get_taiwan_session_info）──
+  const now=new Date(new Date().toLocaleString('en-US',{timeZone:'Asia/Taipei'}));
+  const h=now.getHours(), m=now.getMinutes();
+  let session,impact,openNote,sessionColor;
+  if(h>=8&&h<14&&(h>8||m>=45)){
+    session='日盤'; sessionColor='var(--green)';
+    impact='☀️ 此為當日日盤參考（最直接反映今天台股走勢）';
+    openNote='今日開盤已發生，重點觀察早盤是否延續昨夜盤方向，以及台積電等權值股表現。';
+  }else if(h>=15||h<5){
+    session='夜盤'; sessionColor='var(--cyan)';
+    impact='🌙 此為夜盤 → 將直接影響明日台股開盤方向與跳空幅度';
+    openNote='夜盤是台股開盤最重要的領先指標。';
+  }else{
+    session='非交易時段'; sessionColor='var(--yellow)';
+    impact='⚠️ 目前非交易時段';
+    openNote='可參考昨夜盤收盤作為今日開盤預測依據。';
+  }
+  return{txPrice,txPrevSettle,txContract,txSettle,txVolume,txOI,txDate,taiex,session,impact,openNote,sessionColor};
 }
 
 // ── 台指期訊號引擎 ────────────────────────────────────────────────
@@ -4993,115 +4993,327 @@ function generateTXSignal(taiex, tx, basis){
 
 // ── 渲染台指期面板 ────────────────────────────────────────────────
 async function renderTX(){
-  const el = document.getElementById('txContent');
+  const el=document.getElementById('txContent');
   if(!el) return;
-  el.innerHTML = '<div class="loading"><div class="spin"></div><div class="load-t">連接 TAIFEX + TWSE 即時行情…</div></div>';
+  el.innerHTML=`<div style="display:flex;align-items:center;gap:10px;padding:24px;color:var(--text3);font-size:12px">
+    <div class="spin" style="width:18px;height:18px;border-width:2px;flex-shrink:0"></div>
+    載入台指期即時行情…</div>`;
+  let d;
+  try{d=await fetchTX();}
+  catch(e){el.innerHTML=`<div style="color:var(--red);padding:20px;font-size:12px">❌ ${e.message}</div>`;return;}
 
-  const now = new Date();
-  const nowStr = now.toLocaleTimeString('zh-TW',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+  const{txPrice,txPrevSettle,txContract,txSettle,txVolume,txOI,txDate,
+        taiex,session,impact,openNote,sessionColor}=d;
 
-  const [taiexData, txData] = await Promise.all([fetchTAIEX(), fetchTX()]);
-  console.log('[TX Debug] TAIEX:', taiexData, '| TX:', txData);
+  // ── Basis = TX - TAIEX（對應 Python basis = tx_near - taiex）
+  const basis=(txPrice!=null&&taiex!=null)?(txPrice-taiex):null;
+  const basisStr=basis!=null?`${basis>0?'+':''}${basis.toFixed(2)}`:'—';
+  const basisColor=basis==null?'var(--text3)':basis>0?'var(--green)':'var(--red)';
 
-  const taiex  = taiexData?.price || null;
-  // 顯示 API 狀態（用於診斷）
-  const srcTag  = (taiexData?.source||'—') + ' | ' + (txData?.source||'—');
-  const tx     = txData?.price    || null;
-  const basis  = (taiex&&tx) ? (tx - taiex) : null;
-  const signal = generateTXSignal(taiex, tx, basis||0);
+  // ── 開盤方向預測（對應 Python gap + direction）
+  const prevRef=txPrevSettle||taiex||0;
+  const gap=(txPrice!=null&&prevRef>0)?(txPrice-prevRef):null;
+  const gapPct=(gap!=null&&prevRef>0)?((gap/prevRef)*100):null;
+  let openDir,openColor,openIcon,openDesc,openConf='';
+  if(gap==null){
+    openDir='資料載入中…';openColor='var(--text3)';openIcon='⏳';openDesc='';
+  }else if(gap>50){
+    openDir='🟢 預測開高（偏多開盤）';openColor='var(--green)';openIcon='📈';
+    openConf=Math.abs(gap)>100?'高 ★★★':'中 ★★☆';
+    openDesc='期貨大幅正價差，明日現貨可能跳空開高，勿追高，等回測支撐確認。';
+  }else if(gap>15){
+    openDir='↗️ 偏高開（小幅正價差）';openColor='#7fff7f';openIcon='↗️';
+    openConf='中 ★★☆';
+    openDesc='小幅正價差，開盤可能小幅高開，觀察5分鐘量能確認方向。';
+  }else if(gap>=-15){
+    openDir='⚪ 預測震盪開盤';openColor='var(--cyan)';openIcon='⚖️';
+    openConf='中 ★★☆';
+    openDesc='期貨接近平盤，開盤預計震盪，等第一根K棒方向確認再進場。';
+  }else if(gap>=-50){
+    openDir='↘️ 偏低開（小幅逆價差）';openColor='var(--orange)';openIcon='↘️';
+    openConf='中 ★★☆';
+    openDesc='小幅逆價差，開盤可能小幅低開，注意止損設定。';
+  }else{
+    openDir='🔴 預測開低（偏空開盤）';openColor='var(--red)';openIcon='📉';
+    openConf=Math.abs(gap)>100?'高 ★★★':'中 ★★☆';
+    openDesc='期貨大幅逆價差，明日現貨可能跳空開低，謹慎應對。';
+  }
 
-  const signalCol = signal.action.includes('買') ? 'var(--green)' :
-                    signal.action.includes('賣') ? 'var(--red)' : 'var(--cyan)';
+  // ── 個股資料（從 window._mjD 取，對應 Python 的 shares/price/beta 輸入）
+  const D=window._mjD||window.D||{};
+  const ticker=(D.ticker||'').toUpperCase();
+  const stockPrice=parseFloat(D.price||D.technical?.last||0)||0;
+  const isTW=/\.(TW|TWO)$/i.test(ticker);
+  const stockName=D.name||ticker||'—';
 
-  // Basis 顏色
-  const basisCol = basis===null ? 'var(--text3)' :
-                   basis > 0    ? 'var(--green)' :
-                   basis > -20  ? '#7fff7f'      :
-                   basis > -50  ? 'var(--yellow)' : 'var(--red)';
-  const basisTag = basis===null ? '—' :
-                   basis > 0    ? '正價差' :
-                   basis > -20  ? '小逆價差' :
-                   basis > -50  ? '逆價差' : '大逆價差';
+  // ── 預設值（對應 Python: shares=10, beta=1.5, hedge_type="short"）
+  const defShares=10;
+  const defBeta=isTW?1.5:1.2;
 
-  el.innerHTML = `
-  <!-- ══ 即時行情 ══ -->
-  <div class="card mb" style="border-color:${signalCol};box-shadow:0 0 12px ${signalCol}33">
-    <div class="card-t">📈 台指期（TX）× 加權指數（TAIEX）即時比較</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
-      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid var(--border)">
-        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">加權指數 TAIEX（TWSE）</div>
-        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:var(--cyan)">${taiex?taiex.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}</div>
-        <div style="font-size:9px;color:var(--text3);margin-top:3px">${taiexData?.date||''} ${taiexData?.time||''}</div>
-      </div>
-      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid var(--border)">
-        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">近月台指期 TX（TAIFEX）</div>
-        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:var(--yellow)">${tx?tx.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:0}):'—'}</div>
-        <div style="font-size:9px;color:var(--text3);margin-top:3px">${txData?.contract||''} | 量:${txData?.volume||'—'}</div>
-      </div>
-      <div style="background:var(--bg3);border-radius:5px;padding:12px;border:1px solid ${basisCol}22">
-        <div style="font-size:9px;color:var(--text3);font-family:var(--fm);margin-bottom:4px">價差 Basis（TX - TAIEX）</div>
-        <div style="font-family:var(--fh);font-size:24px;font-weight:900;color:${basisCol}">${basis!==null?(basis>0?'+':'')+basis.toFixed(0):'—'}</div>
-        <div style="font-size:9px;color:${basisCol};margin-top:3px">${basisTag}</div>
-      </div>
-    </div>
-  </div>
+  // ── calculate_tsmc_hedge 邏輯（完全對應 Python 函式）
+  // portfolio_value = shares * 1000 * price（台股）
+  const portVal=isTW?(defShares*1000*(stockPrice||1000)):(defShares*(stockPrice||100));
+  // tx_contracts = portVal * beta / (txPrice * 200)
+  const bigC =(txPrice>0)?(portVal*defBeta/(txPrice*200)):null;
+  const smallC=(txPrice>0)?(portVal*defBeta/(txPrice*50)) :null;
+  // cdf = (shares * 1000) / 2000  ← 只需要張數！
+  const cdfC=isTW?((defShares*1000)/2000):0;
+  // qff = (shares * 1000) / 100
+  const qffC=isTW?((defShares*1000)/100):0;
 
-  <!-- ══ 交易建議 ══ -->
-  <div class="card mb" style="border-color:${signalCol}88">
-    <div class="card-t">⚡ 即時交易建議（真實資料）</div>
-    <div style="display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--border);margin-bottom:12px">
-      <div style="font-family:var(--fh);font-size:28px;font-weight:900;color:${signalCol}">${signal.action}</div>
-      <div style="font-size:12px;color:var(--text2);flex:1">${signal.reason}</div>
-    </div>
-    ${signal.entry ? `
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
-      ${[['🎯 進場價', signal.entry?.toFixed(0)||'—', 'var(--cyan)'],
-         ['🛑 停損', signal.stop_loss?.toFixed(0)||'—', 'var(--red)'],
-         ['🎯 停利', signal.take_profit?.toFixed(0)||'—', 'var(--green)'],
-         ['⚖️ 風報比', signal.rr||'1:2', 'var(--yellow)']
-        ].map(([l,v,c])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border:1px solid var(--border)">
-          <div style="font-size:9px;color:var(--text3);margin-bottom:3px">${l}</div>
-          <div style="font-family:var(--fh);font-size:16px;color:${c}">${v}</div>
-        </div>`).join('')}
-    </div>` : ''}
-    <div style="margin-top:10px;font-size:10px;color:var(--text3);font-family:var(--fm)">
-      ⚠️ 風控提醒：單筆風險建議 &le; 總資金 1%~2% | 開盤前15分鐘不追單
-    </div>
-  </div>
+  const txP=Number(txPrice)||0;
+  const stkP=Number(stockPrice)||0;
+  const isTWn=isTW?1:0;
 
-  <!-- ══ Basis 解讀 ══ -->
+  el.innerHTML=`
+  <!-- ══ 時段說明（對應 get_taiwan_session_info）══ -->
   <div class="card mb">
-    <div class="card-t">📚 Basis 價差解讀說明</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
-      ${[
-        ['正價差 (Basis > 0)', '期貨 > 現貨，市場偏多樂觀', 'var(--green)'],
-        ['小逆價差 (-20 < B < 0)', '輕微偏空，多空拉鋸', '#7fff7f'],
-        ['逆價差 (-50 < B ≤ -20)', '偏空訊號，外資做空積極', 'var(--yellow)'],
-        ['大逆價差 (B ≤ -50)', '強烈偏空，賣出訊號', 'var(--red)'],
-      ].map(([l,d,c])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border-left:3px solid ${c}">
-          <div style="color:${c};font-weight:600">${l}</div>
-          <div style="color:var(--text3);margin-top:2px">${d}</div>
-        </div>`).join('')}
+    <div class="card-t">📈 台指期即時行情（TAIFEX + TWSE）
+      <span style="font-size:10px;color:${sessionColor};margin-left:8px;font-weight:700">● ${session}</span>
+    </div>
+    <div style="background:rgba(0,0,0,.25);border:1px solid ${sessionColor}55;border-radius:6px;padding:10px 14px;margin-bottom:12px">
+      <div style="font-size:11px;color:${sessionColor};margin-bottom:4px">${impact}</div>
+      <div style="font-size:10px;color:var(--text2)">${openNote}</div>
+    </div>
+    <!-- 行情雙欄 -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+      <div style="background:var(--bg3);border-radius:8px;padding:14px;text-align:center">
+        <div style="font-size:10px;color:var(--text3);margin-bottom:4px">近月台指期（${txContract}）</div>
+        <div style="font-family:var(--fh);font-size:28px;font-weight:900;color:var(--cyan)">
+          ${txPrice?txPrice.toLocaleString('en-US',{maximumFractionDigits:0}):'—'}
+        </div>
+        <div style="font-size:9px;color:var(--text3);margin-top:4px">結算價：${txSettle}｜${txDate}</div>
+        ${!txPrice?`<div style="font-size:9px;color:var(--yellow);margin-top:4px">⚠️ 日盤期間 TAIFEX API 不提供即時報價</div>`:''}
+      </div>
+      <div style="background:var(--bg3);border-radius:8px;padding:14px;text-align:center">
+        <div style="font-size:10px;color:var(--text3);margin-bottom:4px">加權指數 TAIEX</div>
+        <div style="font-family:var(--fh);font-size:28px;font-weight:900;color:var(--yellow)">
+          ${taiex?taiex.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}
+        </div>
+        <div style="font-size:9px;color:var(--text3);margin-top:4px">TWSE 官方即時現貨</div>
+      </div>
+    </div>
+    <!-- 三欄統計 -->
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:10px;font-size:11px">
+      <div class="smc-item"><span class="smc-icon">⚖️</span>
+        <div><div class="smc-label">Basis 價差</div>
+        <div class="smc-val" style="color:${basisColor}">${basisStr}</div></div></div>
+      <div class="smc-item"><span class="smc-icon">📊</span>
+        <div><div class="smc-label">成交量</div>
+        <div class="smc-val">${txVolume?txVolume.toLocaleString():'—'}</div></div></div>
+      <div class="smc-item"><span class="smc-icon">📋</span>
+        <div><div class="smc-label">未平倉量</div>
+        <div class="smc-val">${txOI?txOI.toLocaleString():'—'}</div></div></div>
+    </div>
+    ${basis!=null?`<div style="padding:10px 14px;background:${basis>0?'rgba(0,255,157,.07)':'rgba(255,59,92,.07)'};border:1px solid ${basisColor};border-radius:6px;font-size:11px;color:${basisColor}">
+      ${basis>0?'📈 正價差：市場偏多，法人預期樂觀':'📉 逆價差：市場偏空，謹慎觀望'}
+      <span style="margin-left:8px;font-size:9px;color:var(--text3)">${basisStr} 點</span></div>`:''}
+  </div>
+
+  <!-- ══ 開盤方向預測（對應 Python gap + direction）══ -->
+  <div class="card mb">
+    <div class="card-t">🔮 台指期 → 開盤方向預測</div>
+    <div style="background:rgba(0,0,0,.25);border:2px solid ${openColor};border-radius:10px;padding:16px;text-align:center;margin-bottom:12px">
+      <div style="font-size:34px;margin-bottom:6px">${openIcon}</div>
+      <div style="font-family:var(--fh);font-size:20px;font-weight:900;color:${openColor};margin-bottom:6px">${openDir}</div>
+      ${gap!=null?`<div style="font-family:var(--fm);font-size:16px;color:${openColor};margin-bottom:8px">
+        預估跳空幅度：${gap>0?'+':''}${gap.toFixed(0)} 點
+        ${gapPct!=null?`(${gapPct>0?'+':''}${gapPct.toFixed(2)}%)`:''}
+      </div>`:''}
+      ${openDesc?`<div style="font-size:10px;color:var(--text2);line-height:1.7">${openDesc}</div>`:''}
+      ${openConf?`<div style="font-size:9px;color:var(--text3);margin-top:6px">預測信心：${openConf}</div>`:''}
+    </div>
+    <div style="font-size:10px;color:var(--text2);background:var(--bg3);border-radius:6px;padding:10px 14px;line-height:2">
+      ${session==='夜盤'?
+        '<div>🌙 <b style="color:var(--cyan)">現為夜盤</b>：台指期夜盤走勢直接預示 <b>明日 09:00 開盤</b> 方向</div><div>• 正價差擴大 → 隔日開高機率高｜逆價差擴大 → 隔日開低機率高</div>':
+        session==='日盤'?
+        '<div>☀️ <b style="color:var(--green)">現為日盤</b>：期貨與現貨同步運行，正價差偏多，逆價差偏空</div><div>• 今日收盤前 Basis 方向 = 明日夜盤開盤參考依據</div>':
+        '<div>⚠️ <b style="color:var(--yellow)">非交易時段</b>：顯示最後收盤數據，下次開盤為準</div>'}
     </div>
   </div>
 
-  <!-- ══ 交易時段 ══ -->
-  <div class="card">
-    <div class="card-t">⏰ 台指期交易時段 × 即時狀態</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:11px">
-      ${[
-        ['日盤', '08:45 ~ 13:45', '最直接反映今天台股'],
-        ['夜盤', '15:00 ~ 隔日05:00', '參考次日開盤走勢'],
-        ['開盤前15分不追單', '08:45~08:59 / 15:00~15:14', '高波動防追高殺低'],
-        ['更新時間', nowStr, '每次點選台指期自動更新'],
-      ].map(([l,v,d])=>`<div style="background:var(--bg3);border-radius:4px;padding:8px;border:1px solid var(--border)">
-          <div style="color:var(--cyan);font-size:9px">${l}</div>
-          <div style="font-family:var(--fm);font-size:12px;color:var(--text)">${v}</div>
-          <div style="color:var(--text3);font-size:9px">${d}</div>
-        </div>`).join('')}
+  <!-- ══ 個股避險計算（完全對應 Python calculate_tsmc_hedge）══ -->
+  <div class="card mb">
+    <div class="card-t">🛡️ 單一股票避險策略
+      ${ticker?`<span style="font-size:10px;color:var(--cyan);margin-left:8px;font-weight:600">● ${stockName}（${ticker}）</span>`:''}
     </div>
-    <div style="margin-top:8px;font-size:9px;color:var(--text3);font-family:var(--fm)">
-      資料來源：${taiexData?.source==='yahoo_twii'?'Yahoo ^TWII':'TWSE mis.twse.com.tw'}（加權指數）| ${txData?.source?.includes('yahoo')?'Yahoo TX=F':'TAIFEX openapi.taifex.com.tw'}（台指期）| 更新：${nowStr}
+
+    ${!ticker?`
+    <div style="background:var(--bg3);border-radius:6px;padding:14px;text-align:center;color:var(--text3);font-size:11px">
+      💡 請先在上方輸入股票代碼並點擊「分 析」<br>
+      分析完成後此處將自動顯示個股期貨避險口數
+    </div>`:`
+
+    <!-- 股票資訊欄 -->
+    <div style="background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.25);border-radius:6px;padding:10px 14px;margin-bottom:14px">
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;font-size:11px">
+        <div><div style="font-size:9px;color:var(--text3)">股票代碼</div><div style="color:var(--cyan);font-weight:700">${ticker}</div></div>
+        <div><div style="font-size:9px;color:var(--text3)">目前股價</div><div style="font-family:var(--fm)">${stockPrice?stockPrice.toLocaleString('en-US',{maximumFractionDigits:2}):'—'}</div></div>
+        <div><div style="font-size:9px;color:var(--text3)">預設張數</div><div style="font-family:var(--fm)">${defShares} ${isTW?'張':'股'}</div></div>
+        <div><div style="font-size:9px;color:var(--text3)">預設 Beta</div><div style="font-family:var(--fm)">${defBeta.toFixed(1)}</div></div>
+      </div>
+      ${stockPrice>0?`<div style="font-size:9px;color:var(--text3);margin-top:8px">
+        總持股市值：${isTW?(defShares*1000*stockPrice).toLocaleString('en-US',{maximumFractionDigits:0}):(defShares*stockPrice).toLocaleString('en-US',{maximumFractionDigits:0})} 元
+      </div>`:''}
+    </div>
+
+    <!-- 【1】台指期避險（需要 txPrice）-->
+    <div style="font-size:10px;color:var(--text3);font-weight:700;margin-bottom:8px;padding:6px 10px;background:var(--bg3);border-radius:4px">
+      【1】台指期避險（對沖系統性風險）
+      ${!txPrice?`<span style="color:var(--yellow);font-weight:400;margin-left:8px">⚠️ 日盤期間 TAIFEX 無即時報價，收盤後自動計算</span>`:''}
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+      <div style="background:rgba(255,170,0,.1);border:1px solid rgba(255,170,0,.35);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:9px;color:var(--text3);margin-bottom:4px">大台（TX）</div>
+        <div style="font-family:var(--fh);font-size:32px;font-weight:900;color:var(--yellow)">${bigC!=null?Math.round(bigC):'N/A'}</div>
+        <div style="font-size:9px;color:var(--text3)">${bigC!=null?bigC.toFixed(2)+' 口｜乘數 200元/點':'待台指期收盤後計算'}</div>
+      </div>
+      <div style="background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.35);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:9px;color:var(--text3);margin-bottom:4px">小台（MTX）</div>
+        <div style="font-family:var(--fh);font-size:32px;font-weight:900;color:var(--cyan)">${smallC!=null?Math.round(smallC):'N/A'}</div>
+        <div style="font-size:9px;color:var(--text3)">${smallC!=null?smallC.toFixed(2)+' 口｜乘數 50元/點':'待台指期收盤後計算'}</div>
+      </div>
+    </div>
+
+    ${isTW?`
+    <!-- 【2】個股期貨避險（只需要張數，不需要 txPrice！）-->
+    <div style="font-size:10px;color:var(--text3);font-weight:700;margin-bottom:8px;padding:6px 10px;background:var(--bg3);border-radius:4px">
+      【2】個股期貨避險（最精準，直接對沖 ${stockName}）
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+      <div style="background:rgba(0,255,157,.08);border:1px solid rgba(0,255,157,.3);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:9px;color:var(--text3);margin-bottom:4px">CDF 標準合約</div>
+        <div style="font-family:var(--fh);font-size:32px;font-weight:900;color:var(--green)">${cdfC.toFixed(1)}</div>
+        <div style="font-size:9px;color:var(--text3)">口（1口=2000股≈2張）</div>
+      </div>
+      <div style="background:rgba(255,215,0,.08);border:1px solid rgba(255,215,0,.3);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:9px;color:var(--text3);margin-bottom:4px">QFF 小型合約</div>
+        <div style="font-family:var(--fh);font-size:32px;font-weight:900;color:var(--yellow)">${Math.round(qffC)}</div>
+        <div style="font-size:9px;color:var(--text3)">口（1口=100股）</div>
+      </div>
+    </div>
+    <div style="font-size:9px;color:var(--text3);background:var(--bg3);border-radius:5px;padding:8px 12px;line-height:1.9;margin-bottom:12px">
+      💡 個股期貨直接1:1對沖持股，效果優於台指期，無指數相關性殘差風險<br>
+      ⚠️ 個股期貨流動性較低，建議優先用於大型權值股（台積電、聯發科等）
+    </div>`:''}
+
+    <!-- 自訂參數（對應 Python input() 區段）-->
+    <div style="background:var(--bg3);border-radius:6px;padding:12px 14px">
+      <div style="font-size:10px;color:var(--cyan);font-weight:700;margin-bottom:10px">⚙️ 自訂避險參數</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
+        <div style="flex:1;min-width:90px">
+          <div style="font-size:9px;color:var(--text3);margin-bottom:4px">${isTW?'持股張數':'持股數量（股）'}</div>
+          <input id="txSharesInput" type="number" value="${defShares}" min="1" step="1"
+            style="width:100%;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:4px;padding:7px 8px;font-size:12px;box-sizing:border-box">
+        </div>
+        <div style="flex:1;min-width:80px">
+          <div style="font-size:9px;color:var(--text3);margin-bottom:4px">股價（元）</div>
+          <input id="txPriceInput" type="number" value="${stockPrice||1000}" min="1" step="0.5"
+            style="width:100%;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:4px;padding:7px 8px;font-size:12px;box-sizing:border-box">
+        </div>
+        <div style="flex:1;min-width:70px">
+          <div style="font-size:9px;color:var(--text3);margin-bottom:4px">Beta 值</div>
+          <input id="txBetaInput" type="number" value="${defBeta}" min="0.1" max="3" step="0.1"
+            style="width:100%;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:4px;padding:7px 8px;font-size:12px;box-sizing:border-box">
+        </div>
+        <div style="flex:1;min-width:90px">
+          <div style="font-size:9px;color:var(--text3);margin-bottom:4px">避險方向</div>
+          <select id="txHedgeDir" style="width:100%;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:4px;padding:7px 8px;font-size:11px;box-sizing:border-box">
+            <option value="short">賣出（空頭）</option>
+            <option value="long">買進（多頭）</option>
+          </select>
+        </div>
+        <button onclick="txRecalc(${txP},${stkP},'${ticker}',${isTWn})"
+          style="background:var(--cyan);color:#000;border:none;border-radius:5px;padding:8px 16px;font-size:11px;font-weight:700;cursor:pointer;flex-shrink:0">重新計算</button>
+      </div>
+      <div id="txHedgeResult" style="margin-top:10px"></div>
+    </div>`}
+
+    <div style="margin-top:10px;font-size:9px;color:var(--text3);line-height:1.9">
+      📐 台指期口數 = (持股市值 × Beta) ÷ 契約價值｜個股期貨口數 = 持股股數 ÷ 每口股數<br>
+      ⚠️ 提醒：個股期貨避險效果優於台指期，但流動性稍低，實際操作請注意保證金與基差風險
+    </div>
+  </div>
+
+  <!-- ══ 台指期×台股關係說明 ══ -->
+  <div class="card mb">
+    <div class="card-t">🔍 台指期 × 台股關係說明</div>
+    <div style="font-size:11px;color:var(--text2);line-height:2.2">
+      <div>📌 台指期通常 <b style="color:var(--cyan)">領先加權指數 1~5 分鐘</b> 反映最新訊息</div>
+      <div>📌 夜盤走勢是隔日 <b style="color:var(--yellow)">09:00 開盤</b> 最直接先行指標</div>
+      <div>📌 未平倉量大增 → 新部位進場，趨勢加速；大減 → 主力平倉離場</div>
+      <div>📌 結算日（每月第三週三）前後波動加大，需加強風控</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;font-size:10px">
+      <div style="background:rgba(0,255,157,.08);border:1px solid rgba(0,255,157,.3);border-radius:5px;padding:10px 12px">
+        <div style="color:var(--green);font-weight:700;margin-bottom:4px">📈 正價差 Basis &gt; 0</div>
+        <div style="color:var(--text2);line-height:1.8">法人預期後市樂觀<br>期貨溢價，偏多方操作</div>
+      </div>
+      <div style="background:rgba(255,59,92,.08);border:1px solid rgba(255,59,92,.3);border-radius:5px;padding:10px 12px">
+        <div style="color:var(--red);font-weight:700;margin-bottom:4px">📉 逆價差 Basis &lt; 0</div>
+        <div style="color:var(--text2);line-height:1.8">避險需求強或市場偏空<br>謹慎操作，留意支撐</div>
+      </div>
+    </div>
+    <div style="margin-top:8px;font-size:9px;color:var(--text3)">
+      ℹ️ 來源：TAIFEX openapi + TWSE mis｜三層 CORS Proxy 備援
+    </div>
+  </div>`;
+}
+
+// ── 重新計算（對應 Python calculate_tsmc_hedge 互動版）
+function txRecalc(txPrice,stockPriceDefault,ticker,isTW){
+  const shares =parseFloat(document.getElementById('txSharesInput')?.value)||10;
+  const price  =parseFloat(document.getElementById('txPriceInput')?.value)||stockPriceDefault||1000;
+  const beta   =parseFloat(document.getElementById('txBetaInput')?.value)||1.5;
+  const dir    =document.getElementById('txHedgeDir')?.value||'short';
+  const el     =document.getElementById('txHedgeResult');
+  if(!el) return;
+
+  // portfolio_value = shares * 1000 * price（台股）
+  const portVal=isTW?(shares*1000*price):(shares*price);
+  const hedgeAmt=portVal*beta;
+  // tx_contracts = hedge_amount / (tx_price * 200)
+  const bigC  =(txPrice>0)?(hedgeAmt/(txPrice*200)):null;
+  const smallC=(txPrice>0)?(hedgeAmt/(txPrice*50)) :null;
+  // cdf = (shares * 1000) / 2000
+  const cdfC=isTW?((shares*1000)/2000):0;
+  // qff = (shares * 1000) / 100
+  const qffC=isTW?((shares*1000)/100):0;
+
+  const dirLabel=dir==='short'?'賣出（空頭避險）':'買進（多頭避險）';
+
+  el.innerHTML=`
+  <div style="background:var(--bg2);border-radius:6px;padding:12px;margin-top:4px">
+    <div style="color:var(--cyan);font-weight:700;font-size:11px;margin-bottom:10px">
+      📊 計算結果｜${ticker}｜${shares}${isTW?'張':'股'}×${price}元｜Beta ${beta.toFixed(2)}｜${dirLabel}
+    </div>
+    <div style="display:grid;grid-template-columns:${isTW?'1fr 1fr 1fr 1fr':'1fr 1fr'};gap:8px;margin-bottom:8px">
+      <div style="text-align:center;background:rgba(255,170,0,.1);border-radius:6px;padding:10px">
+        <div style="font-size:9px;color:var(--text3)">大台 TX</div>
+        <div style="font-family:var(--fh);font-size:26px;color:var(--yellow)">${bigC!=null?Math.round(bigC):'N/A'}</div>
+        <div style="font-size:9px;color:var(--text3)">${bigC!=null?bigC.toFixed(2)+' 口':'待收盤'}</div>
+      </div>
+      <div style="text-align:center;background:rgba(0,212,255,.1);border-radius:6px;padding:10px">
+        <div style="font-size:9px;color:var(--text3)">小台 MTX</div>
+        <div style="font-family:var(--fh);font-size:26px;color:var(--cyan)">${smallC!=null?Math.round(smallC):'N/A'}</div>
+        <div style="font-size:9px;color:var(--text3)">${smallC!=null?smallC.toFixed(2)+' 口':'待收盤'}</div>
+      </div>
+      ${isTW?`
+      <div style="text-align:center;background:rgba(0,255,157,.08);border-radius:6px;padding:10px">
+        <div style="font-size:9px;color:var(--text3)">CDF 標準</div>
+        <div style="font-family:var(--fh);font-size:26px;color:var(--green)">${cdfC.toFixed(1)}</div>
+        <div style="font-size:9px;color:var(--text3)">${cdfC.toFixed(1)} 口</div>
+      </div>
+      <div style="text-align:center;background:rgba(255,215,0,.08);border-radius:6px;padding:10px">
+        <div style="font-size:9px;color:var(--text3)">QFF 小型</div>
+        <div style="font-family:var(--fh);font-size:26px;color:var(--yellow)">${Math.round(qffC)}</div>
+        <div style="font-size:9px;color:var(--text3)">${Math.round(qffC)} 口</div>
+      </div>`:''}
+    </div>
+    <div style="font-size:9px;color:var(--text3);line-height:1.9">
+      持股市值：${portVal.toLocaleString('en-US',{maximumFractionDigits:0})} 元
+      ｜避險金額：${hedgeAmt.toLocaleString('en-US',{maximumFractionDigits:0})} 元
+      ${bigC!=null?`｜大台契約值：${(txPrice*200).toLocaleString()} 元/口`:''}
     </div>
   </div>`;
 }
