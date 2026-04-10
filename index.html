@@ -1514,13 +1514,16 @@ function calcChipAnalysis(bars, fund, ticker=''){
     recent_gaps:     recentGaps,
     total_gaps:      gaps.length,
     unfilled_gaps:   openGaps.length,
-    // 借券新增欄位
-    lending_signal:  lendingProxy.signal,
-    lending_score:   lendingProxy.score,
-    lending_reason:  lendingProxy.reason,
+    // 借券五型裂縫欄位（對應 _renderChipPanel 期望的欄位名）
+    lending_pattern: lendingProxy.pattern  || 'NEUTRAL',
+    lending_score:   lendingProxy.score    || 0,
+    lending_detail:  lendingProxy.detail   || '',
+    lending_action:  lendingProxy.action   || '',
+    lending_signal:  lendingProxy.signal   || 'Neutral',
+    lending_reason:  lendingProxy.reason   || '',
     lending_balance: 0,
     lending_sell:    0,
-    lending_source:  lendingProxy.data_source,
+    lending_source:  lendingProxy.data_source || 'proxy',
   };
 }
 
@@ -4621,6 +4624,10 @@ async function doAnalyze(){
       D.ticker = ticker; D._klineData = D.all_chart_data || bars;  // 含指標
       setProgress('render', '更新估值面板…', `${fund._count}項財務數據`);
       renderAll(D);
+      // ── OFI + ML動量 + 波動率政權（主流程即時計算，所有市場通用）
+      try{ D.technical = calcOFIAndRegime(D._bars||[], D.technical||{}); }catch(e){}
+      try{ applyOFIScoring(D); }catch(e){}
+      try{ renderSMC(D); }catch(e){}
       if(window.innerWidth <= 768) showPanel('overview');
     }
     setProgress('done', '分析完成！', `${ticker} - ${D.signal}`);
