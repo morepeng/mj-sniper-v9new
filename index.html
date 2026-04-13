@@ -1813,132 +1813,120 @@ async function fetchOptionsFlow(ticker){
 
   const store = r => { window._OPT_CACHE[cacheKey]=r; return r; };
 
-  // ── parseChain helper
+  // ── parseChain helper（改良版：近月過濾 + 多到期日加總 + Delta加權）
   function parseChain(res){
-    const chain = res?.options?.[0];
-    if(!chain) return null;
-    const calls   = chain.calls||[], puts = chain.puts||[];
-    const callVol = calls.reduce((s,x)=>s+(x.volume||0),0);
-    const putVol  = puts.reduce((s,x)=>s+(x.volume||0),0);
-    const callOI  = calls.reduce((s,x)=>s+(x.openInterest||0),0);
-    const putOI   = puts.reduce((s,x)=>s+(x.openInterest||0),0);
-    const total   = callVol+putVol;
-    if(total===0) return null;
-    const expTs   = res.expirationDates?.[0];
-    const expDate = expTs?new Date(expTs*1000).toISOString().slice(0,10):'—';
-    const pcr     = callVol>0?putVol/callVol:9.99;
-    const avgOI   = (callOI+putOI)/2;
-    const unusual = avgOI>0&&total>avgOI*0.2;
-    let score=0; const details=[];
-    if(pcr<0.5){score+=5;details.push(`🔥 極低PCR(${pcr.toFixed(2)}) — 強烈看多`);}
-    else if(pcr<0.7){score+=3;details.push(`✅ 低PCR(${pcr.toFixed(2)}) — 偏多`);}
-    else if(pcr<=1.0){score+=1;details.push(`⚖️ 中性PCR(${pcr.toFixed(2)})`);}
-    else if(pcr<=1.2){score-=3;details.push(`⚠️ 高PCR(${pcr.toFixed(2)}) — 偏空`);}
-    else{score+=6;details.push(`🚨 極高PCR(${pcr.toFixed(2)}) — 逆向軋空機會`);}
+    if(!res) return null;
+    const today = new Date();
+    const maxExp = new Date(today.getTime() + 45*24*3600*1000);
+    const expDates = res.expirationDates || [];
+
+    // 過濾近月到期日（45天內）
+    const nearExpTs = expDates.filter(ts => {
+      const d = new Date(ts * 1000);
+      return d >= today && d <= maxExp;
+    });
+
+    // 若無近月合約則 fallback 用第一個
+    const targetExpTs = nearExpTs.length > 0 ? nearExpTs : (expDates.length > 0 ? [expDates[0]] : []);
+
+    // 從 res.options 中找到對應到期日的合約
+    let allCalls = [], allPuts = [];
+    const chains = res.options || [];
+    for(const chain of chains){
+      const chainExp = chain.expirationDate;
+      if(targetExpTs.length === 0 || targetExpTs.includes(chainExp)){
+        allCalls = allCalls.concat(chain.calls || []);
+        allPuts  = allPuts.concat(chain.puts  || []);
+      }
+    }
+    // fallback: 若還是空，取第一個 chain
+    if(allCalls.length === 0 && allPuts.length === 0 && chains.length > 0){
+      allCalls = chains[0].calls || [];
+      allPuts  = chains[0].puts  || [];
+    }
+
+    const callVol = allCalls.reduce((s,x)=>s+(x.volume||0),0);
+    const putVol  = allPuts.reduce((s,x)=>s+(x.volume||0),0);
+    const callOI  = allCalls.reduce((s,x)=>s+(x.openInterest||0),0);
+    const putOI   = allPuts.reduce((s,x)=>s+(x.openInterest||0),0);
+    const total   = callVol + putVol;
+    if(total === 0) return null;
+
+    // 近月到期日字串
+    const nearExpDate = nearExpTs.length > 0
+      ? new Date(nearExpTs[0]*1000).toISOString().slice(0,10)
+      : (expDates[0] ? new Date(expDates[0]*1000).toISOString().slice(0,10) : '—');
+
+    // 標準 PCR（成交量）
+    const pcr = callVol > 0 ? putVol / callVol : 9.99;
+
+    // Delta 加權淨曝險（近似：Call delta~+0.5, Put delta~-0.5，用成交量加權）
+    const callDeltaApprox = allCalls.reduce((s,x)=> s + (x.volume||0) * (x.delta || 0.5), 0);
+    const putDeltaApprox  = allPuts.reduce((s,x)=>  s + (x.volume||0) * (x.delta || -0.5), 0);
+    const netDelta = callDeltaApprox + putDeltaApprox;
+
+    const avgOI   = (callOI + putOI) / 2;
+    const unusual = avgOI > 0 && total > avgOI * 0.2;
+
+    let score = 0;
+    const details = [];
+
+    // PCR 評分（逆向指標）
+    if(pcr < 0.5){
+      score += 5; details.push(`🔥 近月PCR=${pcr.toFixed(2)} 極低 — 強烈看多（近${nearExpTs.length||1}到期）`);
+    } else if(pcr < 0.75){
+      score += 3; details.push(`✅ 近月PCR=${pcr.toFixed(2)} 偏低 — 偏多`);
+    } else if(pcr <= 0.95){
+      score += 1; details.push(`⚖️ 近月PCR=${pcr.toFixed(2)} 中性偏多`);
+    } else if(pcr <= 1.1){
+      score -= 1; details.push(`⚖️ 近月PCR=${pcr.toFixed(2)} 中性偏空`);
+    } else if(pcr <= 1.25){
+      score -= 3; details.push(`⚠️ 近月PCR=${pcr.toFixed(2)} 偏空`);
+    } else {
+      score += 4; details.push(`🚨 近月PCR=${pcr.toFixed(2)} 極高 — 逆向軋空機會`);
+    }
+
+    // Delta 淨曝險輔助確認
+    if(netDelta > 5000){
+      score += 2; details.push(`📈 Delta淨曝險 +${netDelta.toFixed(0)}（多頭主導）`);
+    } else if(netDelta < -5000){
+      score -= 2; details.push(`📉 Delta淨曝險 ${netDelta.toFixed(0)}（空頭主導）`);
+    }
+
+    // 異常大單
     if(unusual){
-      if(callVol>putVol*1.5){score+=4;details.push('🔥 大單Call異常湧入');}
-      else if(putVol>callVol*1.5){score-=4;details.push('⚠️ 大單Put異常湧入（避險）');}
-      else{details.push('異常期權活動偵測');}
+      if(callVol > putVol * 1.5){ score += 3; details.push('🔥 大單Call異常湧入'); }
+      else if(putVol > callVol * 1.5){ score -= 3; details.push('⚠️ 大單Put異常湧入（避險信號）'); }
+      else { details.push('⚡ 異常期權活動（Call/Put均衡）'); }
     }
-    if(callOI>putOI*2){score+=2;details.push('Call未平倉佔優');}
-    else if(putOI>callOI*2){score-=2;details.push('Put未平倉佔優');}
-    let signal='Neutral';
-    if(score>=8)signal='Strong Buy';
-    else if(score>=4)signal='Buy';
-    else if(score<=-8)signal='Strong Sell';
-    else if(score<=-4)signal='Sell';
-    return{signal,score,put_call_ratio:+pcr.toFixed(3),
-      call_volume:callVol,put_volume:putVol,call_oi:callOI,put_oi:putOI,
-      unusual_activity:unusual,exp_date:expDate,total_volume:total,
-      reason:details[0]||'中性',details};
+
+    // OI 未平倉多空比
+    if(callOI > putOI * 2){ score += 2; details.push('📊 Call未平倉大幅佔優'); }
+    else if(putOI > callOI * 2){ score -= 2; details.push('📊 Put未平倉大幅佔優'); }
+
+    // PCR + Delta 聯合評分
+    let signal = 'Neutral';
+    if(score >= 8)      signal = 'Strong Buy';
+    else if(score >= 4) signal = 'Buy';
+    else if(score <= -8) signal = 'Strong Sell';
+    else if(score <= -4) signal = 'Sell';
+
+    return {
+      signal, score,
+      put_call_ratio: +pcr.toFixed(3),
+      call_volume: callVol,
+      put_volume:  putVol,
+      call_oi:     callOI,
+      put_oi:      putOI,
+      net_delta:   +netDelta.toFixed(0),
+      unusual_activity: unusual,
+      exp_date:    nearExpDate,
+      near_exp_count: nearExpTs.length,
+      total_volume: total,
+      reason:  details[0] || '中性',
+      details
+    };
   }
-
-  // ── 策略 1: 先取 Crumb，再帶 Crumb 呼叫 Options API
-  try{
-    // Step A: 取得 crumb（透過 allorigins 抓 Yahoo Finance 頁面）
-    let crumb = null;
-    const quoteUrl = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
-    const aoBase   = `https://api.allorigins.win/get?url=${encodeURIComponent(quoteUrl)}&timestamp=${Date.now()}`;
-    try{
-      const rq = await fetchWithTimeout(aoBase,{cache:'no-store'},12000);
-      if(rq&&rq.ok){
-        const jq = await rq.json();
-        const html = jq?.contents||'';
-        // 從 HTML 中解析 crumb
-        const cm = html.match(/"crumb"\s*:\s*"([^"]{5,30})"/);
-        if(cm) crumb = cm[1];
-        // 同時嘗試解析 optionChain JSON blob 嵌入 HTML
-        const om = html.match(/"OptionContractsStore"\s*:\s*(\{[\s\S]{50,15000}?\})\s*,\s*"(?:QuoteSummaryStore|StreamDataStore|RecommendationStore)"/);
-        if(om){
-          try{
-            const blob = JSON.parse(om[1]);
-            const ce = blob?.callExpDateMap, pe = blob?.putExpDateMap;
-            if(ce&&pe){
-              const fc = Object.values(ce).flatMap(Object.values).flat();
-              const fp = Object.values(pe).flatMap(Object.values).flat();
-              const cv=fc.reduce((s,x)=>s+(x.volume?.raw||0),0);
-              const pv=fp.reduce((s,x)=>s+(x.volume?.raw||0),0);
-              const co=fc.reduce((s,x)=>s+(x.openInterest?.raw||0),0);
-              const po=fp.reduce((s,x)=>s+(x.openInterest?.raw||0),0);
-              const total=cv+pv;
-              if(total>0){
-                const fakeRes={options:[{
-                  calls:fc.map(x=>({volume:x.volume?.raw||0,openInterest:x.openInterest?.raw||0})),
-                  puts:fp.map(x=>({volume:x.volume?.raw||0,openInterest:x.openInterest?.raw||0}))
-                }],expirationDates:[]};
-                const d=parseChain(fakeRes);
-                if(d){ d.source='html_scrape'; return store(d); }
-              }
-            }
-          }catch(_){}
-        }
-      }
-    }catch(_){}
-
-    // Step B: 用 Crumb 帶入 Options API
-    if(crumb){
-      const apiUrl = `https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}?crumb=${encodeURIComponent(crumb)}`;
-      for(const url of [apiUrl, ...CORS_PROXIES.map(mk=>mk(apiUrl))]){
-        try{
-          const r=await fetchWithTimeout(url,{cache:'no-store',mode:'cors'},10000);
-          if(!r||!r.ok) continue;
-          let raw=await r.text();
-          let parsed=null;
-          try{parsed=JSON.parse(raw);}catch(_){continue;}
-          if(parsed?.contents)try{parsed=JSON.parse(parsed.contents);}catch(_){}
-          const res=parsed?.optionChain?.result?.[0];
-          if(res){const d=parseChain(res);if(d){d.source='crumb_api';return store(d);}}
-        }catch(_){}
-      }
-    }
-  }catch(_){}
-
-  // ── 策略 2: 無 Crumb 直接嘗試 v7/v8 + CORS proxy
-  const v7q2=`https://query2.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`;
-  const v7q1=`https://query1.finance.yahoo.com/v7/finance/options/${encodeURIComponent(ticker)}`;
-  const v8q2=`https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?modules=optionChain`;
-  for(const base of [v7q2,v7q1,v8q2]){
-    for(const url of [base,...CORS_PROXIES.map(mk=>mk(base))]){
-      try{
-        const r=await fetchWithTimeout(url,{cache:'no-store',mode:'cors'},8000);
-        if(!r||!r.ok) continue;
-        let raw=await r.text();
-        let parsed=null;
-        try{parsed=JSON.parse(raw);}catch(_){continue;}
-        if(parsed?.contents)try{parsed=JSON.parse(parsed.contents);}catch(_){}
-        if(parsed?.body)try{parsed=JSON.parse(parsed.body);}catch(_){}
-        const res=parsed?.optionChain?.result?.[0]||parsed?.chart?.result?.[0]?.optionChain;
-        if(res){const d=parseChain(res);if(d){d.source='direct_api';return store(d);}}
-      }catch(_){}
-    }
-  }
-
-  // ── 全部失敗 → 顯示明確失敗卡（不轉圈）
-  return store({...EMPTY, signal:'N/A',
-    reason:'Yahoo Finance Options API 需要登入驗證（Crumb/Cookie）',
-    details:['已嘗試：HTML scrape + Crumb提取 + v7/v8直連 + 4層CORS Proxy','建議直接至 finance.yahoo.com/quote/'+ticker+'/options/ 查詢']
-  });
-}
 
 
 // ============================================================
@@ -2148,70 +2136,93 @@ function renderCrossborderCard(cb, ticker){
 }
 
 function renderOptionsCard(opt){
-  if(opt.signal === 'N/A'){
-    if(opt.reason === '非美股市場') return '';
-    const detailLines = (opt.details||[]).map(s=>`<div style="margin-top:4px">• ${s}</div>`).join('');
-    return `<div class="card mb">
-      <div class="card-t">📊 期權情緒分析（Put/Call Ratio）</div>
-      <div style="padding:14px">
-        <div style="color:var(--yellow);font-size:12px;font-weight:600;margin-bottom:8px">⚠️ ${opt.reason}</div>
-        <div style="font-size:10px;color:var(--text3);line-height:1.8">${detailLines}</div>
-        <div style="margin-top:10px;padding:8px;background:var(--bg3);border-radius:6px;font-size:10px;color:var(--text2)">
-          💡 可直接至
-          <a href="https://finance.yahoo.com/quote/${encodeURIComponent(window._lastTicker||'AAPL')}/options/"
-            target="_blank" style="color:var(--cyan)">finance.yahoo.com → 期權頁面</a>
-          查詢即時 PCR 數據
-        </div>
-      </div>
-    </div>`;
-  }
-  const pcrCol  = opt.put_call_ratio<0.6?'var(--green)':opt.put_call_ratio>1.2?'var(--red)':'var(--yellow)';
+  if(opt.signal==='N/A'){ if(opt.reason) return `
+    <div class="card mb"><div class="card-t">Put/Call Ratio</div>
+    <div style="color:var(--yellow);font-size:12px;font-weight:600;margin-bottom:8px">${opt.reason}</div>
+    <div style="font-size:10px;color:var(--text3);line-height:1.8">${(opt.details||[]).map(s=>`<div>${s}</div>`).join('')}</div>
+    <div style="margin-top:10px;padding:8px;background:var(--bg3);border-radius:6px;font-size:10px;color:var(--text2)">
+      <a href="https://finance.yahoo.com/quote/${encodeURIComponent(window.lastTicker||'AAPL')}/options/" target="_blank" style="color:var(--cyan)">→ finance.yahoo.com 查看選擇權</a>
+    </div></div></div>`; return ''; }
+
+  const pcrCol  = opt.put_call_ratio<0.75?'var(--green)':opt.put_call_ratio>1.25?'var(--red)':'var(--yellow)';
   const sigColor= opt.signal.includes('Buy')?'var(--green)':opt.signal.includes('Sell')?'var(--red)':'var(--cyan)';
-  const sigEmoji= opt.signal==='Strong Buy'?'🔥':opt.signal==='Buy'?'✅':opt.signal==='Strong Sell'?'🚨':opt.signal==='Sell'?'⚠️':'⚖️';
+  const sigEmoji= opt.signal==='Strong Buy'?'🚀':opt.signal==='Buy'?'📈':opt.signal==='Strong Sell'?'🔻':opt.signal==='Sell'?'📉':'⚖️';
   const scoreCol= opt.score>0?'var(--green)':opt.score<0?'var(--red)':'var(--text3)';
-  const unusualBadge = opt.unusual_activity?'<span style="color:var(--orange);font-size:10px;margin-left:6px">🔥 異常活動</span>':'';
+  const unusualBadge = opt.unusual_activity?`<span style="color:var(--orange);font-size:10px;margin-left:6px">⚡異常</span>`:'';
   const callPct = opt.total_volume>0?Math.round(opt.call_volume/opt.total_volume*100):50;
   const putPct  = 100-callPct;
-  const srcLabel= opt.source==='html_scrape'?'HTML解析':'opt.source'==='crumb_api'?'Crumb驗證':'Yahoo API';
-  return `
-  <div class="card mb">
-    <div class="card-t">📊 期權情緒分析（Put/Call Ratio）${unusualBadge}</div>
+  const srcLabel= opt.source==='html_scrape'?'HTML抓取':opt.source==='crumb_api'?'Crumb API':'Yahoo API';
+  const nearLabel= opt.near_exp_count>0?`近${opt.near_exp_count}個到期日`:'最近到期';
+  const netDeltaBadge = opt.net_delta!=null
+    ? `<span style="font-family:var(--fm);font-size:10px;color:${opt.net_delta>0?'var(--green)':'var(--red)'}">Δ${opt.net_delta>0?'+':''}${opt.net_delta}</span>`:'';
+
+  return `<div class="card mb">
+    <div class="card-t">Put/Call Ratio${unusualBadge}</div>
     <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
-      <div style="font-family:var(--fh);font-size:36px;font-weight:900;color:${pcrCol}">${opt.put_call_ratio}</div>
-      <div style="flex:1;min-width:0">
-        <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:${sigColor}">${sigEmoji} ${opt.signal}</div>
-        <div style="font-size:10px;color:var(--text3);margin-top:2px;word-break:break-all">${opt.reason}</div>
+      <div style="font-size:40px">${sigEmoji}</div>
+      <div style="flex:1">
+        <div style="font-family:var(--fh);font-size:16px;font-weight:700;color:${sigColor}">${opt.signal}</div>
+        <div style="display:flex;gap:8px;margin-top:4px;flex-wrap:wrap;align-items:center">
+          <span style="font-family:var(--fm);font-size:11px;color:var(--text3)">${nearLabel}</span>
+          ${netDeltaBadge}
+        </div>
       </div>
       <div style="text-align:right;flex-shrink:0">
-        <div style="font-family:var(--fh);font-size:18px;color:${scoreCol}">${opt.score>0?'+':''}${opt.score}</div>
+        <div style="font-family:var(--fh);font-size:22px;color:${scoreCol}">${opt.score>0?'+':''}${opt.score}</div>
         <div style="font-size:9px;color:var(--text3)">評分</div>
       </div>
     </div>
-    <div style="background:var(--bg3);border-radius:6px;padding:10px 14px;margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:6px">
-        <span style="color:var(--green)">📈 Call ${callPct}%（${opt.call_volume.toLocaleString()}）</span>
-        <span style="color:var(--red)">📉 Put ${putPct}%（${opt.put_volume.toLocaleString()}）</span>
+
+    <!-- PCR 量表 -->
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-bottom:3px">
+        <span>極看多 0</span><span>中性 1.0</span><span>極看空 2+</span>
       </div>
-      <div style="height:8px;background:var(--bg2);border-radius:4px;overflow:hidden;display:flex">
-        <div style="width:${callPct}%;background:var(--green);border-radius:4px 0 0 4px;transition:width .6s"></div>
-        <div style="width:${putPct}%;background:var(--red);border-radius:0 4px 4px 0;transition:width .6s"></div>
+      <div style="height:8px;background:var(--bg3);border-radius:4px;overflow:hidden;position:relative">
+        <div style="position:absolute;left:0;top:0;height:100%;width:33%;background:linear-gradient(90deg,var(--green),var(--yellow));opacity:.5;border-radius:4px"></div>
+        <div style="position:absolute;left:33%;top:0;height:100%;width:34%;background:var(--yellow);opacity:.3;border-radius:0"></div>
+        <div style="position:absolute;left:67%;top:0;height:100%;width:33%;background:linear-gradient(90deg,var(--yellow),var(--red));opacity:.5;border-radius:0 4px 4px 0"></div>
+        <div style="position:absolute;top:-2px;width:12px;height:12px;border-radius:50%;background:${pcrCol};border:2px solid var(--bg);left:calc(${Math.min(98,Math.max(1,opt.put_call_ratio/2*100)).toFixed(0)}% - 6px);transition:left .5s;box-shadow:0 0 6px ${pcrCol}"></div>
+      </div>
+      <div style="text-align:center;font-family:var(--fm);font-size:18px;font-weight:700;color:${pcrCol};margin-top:4px">${opt.put_call_ratio}</div>
+    </div>
+
+    <!-- Call/Put 成交量分佈 -->
+    <div style="margin-bottom:10px">
+      <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--text2);margin-bottom:3px">
+        <span style="color:var(--green)">Call ${callPct}% — ${opt.call_volume.toLocaleString()}</span>
+        <span style="color:var(--red)">Put ${putPct}% — ${opt.put_volume.toLocaleString()}</span>
+      </div>
+      <div style="height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;display:flex">
+        <div style="width:${callPct}%;background:var(--green);opacity:.7;transition:width .5s"></div>
+        <div style="width:${putPct}%;background:var(--red);opacity:.7;transition:width .5s"></div>
       </div>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px;margin-bottom:8px">
-      <div><div style="color:var(--text3);font-size:9px">Call 未平倉</div>
-        <div style="font-family:var(--fm);color:var(--green)">${(opt.call_oi||0).toLocaleString()}</div></div>
-      <div><div style="color:var(--text3);font-size:9px">Put 未平倉</div>
-        <div style="font-family:var(--fm);color:var(--red)">${(opt.put_oi||0).toLocaleString()}</div></div>
-      <div><div style="color:var(--text3);font-size:9px">最近到期日</div>
-        <div style="font-family:var(--fm)">${opt.exp_date||'—'}</div></div>
+
+    <!-- 詳細訊號 -->
+    <div style="font-size:10px;color:var(--text2);line-height:2;margin-bottom:8px">
+      ${(opt.details||[]).map(s=>`<div>${s}</div>`).join('')}
     </div>
-    ${opt.details&&opt.details.length>1?`<div style="font-size:10px;color:var(--text2);line-height:2">${opt.details.slice(1).map(s=>`<div>${s}</div>`).join('')}</div>`:''}
-    <div style="font-size:9px;color:var(--text3);margin-top:6px">
-      ℹ️ PCR&lt;0.6=強烈看多 | PCR&gt;1.2=逆向底部機會 | 來源：${srcLabel}
+
+    <!-- OI 比較 -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:10px;margin-bottom:8px">
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">
+        <div style="color:var(--text3);font-size:9px">Call OI</div>
+        <div style="color:var(--green);font-family:var(--fm)">${opt.call_oi.toLocaleString()}</div>
+      </div>
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">
+        <div style="color:var(--text3);font-size:9px">Put OI</div>
+        <div style="color:var(--red);font-family:var(--fm)">${opt.put_oi.toLocaleString()}</div>
+      </div>
+    </div>
+
+    <div style="font-size:9px;color:var(--text3)">
+      到期日：${opt.exp_date} ｜ 資料源：${srcLabel} ｜ 
+      <a href="https://finance.yahoo.com/quote/${encodeURIComponent(window.lastTicker||'AAPL')}/options/" target="_blank" style="color:var(--cyan)">Yahoo Options →</a>
     </div>
   </div>`;
-}
-
+}      
+      
 
 
 const YF_CORS_PROXIES = [
