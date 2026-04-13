@@ -3758,7 +3758,7 @@ function analyze(bars, ticker, quoteData){
   const pvMA200 = e200[n-1]!=null?(price/e200[n-1]-1)*100:0;
   const macroScore = clamp((pvMA200>5?1:pvMA200<-5?-1:0)+(slope>0?1:-1),-5,5);
 
-  const comp = +(momScore*.20+valScore*.15+qualScore*.20+growScore*.15+volScore*.10+sentScore*.15+macroScore*.05).toFixed(2);
+  const comp = +(momScore*.22+valScore*.12+qualScore*.20+growScore*.13+volScore*.10+sentScore*.18+macroScore*.05).toFixed(2);
 
   // ── DOW THEORY ────────────────────────────────────
   // Dow Theory → 見後面強化區塊
@@ -4316,10 +4316,53 @@ function analyze(bars, ticker, quoteData){
   const total = score;  // 直接使用淨分
   const buy   = sigs.filter(s=>s.pt>0).reduce((a,s)=>a+s.pt, 0);
   const sell  = sigs.filter(s=>s.pt<0).reduce((a,s)=>a+Math.abs(s.pt), 0);
-  const signal = total >= 30 ? 'Strong Buy'  :
-                 total >= 15 ? 'Buy'          :
-                 total <= -30? 'Strong Sell'  :
-                 total <= -15? 'Sell'          : 'Hold';
+
+  // ══════════════════════════════════════════════════════
+  // 🧠 v13 AI 總決策公式
+  // finalScore = comp×0.40 + techNet×0.35 + q6×0.15 + riskGate×0.10
+  // ══════════════════════════════════════════════════════
+
+  // ① 技術訊號正規化 (-10 ~ +10)
+  const techNet = Math.max(-10, Math.min(10, total / 10));
+
+  // ② Queen 六大技巧 AI 分 → 已在 q6AI() 計算，此處預設 0 等待接入
+  //    實際由 renderQ6Tab 後補到 window.__q6Score
+  const q6Raw = (typeof window !== 'undefined' && window.__q6Score != null)
+                ? window.__q6Score : 5;  // 無資料時中性 5
+  const q6Norm = (q6Raw - 5) * 2;  // 0~10 → -10~+10
+
+  // ③ 風險閘門（Gate 1~3）
+  //    Gate1：頭肩頂頸線突破 → -6
+  //    Gate2：VaR95 < -7% → -4（降級）
+  //    Gate3：高波動+盤整 → -3（中性壓制）
+  const q6PatBreakout = pat && pat.breakout;
+  const gate1 = q6PatBreakout ? -6 : (pat ? -2 : 0);
+  const gate2 = (+var95 < -7) ? -4 : (+var95 < -5) ? -2 : 0;
+  const gate3 = (atrPct > 4 && chop > 61.8) ? -3 : 0;
+  const riskGate = Math.max(-10, gate1 + gate2 + gate3);
+
+  // ④ 最終整合分數 (-10 ~ +10)
+  const finalScore = +(comp*0.40 + techNet*0.35 + q6Norm*0.15 + riskGate*0.10).toFixed(2);
+
+  // ⑤ VaR 降級機制：Strong Buy → Buy, Buy → Hold
+  let rawSignal = finalScore >= 6  ? 'Strong Buy'  :
+                  finalScore >= 4  ? 'Buy'          :
+                  finalScore <= -6 ? 'Strong Sell'  :
+                  finalScore <= -4 ? 'Sell'          : 'Hold';
+  // VaR 降級（var95 < -7% 時降一級）
+  if (+var95 < -7) {
+    if (rawSignal === 'Strong Buy')  rawSignal = 'Buy';
+    else if (rawSignal === 'Buy')    rawSignal = 'Hold';
+    else if (rawSignal === 'Strong Sell') rawSignal = 'Sell';
+  }
+  // 頭肩頂突破強制覆蓋（無論其他訊號）
+  if (q6PatBreakout) {
+    if (rawSignal === 'Strong Buy' || rawSignal === 'Buy') rawSignal = 'Hold';
+  }
+  const signal = rawSignal;
+
+  // 舊版相容（讓其他顯示模組仍能用 total）
+  // total 保持為淨分，signal 使用新版 finalScore 決策
 
   // 整理道氏法則的文字說明，讓介面正確顯示
   const rule123Text = rule123Bull ? '✅ 確認多頭 (突破前高且低點墊高)' : rule123Bear ? '🔴 確認空頭 (跌破前低且高點下移)' : '⚖️ 條件未成立 (盤整或觀察中)';
@@ -4327,7 +4370,9 @@ function analyze(bars, ticker, quoteData){
 
   return {
     ticker, signal, buy_score:buy, sell_score:sell, net_score:score, total_score:total,
-    composite_score:comp, price, signals:sigs,
+    composite_score:comp, final_score:finalScore, risk_gate:riskGate,
+    gate1, gate2, gate3, q6norm:q6Norm, tech_net:techNet,
+    price, signals:sigs,
     val_grade: valGrade,  val_avg: +valAvg.toFixed(2),
     date: bars[n-1].date,
     technical:{
@@ -5907,6 +5952,7 @@ function renderOverview(d){
     ['賣出評分',d.sell_score,50,'var(--red)'],
     ['淨評分',Math.abs(d.total_score),50,d.total_score>=0?'var(--green)':'var(--red)'],
     ['7因子綜合',Math.abs(d.composite_score)*10,50,(d.composite_score||0)>=0?'var(--green)':'var(--red)'],
+    ['🧠 AI總決策分',Math.abs(d.final_score||0)*10,50,(d.final_score||0)>=0?'var(--green)':'var(--red)'],
   ].map(([lbl,val,mx,col])=>`
     <div class="sbar-row">
       <div class="sbar-lbl">${lbl}</div>
@@ -5919,7 +5965,29 @@ function renderOverview(d){
   const patBuyN  = recentPats.filter(p=>p.type==='buy').length;
   const patSellN = recentPats.filter(p=>p.type==='sell').length;
   document.getElementById('ovSigs').innerHTML=
-    `<div class="stags">${d.signals.map(s=>`<span class="stag ${s.c}">${s.t}</span>`).join('')}</div>
+    `<!-- 🧠 v13 AI 總決策分解 -->
+    <div style="background:var(--bg3);border-radius:6px;padding:10px 12px;margin-bottom:10px;border-left:3px solid ${(d.final_score||0)>=4?'var(--green)':(d.final_score||0)<=-4?'var(--red)':'var(--yellow)'}">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+        <span style="font-size:11px;font-weight:700;color:var(--text)">🧠 v13 AI 總決策分</span>
+        <span style="font-family:var(--fm);font-size:20px;font-weight:900;color:${(d.final_score||0)>=4?'var(--green)':(d.final_score||0)<=-4?'var(--red)':'var(--yellow)'}">${(d.final_score||0).toFixed(2)}</span>
+      </div>
+      <div style="font-size:9px;color:var(--text3);margin-bottom:8px">= 7因子×40% + 技術訊號×35% + 六大技巧×15% + 風控閘門×10%</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:10px">
+        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
+          7因子(comp)<br><span style="font-family:var(--fm);color:${(d.composite_score||0)>=0?'var(--green)':'var(--red)'}">${(d.composite_score||0).toFixed(2)} <span style="color:var(--text3)">×40%</span></span>
+        </div>
+        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
+          技術訊號(net)<br><span style="font-family:var(--fm);color:${(d.tech_net||0)>=0?'var(--green)':'var(--red)'}">${(d.tech_net||0).toFixed(1)} <span style="color:var(--text3)">×35%</span></span>
+        </div>
+        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
+          六大技巧(q6)<br><span style="font-family:var(--fm);color:${(d.q6norm||0)>=0?'var(--green)':'var(--red)'}">${(d.q6norm||0).toFixed(1)} <span style="color:var(--text3)">×15%</span></span>
+        </div>
+        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
+          風控閘門<br><span style="font-family:var(--fm);color:${(d.risk_gate||0)<0?'var(--red)':'var(--text3)'}">${(d.risk_gate||0).toFixed(0)} <span style="color:var(--text3)">×10%</span>${d.gate1<0?' 🚨頭肩頂':''}${d.gate2<0?' ⚠️VaR':''}${d.gate3<0?' 🌊高波動':''}</span>
+        </div>
+      </div>
+    </div>
+    <div class="stags">${d.signals.map(s=>`<span class="stag ${s.c}">${s.t}</span>`).join('')}</div>`
      <div style="margin:10px 0 6px;font-size:9px;color:var(--text3);font-family:var(--fm)">最近K線型態 (${recentPats.length})</div>
      <div class="stags">${recentPats.map(p=>`
        <span class="stag ${p.type==='buy'?'buy':p.type==='sell'?'sell':'info'}" title="${p.desc}">${p.name.split(' ')[0]}</span>
@@ -8667,37 +8735,187 @@ function q6Draw(){
 // ── AI 建議
 function q6AI(bars,pat,ticker){
   const n=bars.length,cl=bars.map(b=>b.close);
+  const hi=bars.map(b=>b.high),lo=bars.map(b=>b.low),vol=bars.map(b=>b.volume);
   const ma5=q6SMA(cl,5),ma20=q6SMA(cl,20),ma60=q6SMA(cl,60);
   const cur=cl[n-1],m5=ma5[n-1],m20=ma20[n-1],m60=ma60[n-1];
   const gaps=q6Gaps(bars);
+  const zz=q6ZZ(bars);
+
+  // ════════════════════════════════════════════════
+  // 🧠 AI 專業評分模型（滿分 100 分，加權換算 0-10）
+  // 六大維度：趨勢、動能、型態、量能、波動、風險
+  // ════════════════════════════════════════════════
+
+  let scoreDetail = {};
+
+  // ── 維度 1：趨勢強度 (25分)
+  // 均線多頭排列 15分 + 均線斜率 10分
+  const bullMA=m5>m20&&m20>m60, bearMA=m5<m20&&m20<m60;
+  const maSlope5 = n>=6?(ma5[n-1]-ma5[n-6])/ma5[n-6]*100:0;
+  const maSlope20= n>=11?(ma20[n-1]-ma20[n-11])/ma20[n-11]*100:0;
+  let s1=0;
+  if(bullMA) s1+=15;
+  else if(!bearMA) s1+=6; // 部分多頭
+  if(maSlope5>1.5) s1+=6; else if(maSlope5>0.5) s1+=4; else if(maSlope5<-1.5) s1-=4;
+  if(maSlope20>0.5) s1+=4; else if(maSlope20<-0.5) s1-=2;
+  s1=Math.max(0,Math.min(25,s1));
+  scoreDetail['趨勢強度']={score:s1,max:25,detail:bullMA?'多頭排列✅':bearMA?'空頭排列🔴':'均線交叉中⚠️'};
+
+  // ── 維度 2：動能指標 (20分)
+  // RSI 位階 10分 + MACD 訊號 10分
+  function calcRSI(prices,p=14){
+    if(prices.length<p+1)return 50;
+    let gains=0,losses=0;
+    for(let i=prices.length-p;i<prices.length;i++){
+      const d=prices[i]-prices[i-1];
+      if(d>0)gains+=d; else losses-=d;
+    }
+    const ag=gains/p,al=losses/p;
+    return al===0?100:100-100/(1+ag/al);
+  }
+  function calcMACD(prices){
+    function ema(arr,p){let k=2/(p+1),e=arr[0];for(let i=1;i<arr.length;i++)e=arr[i]*k+e*(1-k);return e;}
+    if(prices.length<27)return{hist:0,signal:0};
+    const e12=ema(prices.slice(-26),12),e26=ema(prices.slice(-26),26);
+    const macdLine=e12-e26;
+    const prev12=ema(prices.slice(-36,-1),12),prev26=ema(prices.slice(-36,-1),26);
+    const prevMACD=prev12-prev26;
+    const sig=(macdLine*0.222+prevMACD*0.778);
+    return{hist:macdLine-sig,macdLine,sig,cross:macdLine>sig&&prevMACD<=sig,death:macdLine<sig&&prevMACD>=sig};
+  }
+  const rsi=calcRSI(cl);
+  const macd=calcMACD(cl);
+  let s2=10; // 中性起點
+  // RSI：35-65 為中性，<35 超賣（逆向偏多），>70 超買（逆向偏空）
+  if(rsi<30){s2+=4;}else if(rsi<45){s2+=6;}else if(rsi<=60){s2+=4;}else if(rsi<=70){s2+=2;}else{s2-=3;}
+  // MACD：金叉加分、死叉減分、柱狀正向加分
+  if(macd.cross)s2+=5;else if(macd.death)s2-=5;
+  if(macd.hist>0)s2+=2;else s2-=2;
+  s2=Math.max(0,Math.min(20,s2));
+  scoreDetail['動能指標']={score:s2,max:20,detail:`RSI=${rsi.toFixed(0)} | MACD柱${macd.hist>0?'正向🟢':'負向🔴'}${macd.cross?' | 金叉✨':''}${macd.death?' | 死叉⚠️':''}`};
+
+  // ── 維度 3：型態訊號 (20分)
+  // 頭肩頂 -15~0分 + N字法方向 + 跳空缺口
   const recentGUp=gaps.up.filter(i=>i>=n-10).length>0;
-  const bullMA=m5>m20&&m20>m60,bearMA=m5<m20&&m20<m60;
+  const recentGDn=gaps.dn.filter(i=>i>=n-10).length>0;
+  // ZigZag 最近走向
+  const zzVals=zz.map((v,i)=>({v,i})).filter(x=>!isNaN(x.v));
+  const zzLast2=zzVals.slice(-2);
+  const zzBull=zzLast2.length>=2&&zzLast2[1].v>zzLast2[0].v;
+  let s3=10;
+  if(pat){
+    if(pat.breakout)s3-=12; // 頸線突破：強烈看空
+    else s3-=6;             // 右肩誘多：偏空警告
+  }
+  if(zzBull)s3+=5;else s3-=2;
+  if(recentGUp)s3+=5;
+  if(recentGDn)s3-=5;
+  s3=Math.max(0,Math.min(20,s3));
+  const patLabel=pat?(pat.breakout?'🚨頸線突破 -12分':'⚠️右肩誘多 -6分'):'無頭肩頂 ✅';
+  scoreDetail['型態訊號']={score:s3,max:20,detail:`${patLabel} | N字${zzBull?'↑上升':'↓下降'}${recentGUp?' | 跳空↑':recentGDn?' | 跳空↓':''}`};
 
-  let score=5;
-  if(bullMA)score+=2;else if(bearMA)score-=2;
-  if(recentGUp)score+=1;
-  if(pat){score-=2;if(pat.breakout)score-=2;}
-  if(cur>m5)score+=0.5;if(cur<m60)score-=1;
-  score=Math.min(9.5,Math.max(0.5,score));
+  // ── 維度 4：量能確認 (15分)
+  // 近5日均量 vs 前期均量比較 + 量價同向
+  const volMA5=vol.slice(-5).reduce((a,b)=>a+b,0)/5;
+  const volMA20=vol.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const volRatio=volMA20>0?volMA5/volMA20:1;
+  const priceUp5=cl[n-1]>cl[n-6>0?n-6:0];
+  let s4=7;
+  if(volRatio>1.5&&priceUp5){s4+=6;}      // 放量上漲：強烈看多
+  else if(volRatio>1.2&&priceUp5){s4+=4;} // 溫和放量上漲
+  else if(volRatio>1.5&&!priceUp5){s4-=5;}// 放量下跌：警示
+  else if(volRatio<0.7){s4-=2;}           // 縮量：信號不明
+  s4=Math.max(0,Math.min(15,s4));
+  scoreDetail['量能確認']={score:s4,max:15,detail:`量比=${volRatio.toFixed(2)} | ${priceUp5?'↑量價同向🟢':'↓量價背離⚠️'}`};
 
-  const isSB=score>=7.5,isB=score>=6,isSS=score<=2,isSl=score<=3.5;
+  // ── 維度 5：波動性評估 (10分)
+  // ATR 相對波動 + Bollinger Band 位置
+  function calcATR(p=14){
+    let atrSum=0;
+    for(let i=n-p;i<n;i++){
+      const tr=Math.max(hi[i]-lo[i],Math.abs(hi[i]-cl[i-1]||0),Math.abs(lo[i]-cl[i-1]||0));
+      atrSum+=tr;
+    }
+    return atrSum/p;
+  }
+  const atr=calcATR();
+  const atrPct=cur>0?atr/cur*100:2;
+  const bbPeriod=20,bbArr=cl.slice(-bbPeriod);
+  const bbMean=bbArr.reduce((a,b)=>a+b,0)/bbPeriod;
+  const bbStd=Math.sqrt(bbArr.reduce((a,v)=>a+(v-bbMean)**2,0)/bbPeriod);
+  const bbUpper=bbMean+2*bbStd,bbLower=bbMean-2*bbStd;
+  const bbPos=(cur-bbLower)/(bbUpper-bbLower||1); // 0=下軌,1=上軌
+  let s5=5;
+  if(bbPos<0.2)s5+=4;       // 接近下軌：低估逢低買
+  else if(bbPos<0.4)s5+=2;  // 中下段：偏多
+  else if(bbPos>0.85)s5-=3; // 接近上軌：過熱
+  else if(bbPos>0.7)s5-=1;
+  if(atrPct>4)s5-=2;        // 波動過大：風險上升
+  s5=Math.max(0,Math.min(10,s5));
+  scoreDetail['波動性評估']={score:s5,max:10,detail:`ATR%=${atrPct.toFixed(1)}% | BB位置=${(bbPos*100).toFixed(0)}%${bbPos<0.2?' 接近下軌🟢':bbPos>0.85?' 接近上軌⚠️':''}`};
+
+  // ── 維度 6：風險控管 (10分)
+  // 與 MA60 距離 + 近期最大回撤
+  const distMA60=m60>0?(cur-m60)/m60*100:0;
+  const recent20High=Math.max(...hi.slice(-20));
+  const drawdown=recent20High>0?(cur-recent20High)/recent20High*100:0;
+  let s6=5;
+  if(distMA60>0&&distMA60<8)s6+=3;       // 在MA60上方適當距離
+  else if(distMA60>=8&&distMA60<20)s6+=1;// 偏高
+  else if(distMA60>=20)s6-=2;            // 過度拉升，風險大
+  else if(distMA60<-5)s6-=3;             // 跌破MA60
+  if(drawdown>-5)s6+=2;                  // 回撤小：健康
+  else if(drawdown<-15)s6-=3;            // 深度回撤
+  s6=Math.max(0,Math.min(10,s6));
+  scoreDetail['風險控管']={score:s6,max:10,detail:`距MA60=${distMA60.toFixed(1)}% | 近期回撤=${drawdown.toFixed(1)}%`};
+
+  // ── 總分換算（滿分100 → 0~10）
+  const totalRaw=s1+s2+s3+s4+s5+s6;
+  const totalMax=100;
+  const score=+(totalRaw/totalMax*10).toFixed(1);
+
+  const isSB=score>=7.5,isB=score>=6.0,isSS=score<=2.5,isSl=score<=4.0;
   const sig=isSB?'🟢 強力建議買進':isB?'🟢 建議買進':isSS?'🔴 強力建議賣出':isSl?'🔴 建議賣出':'🟡 中性觀望';
   const sc=isSB||isB?'var(--green)':isSS||isSl?'var(--red)':'var(--yellow)';
   const em=isSB?'🚀':isB?'📈':isSS?'🔻':isSl?'📉':'⚖️';
 
-  document.getElementById('q6SignalCard').innerHTML=`
-    <div class="card-t">AI 買賣建議</div>
-    <div style="text-align:center;padding:12px 0">
-      <div style="font-size:44px;margin-bottom:8px">${em}</div>
-      <div style="font-family:var(--fh);font-size:16px;font-weight:700;color:${sc}">${sig}</div>
-      <div style="font-family:var(--fh);font-size:46px;font-weight:900;color:${sc};margin:8px 0;line-height:1">${score.toFixed(1)}</div>
-      <div style="font-size:10px;color:var(--text3);margin-bottom:12px">評分（0–10分）</div>
-      <div style="text-align:left;font-size:11px;color:var(--text2);line-height:2;background:var(--bg3);padding:8px 10px;border-radius:4px">
-        <div>現價：<span style="font-family:var(--fm);color:var(--text)">${cur.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
-        <div>MA5：<span style="font-family:var(--fm);color:#ffa500">${m5.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
-        <div>MA20：<span style="font-family:var(--fm);color:#00d4ff">${m20.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
-        <div>MA60：<span style="font-family:var(--fm);color:#ff3b5c">${m60.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
+  // 評分明細列
+  const scoreRows=Object.entries(scoreDetail).map(([k,v])=>{
+    const pct=v.max>0?v.score/v.max*100:0;
+    const barCol=pct>=70?'var(--green)':pct>=40?'var(--yellow)':'var(--red)';
+    return `<div style="margin-bottom:8px">
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px">
+        <span style="color:var(--text2)">${k}</span>
+        <span style="font-family:var(--fm);color:${barCol}">${v.score}/${v.max}</span>
       </div>
+      <div style="height:5px;background:var(--bg3);border-radius:3px;overflow:hidden">
+        <div style="width:${pct.toFixed(0)}%;height:100%;background:${barCol};border-radius:3px;transition:width .6s"></div>
+      </div>
+      <div style="font-size:9px;color:var(--text3);margin-top:2px">${v.detail}</div>
+    </div>`;
+  }).join('');
+
+  window.__q6Score = score;  // 🔗 供 v13 總覽 finalScore 使用
+  document.getElementById('q6SignalCard').innerHTML=`
+    <div class="card-t">🧠 AI 買賣建議（六維度評分）</div>
+    <div style="text-align:center;padding:10px 0 6px">
+      <div style="font-size:40px;margin-bottom:6px">${em}</div>
+      <div style="font-family:var(--fh);font-size:16px;font-weight:700;color:${sc}">${sig}</div>
+      <div style="font-family:var(--fh);font-size:48px;font-weight:900;color:${sc};margin:6px 0;line-height:1">${score.toFixed(1)}</div>
+      <div style="font-size:10px;color:var(--text3);margin-bottom:6px">總分 / 10（100分制換算）</div>
+      <!-- 大進度條 -->
+      <div style="height:8px;background:var(--bg3);border-radius:4px;overflow:hidden;margin:0 4px 14px">
+        <div style="width:${(score/10*100).toFixed(0)}%;height:100%;background:${sc};border-radius:4px;transition:width .8s"></div>
+      </div>
+    </div>
+    <!-- 六維度評分明細 -->
+    <div style="border-top:1px solid var(--border);padding-top:10px">${scoreRows}</div>
+    <!-- 快覽數據 -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:10px;font-size:11px">
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">現價<br><span style="font-family:var(--fm);color:var(--text)">${cur.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">MA60<br><span style="font-family:var(--fm);color:#ff3b5c">${m60.toLocaleString(undefined,{maximumFractionDigits:2})}</span></div>
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">RSI<br><span style="font-family:var(--fm);color:${rsi<35?'var(--green)':rsi>70?'var(--red)':'var(--cyan)'}">${rsi.toFixed(0)}</span></div>
+      <div style="background:var(--bg3);padding:6px 8px;border-radius:4px">MACD柱<br><span style="font-family:var(--fm);color:${macd.hist>0?'var(--green)':'var(--red)'}">${macd.hist>0?'正向':'負向'}</span></div>
     </div>`;
 
   const maS=bullMA?'✅ 多頭排列':bearMA?'🔴 空頭排列':'⚠️ 均線交叉中';
