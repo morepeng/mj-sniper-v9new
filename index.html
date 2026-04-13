@@ -2828,7 +2828,7 @@ async function fetchFundamentals(ticker, chartJson){
     let res0 = null;
     for(const base of ['query1','query2']){
       const d0 = await tryFetchJSON(
-        `https://${base}.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d`, 6000);
+        `https://${base}.finance.yahoo.com/v8/finance/chart/${t}?range=1d&interval=1d&modules=defaultKeyStatistics%2CfinancialData%2CsummaryDetail%2Cprice`, 6000);
       if(d0?.chart?.result?.[0]){ res0 = d0.chart.result[0]; break; }
     }
     // 合併：chartJson（有 modules）和 res0（meta 最完整）
@@ -2857,8 +2857,13 @@ async function fetchFundamentals(ticker, chartJson){
 
       // 52W — 先從 summaryDetail 找，再從 meta 找
       // meta 是台股最可靠的52W來源（summaryDetail 對台股常為null）
-      const hi52 = rv(sd.fiftyTwoWeekHigh)||meta.fiftyTwoWeekHigh||rv(pr.fiftyTwoWeekHigh)||null;
-      const lo52 = rv(sd.fiftyTwoWeekLow) ||meta.fiftyTwoWeekLow ||rv(pr.fiftyTwoWeekLow)||null;
+      // 52W — meta 值若 >1e6 視為時間戳記，捨棄
+      const _hi52raw = rv(sd.fiftyTwoWeekHigh)||rv(pr.fiftyTwoWeekHigh)||null;
+      const _lo52raw = rv(sd.fiftyTwoWeekLow) ||rv(pr.fiftyTwoWeekLow)||null;
+      const _mhi52 = (meta.fiftyTwoWeekHigh&&+meta.fiftyTwoWeekHigh<1e6)?meta.fiftyTwoWeekHigh:null;
+      const _mlo52 = (meta.fiftyTwoWeekLow &&+meta.fiftyTwoWeekLow <1e6)?meta.fiftyTwoWeekLow :null;
+      const hi52 = _hi52raw||_mhi52||null;
+      const lo52 = _lo52raw||_mlo52||null;
 
       const f0 = {
         _src:'chart_json',
@@ -4335,6 +4340,8 @@ function analyze(bars, ticker, quoteData){
   //    Gate1：頭肩頂頸線突破 → -6
   //    Gate2：VaR95 < -7% → -4（降級）
   //    Gate3：高波動+盤整 → -3（中性壓制）
+  // 頭肩頂型態偵測（q6HS 在本檔已定義，直接呼叫）
+  const pat = (typeof q6HS === 'function') ? q6HS(bars) : null;
   const q6PatBreakout = pat && pat.breakout;
   const gate1 = q6PatBreakout ? -6 : (pat ? -2 : 0);
   const gate2 = (+var95 < -7) ? -4 : (+var95 < -5) ? -2 : 0;
@@ -5964,40 +5971,50 @@ function renderOverview(d){
   const recentPats = (d.patterns||[]).slice(-6);
   const patBuyN  = recentPats.filter(p=>p.type==='buy').length;
   const patSellN = recentPats.filter(p=>p.type==='sell').length;
-  document.getElementById('ovSigs').innerHTML=
-    `<!-- 🧠 v13 AI 總決策分解 -->
-    <div style="background:var(--bg3);border-radius:6px;padding:10px 12px;margin-bottom:10px;border-left:3px solid ${(d.final_score||0)>=4?'var(--green)':(d.final_score||0)<=-4?'var(--red)':'var(--yellow)'}">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-        <span style="font-size:11px;font-weight:700;color:var(--text)">🧠 v13 AI 總決策分</span>
-        <span style="font-family:var(--fm);font-size:20px;font-weight:900;color:${(d.final_score||0)>=4?'var(--green)':(d.final_score||0)<=-4?'var(--red)':'var(--yellow)'}">${(d.final_score||0).toFixed(2)}</span>
-      </div>
-      <div style="font-size:9px;color:var(--text3);margin-bottom:8px">= 7因子×40% + 技術訊號×35% + 六大技巧×15% + 風控閘門×10%</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:10px">
-        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
-          7因子(comp)<br><span style="font-family:var(--fm);color:${(d.composite_score||0)>=0?'var(--green)':'var(--red)'}">${(d.composite_score||0).toFixed(2)} <span style="color:var(--text3)">×40%</span></span>
-        </div>
-        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
-          技術訊號(net)<br><span style="font-family:var(--fm);color:${(d.tech_net||0)>=0?'var(--green)':'var(--red)'}">${(d.tech_net||0).toFixed(1)} <span style="color:var(--text3)">×35%</span></span>
-        </div>
-        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
-          六大技巧(q6)<br><span style="font-family:var(--fm);color:${(d.q6norm||0)>=0?'var(--green)':'var(--red)'}">${(d.q6norm||0).toFixed(1)} <span style="color:var(--text3)">×15%</span></span>
-        </div>
-        <div style="background:var(--bg2);padding:4px 6px;border-radius:3px">
-          風控閘門<br><span style="font-family:var(--fm);color:${(d.risk_gate||0)<0?'var(--red)':'var(--text3)'}">${(d.risk_gate||0).toFixed(0)} <span style="color:var(--text3)">×10%</span>${d.gate1<0?' 🚨頭肩頂':''}${d.gate2<0?' ⚠️VaR':''}${d.gate3<0?' 🌊高波動':''}</span>
-        </div>
-      </div>
-    </div>
-    <div class="stags">${d.signals.map(s=>`<span class="stag ${s.c}">${s.t}</span>`).join('')}</div>`
-     <div style="margin:10px 0 6px;font-size:9px;color:var(--text3);font-family:var(--fm)">最近K線型態 (${recentPats.length})</div>
-     <div class="stags">${recentPats.map(p=>`
-       <span class="stag ${p.type==='buy'?'buy':p.type==='sell'?'sell':'info'}" title="${p.desc}">${p.name.split(' ')[0]}</span>
-     `).join('')||'<span style="font-size:11px;color:var(--text3)">未偵測到型態</span>'}</div>
-     <div style="margin-top:10px;font-size:10px;color:var(--text3);font-family:var(--fm)">
-       技術信號: <span class="pos">${d.signals.filter(s=>s.c==='buy').length}買</span> /
-                 <span class="neg">${d.signals.filter(s=>s.c==='sell').length}賣</span> ·
-       K線型態: <span class="pos">${patBuyN}看多</span> /
-                <span class="neg">${patSellN}看空</span>
-     </div>`;
+  (function(){
+    const fs = d.final_score||0;
+    const fsCol = fs>=4?'var(--green)':fs<=-4?'var(--red)':'var(--yellow)';
+    const compV = d.composite_score||0;
+    const tnV   = d.tech_net||0;
+    const q6V   = d.q6norm||0;
+    const rgV   = d.risk_gate||0;
+    const g1    = d.gate1||0, g2=d.gate2||0, g3=d.gate3||0;
+    const gateTag = (g1<0?'&nbsp;🚨頭肩頂':'')+(g2<0?'&nbsp;⚠️VaR':'')+(g3<0?'&nbsp;🌊高波動':'');
+    const recentPats = (d.patterns||[]).slice(-6);
+    const patBuyN  = recentPats.filter(p=>p.type==='buy').length;
+    const patSellN = recentPats.filter(p=>p.type==='sell').length;
+    const patHtml  = recentPats.map(p=>{
+      const cls = p.type==='buy'?'buy':p.type==='sell'?'sell':'info';
+      return '<span class="stag '+cls+'" title="'+p.desc+'">'+p.name.split(' ')[0]+'</span>';
+    }).join('')||'<span style="font-size:11px;color:var(--text3)">未偵測到型態</span>';
+    const sigsHtml = d.signals.map(s=>'<span class="stag '+s.c+'">'+s.t+'</span>').join('');
+    document.getElementById('ovSigs').innerHTML =
+      '<div style="background:var(--bg3);border-radius:6px;padding:10px 12px;margin-bottom:10px;border-left:3px solid '+fsCol+'">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">'
+      +'<span style="font-size:11px;font-weight:700;color:var(--text)">🧠 v13 AI 總決策分</span>'
+      +'<span style="font-family:var(--fm);font-size:20px;font-weight:900;color:'+fsCol+'">'+fs.toFixed(2)+'</span>'
+      +'</div>'
+      +'<div style="font-size:9px;color:var(--text3);margin-bottom:8px">= 7因子×40% + 技術訊號×35% + 六大技巧×15% + 風控閘門×10%</div>'
+      +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:10px">'
+      +'<div style="background:var(--bg2);padding:4px 6px;border-radius:3px">7因子(comp)<br>'
+      +'<span style="font-family:var(--fm);color:'+(compV>=0?'var(--green)':'var(--red)')+'">'+compV.toFixed(2)+' <span style="color:var(--text3)">×40%</span></span></div>'
+      +'<div style="background:var(--bg2);padding:4px 6px;border-radius:3px">技術訊號(net)<br>'
+      +'<span style="font-family:var(--fm);color:'+(tnV>=0?'var(--green)':'var(--red)')+'">'+tnV.toFixed(1)+' <span style="color:var(--text3)">×35%</span></span></div>'
+      +'<div style="background:var(--bg2);padding:4px 6px;border-radius:3px">六大技巧(q6)<br>'
+      +'<span style="font-family:var(--fm);color:'+(q6V>=0?'var(--green)':'var(--red)')+'">'+q6V.toFixed(1)+' <span style="color:var(--text3)">×15%</span></span></div>'
+      +'<div style="background:var(--bg2);padding:4px 6px;border-radius:3px">風控閘門<br>'
+      +'<span style="font-family:var(--fm);color:'+(rgV<0?'var(--red)':'var(--text3)')+'">'+rgV.toFixed(0)+' <span style="color:var(--text3)">×10%</span>'+gateTag+'</span></div>'
+      +'</div></div>'
+      +'<div class="stags">'+sigsHtml+'</div>'
+      +'<div style="margin:10px 0 6px;font-size:9px;color:var(--text3);font-family:var(--fm)">最近K線型態 ('+recentPats.length+')</div>'
+      +'<div class="stags">'+patHtml+'</div>'
+      +'<div style="margin-top:10px;font-size:10px;color:var(--text3);font-family:var(--fm)">'
+      +'技術信號: <span class="pos">'+d.signals.filter(s=>s.c==='buy').length+'買</span> / '
+      +'<span class="neg">'+d.signals.filter(s=>s.c==='sell').length+'賣</span> · '
+      +'K線型態: <span class="pos">'+patBuyN+'看多</span> / '
+      +'<span class="neg">'+patSellN+'看空</span>'
+      +'</div>';
+  })();
 
   // Candlestick chart
   drawCandleChart(d.chart_data||[], d.technical, d.patterns||[]);
@@ -8477,22 +8494,22 @@ function mobSwitch(tab){
 // 攔截 showPanel 以同步手機 tab
 const _origShowPanel = typeof showPanel !== 'undefined' ? showPanel : null;
 
-/* ── PWA Service Worker ── */
-if('serviceWorker' in navigator){
+/* ── PWA Service Worker（僅 https 環境啟用，file:// 本地直接跳過）── */
+if('serviceWorker' in navigator && location.protocol === 'https:'){
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('./sw.js')
       .then(reg => {
         console.log('[SW] 已登記:', reg.scope);
-        // 強制更新 SW（避免舊版攔截 API 請求）
         reg.update();
         if(reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
       })
       .catch(e => console.warn('[SW] 登記失敗:', e));
-    // 監聽新 SW 啟用
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       console.log('[SW] 新版 SW 已接管');
     });
   });
+} else if(location.protocol !== 'https:'){
+  console.info('[SW] 本地 file:// 模式，略過 ServiceWorker 登記');
 }
 
 /* ── PWA A2HS 安裝 ── */
