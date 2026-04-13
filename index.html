@@ -5385,6 +5385,136 @@ async function renderTX(){
     </div>
   </div>
 
+  <!-- ══ 個股實戰買點燈號（台指期 × 個股均線雙重確認）══ -->
+  <div class="card mb">
+    <div class="card-t">🎯 個股實戰買點燈號
+      <span style="font-size:9px;color:var(--text3);margin-left:8px">台指期方向 × 個股均線雙重確認</span>
+    </div>
+    ${(()=>{
+      // ── 取個股資料（已載入的分析標的）
+      const D2 = window._mjD || window.D || {};
+      const tkr = (D2.ticker||'').toUpperCase();
+      const stkP2 = parseFloat(D2.price||0)||0;
+      const isTW2 = /\.(TW|TWO)$/i.test(tkr);
+      const tech2 = D2.technical||{};
+      const ma5v  = parseFloat(tech2.ema8||tech2.ema20||0)||0;  // 用 EMA8 當短均線替代
+      const ma20v = parseFloat(tech2.ema20||0)||0;
+      const ma60v = parseFloat(tech2.ema50||0)||0;
+      const aboveMA5  = stkP2>0 && ma5v>0  && stkP2>ma5v;
+      const aboveMA20 = stkP2>0 && ma20v>0 && stkP2>ma20v;
+      const aboveMA60 = stkP2>0 && ma60v>0 && stkP2>ma60v;
+
+      // ── 台指期強度分類（對應 Python gap 判斷）
+      const gapV = gap||0;
+      const txStrong  = gapV > 50;
+      const txWeak    = gapV < -50;
+      const txMid     = gapV > 15 && gapV <= 50;
+      const txNeutral = Math.abs(gapV) <= 15;
+
+      // ── 五種燈號判斷
+      let light, lightColor, lightBorder, lightIcon, lightTitle, lightRows=[];
+
+      if(txStrong && aboveMA5 && aboveMA20){
+        light='🚀 最佳買點';
+        lightColor='var(--green)'; lightBorder='var(--green)';
+        lightIcon='🚀';
+        lightTitle='台指期強勢 + 個股站上短中均線 → 雙重確認，積極分批買進';
+        lightRows=[
+          ['台指期方向','🟢 強勢上漲 +'+gapV.toFixed(0)+'點','var(--green)'],
+          ['站上 MA5（短線）',aboveMA5?'✅ 是':'❌ 否',aboveMA5?'var(--green)':'var(--red)'],
+          ['站上 MA20（中線）',aboveMA20?'✅ 是':'❌ 否',aboveMA20?'var(--green)':'var(--red)'],
+          ['建議操作','開盤後等5分鐘量能確認，分批買進','var(--cyan)'],
+        ];
+      } else if(txStrong && aboveMA5 && !aboveMA20){
+        light='📈 謹慎買進';
+        lightColor='#7fff7f'; lightBorder='#7fff7f';
+        lightIcon='📈';
+        lightTitle='台指期強勢，但個股尚未突破中線 → 謹慎分批，控制倉位';
+        lightRows=[
+          ['台指期方向','🟢 強勢上漲 +'+gapV.toFixed(0)+'點','var(--green)'],
+          ['站上 MA5（短線）',aboveMA5?'✅ 是':'❌ 否',aboveMA5?'var(--green)':'var(--red)'],
+          ['站上 MA20（中線）',aboveMA20?'✅ 是':'❌ 否','var(--yellow)'],
+          ['建議操作','輕倉進場，MA20 突破後再加碼','var(--yellow)'],
+        ];
+      } else if((txMid || txNeutral) && aboveMA5){
+        light='🟡 觀察進場';
+        lightColor='var(--yellow)'; lightBorder='var(--yellow)';
+        lightIcon='🟡';
+        lightTitle='台指期中性，個股站上短均 → 等待台指期明確方向再進場';
+        lightRows=[
+          ['台指期方向','⚪ 震盪 '+( gapV>=0?'+':'')+gapV.toFixed(0)+'點','var(--cyan)'],
+          ['站上 MA5（短線）',aboveMA5?'✅ 是':'❌ 否',aboveMA5?'var(--green)':'var(--yellow)'],
+          ['站上 MA20（中線）',aboveMA20?'✅ 是':'❌ 否',aboveMA20?'var(--green)':'var(--text3)'],
+          ['建議操作','等台指期 > +30 點再確認進場','var(--yellow)'],
+        ];
+      } else if(txWeak || (!aboveMA5 && !aboveMA20)){
+        light='🔴 避免追高';
+        lightColor='var(--red)'; lightBorder='var(--red)';
+        lightIcon='🔴';
+        lightTitle='台指期弱勢 或 個股跌破均線 → 不宜追高，等回測支撐';
+        lightRows=[
+          ['台指期方向',txWeak?'🔴 弱勢 '+gapV.toFixed(0)+'點':'⚠️ 震盪','var(--red)'],
+          ['站上 MA5（短線）',aboveMA5?'✅ 是':'❌ 否',aboveMA5?'var(--green)':'var(--red)'],
+          ['站上 MA20（中線）',aboveMA20?'✅ 是':'❌ 否',aboveMA20?'var(--green)':'var(--red)'],
+          ['建議操作','等台指期轉多 + 個股站回均線再進場','var(--orange)'],
+        ];
+      } else {
+        light='⚪ 中性觀望';
+        lightColor='var(--cyan)'; lightBorder='var(--cyan)';
+        lightIcon='⚖️';
+        lightTitle='條件尚未成立 → 觀望等待更明確訊號';
+        lightRows=[
+          ['台指期方向','⚪ 中性 '+(gapV>=0?'+':'')+gapV.toFixed(0)+'點','var(--cyan)'],
+          ['站上 MA5（短線）',aboveMA5?'✅ 是':'❌ 否',aboveMA5?'var(--green)':'var(--text3)'],
+          ['站上 MA20（中線）',aboveMA20?'✅ 是':'❌ 否',aboveMA20?'var(--green)':'var(--text3)'],
+          ['建議操作','等待訊號組合成立','var(--text3)'],
+        ];
+      }
+
+      // ── 燈號主卡
+      const rowsHtml = lightRows.map(r=>
+        '<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border);font-size:10px">'
+        +'<span style="color:var(--text2)">'+r[0]+'</span>'
+        +'<span style="font-weight:700;color:'+r[2]+'">'+r[1]+'</span>'
+        +'</div>'
+      ).join('');
+
+      // ── 三燈條件說明
+      const cond1 = txStrong;
+      const cond2 = aboveMA5;
+      const cond3 = aboveMA20;
+      const condBar = [
+        ['台指期強勢(>50點)', cond1],
+        ['站上MA5短均線',     cond2],
+        ['站上MA20中均線',    cond3],
+      ].map(([label,ok])=>
+        '<div style="display:flex;align-items:center;gap:6px;font-size:10px;margin-bottom:4px">'
+        +'<div style="width:12px;height:12px;border-radius:50%;background:'+(ok?'var(--green)':'var(--bg3)')+';border:1px solid '+(ok?'var(--green)':'var(--border)')+'"></div>'
+        +'<span style="color:'+(ok?'var(--text)':'var(--text3)')+'">'+label+'</span>'
+        +'</div>'
+      ).join('');
+
+      const stockLabel = tkr ? (tkr+' '+( stkP2>0?stkP2.toLocaleString()+'元':'' )) : '（請先輸入股票代碼分析）';
+
+      return '<div style="border:2px solid '+lightBorder+';border-radius:8px;padding:12px 14px;margin-bottom:12px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">'
+        +'<div style="font-size:24px">'+lightIcon+'</div>'
+        +'<div style="text-align:right"><div style="font-size:14px;font-weight:900;color:'+lightColor+'">'+light+'</div>'
+        +'<div style="font-size:9px;color:var(--text3);margin-top:2px">'+stockLabel+'</div></div>'
+        +'</div>'
+        +'<div style="font-size:10px;color:var(--text2);margin-bottom:10px;line-height:1.6">'+lightTitle+'</div>'
+        +rowsHtml
+        +'</div>'
+        +'<div style="font-size:10px;color:var(--text3);margin-bottom:8px;font-weight:700">📋 三燈確認條件</div>'
+        +condBar
+        +'<div style="margin-top:10px;padding:8px 10px;background:var(--bg3);border-radius:6px;font-size:9px;color:var(--text3);line-height:1.8">'
+        +'🔑 <b style="color:var(--text2)">實戰口訣：</b>'
+        +'台指期夜盤強勢 + 個股站上短均線 = 最佳買點<br>'
+        +'⚠️ 若無已載入個股，請先於上方輸入代碼（如 2330.TW）並點擊分析'
+        +'</div>';
+    })()}
+  </div>
+
   <!-- ══ 個股避險計算（完全對應 Python calculate_tsmc_hedge）══ -->
   <div class="card mb">
     <div class="card-t">🛡️ 單一股票避險策略
