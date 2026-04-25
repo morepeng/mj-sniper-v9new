@@ -5055,14 +5055,15 @@ async function doAnalyze(){
       setProgress('score', '重新評分（含估值）…',
         `${fund._src||'YF'} | PE=${fund.pe!=null?fund.pe.toFixed(1):'N/A'} EPS=${fund.eps!=null?fund.eps.toFixed(2):'N/A'}`);
       D = analyze(bars, ticker, fund);
-      D.ticker = ticker; D.price = bars[bars.length-1]?.close||0; window._mjD = D; D._klineData = D.all_chart_data || bars;  // 含指標
+      D.ticker = ticker; D.price = bars[bars.length-1]?.close||0;
+      D._bars = bars; D._klineData = D.all_chart_data || bars;
+      // ── OFI 先算完再渲染，確保 SMC 欄位不閃爛
+      try{ D.technical = calcOFIAndRegime(D._bars||bars||[], D.technical||{}); }catch(e){}
+      try{ applyOFIScoring(D); }catch(e){}
+      window._mjD = D;
       setProgress('render', '更新估值面板…', `${fund._count}項財務數據`);
       renderAll(D);
     if(activeTab==='tx') try{renderTX();}catch(e){}
-      // ── OFI + ML動量 + 波動率政權（主流程即時計算，所有市場通用）
-      try{ D.technical = calcOFIAndRegime(D._bars||[], D.technical||{}); }catch(e){}
-      try{ applyOFIScoring(D); }catch(e){}
-      try{ renderSMC(D); }catch(e){}
       if(window.innerWidth <= 768) showPanel('overview');
     }
     setProgress('done', '分析完成！', `${ticker} - ${D.signal}`);
@@ -5129,8 +5130,10 @@ async function doAnalyze(){
               if(!D.signals) D.signals = [];
               reasons.forEach(r => D.signals.push({ t:r, c:'chip', pt: bonus > 0 ? Math.ceil(bonus/reasons.length) : Math.floor(bonus/reasons.length) }));
               D._inst3 = { signal:inst.signal, score:inst.score, foreign_consec_buy:fBuy, foreign_consec_sell:fSell, trust_consec_buy:tBuy, margin_change_pct:mbChg, margin_balance:inst.margin_balance || 0, short_balance:inst.short_balance || 0, bonus, reasons, data_source:inst.data_source };
-              try{ renderAll(D); if(activeTab==='tx') try{renderTX();}catch(e){} }catch(e){}
-          try{ renderSMC(D); }catch(e){}
+              try{ D.technical = calcOFIAndRegime(D._bars||[], D.technical||{}); }catch(e){}
+          try{ applyOFIScoring(D); }catch(e){}
+          window._mjD = D;
+          try{ renderAll(D); if(activeTab==='tx') try{renderTX();}catch(e){} }catch(e){}
             }
             if(window._INST3_CACHE?.[instKey]){ applyInstScore(window._INST3_CACHE[instKey]); }
             else { setTimeout(()=>{ if(window._INST3_CACHE?.[instKey]) applyInstScore(window._INST3_CACHE[instKey]); }, 4000); }
