@@ -8608,11 +8608,25 @@ function mobSwitch(tab){
     window.scrollTo(0, 0);
   }
 }
-// 攔截 showPanel 以同步手機 tab
+
+// 攔截 showPanel 以同步手機 tab (確保電腦端點擊時，手機底部按鈕也能同步反白)
 const _origShowPanel = typeof showPanel !== 'undefined' ? showPanel : null;
+if (_origShowPanel) {
+  window.showPanel = function(tabId) {
+    _origShowPanel(tabId);
+    _curMobTab = tabId;
+    _MOB_TABS.forEach(t => {
+      const btn = document.getElementById('mtab-'+t);
+      if(btn) btn.classList.toggle('active', t===tabId);
+    });
+  };
+}
 
 /* ── PWA Service Worker（僅 https 環境啟用，file:// 本地直接跳過）── */
-if('serviceWorker' in navigator && const isSecure = ...){
+// ★ 重大語法錯誤修正：將變數宣告移出 if 條件式之外
+const isSecureEnvironment = location.protocol === 'https:' || location.hostname === 'localhost';
+
+if('serviceWorker' in navigator && isSecureEnvironment){
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('./sw.js')
       .then(reg => {
@@ -8625,8 +8639,8 @@ if('serviceWorker' in navigator && const isSecure = ...){
       console.log('[SW] 新版 SW 已接管');
     });
   });
-} else if(location.protocol !== 'https:'){
-  console.info('[SW] 本地 file:// 模式，略過 ServiceWorker 登記');
+} else if(location.protocol !== 'https:' && location.hostname !== 'localhost'){
+  console.info('[SW] 本地 file:// 模式或非安全環境，略過 ServiceWorker 登記');
 }
 
 /* ── PWA A2HS 安裝 ── */
@@ -8659,6 +8673,7 @@ window.addEventListener('resize', () => {
     document.querySelectorAll('.mob-tabbar').forEach(el => el.style.display='flex');
   }
 });
+</script>
 // ═══════════════════════════════════════════════════════════
 // 👑 Queen怜 六大技巧實戰分析引擎 v2.0
 // 修正：台股/美股/港股/指數 多端點自動切換
