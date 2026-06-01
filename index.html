@@ -1353,6 +1353,19 @@ function runBacktest(bars, ticker){
 //  PCR > 1.2：市場極度悲觀 → 看多逆向訊號 (+5分)
 // ══════════════════════════════════════════════════════════════════
 const _pcrCache = {};
+const FUND_MODULES = 'financialData,defaultKeyStatistics,summaryDetail,price,institutionOwnership';
+async function tryFetchJSON(url, timeoutMs=8000){
+  const ctrl = new AbortController();
+  const tid = setTimeout(()=>ctrl.abort(), timeoutMs||8000);
+  try{
+    const r = await fetch(url, {cache:'no-store', credentials:'omit', signal: ctrl.signal});
+    if(!r.ok) return null;
+    return await r.json();
+  }catch(e){
+    return null;
+  }finally{ clearTimeout(tid); }
+}
+
 
 async function fetchPCR(ticker){
   const isUS = !/\.(TW|TWO|HK|SS|SZ)$/i.test(ticker);
@@ -2458,272 +2471,23 @@ function renderCrossborderCard(cb, ticker){
 
 function renderOptionsCard(opt){
   const tk = window._lastTicker||'';
-  if(opt.signal==='N/A'){
-    // 非美股
-    if(!opt.reason||opt.reason==='非美股市場') return '';
-    // 需要 API Key
-    if(opt.source==='no_key') return `
-    <div class="card mb" id="pcrApiCard">
-      <div class="card-t">PUT/CALL RATIO — 需要 API Key</div>
-      <div style="font-size:11px;color:var(--text2);line-height:1.8;margin-bottom:12px">
-        ${(opt.details||[]).map(s=>`<div>${s}</div>`).join('')}
-      </div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <div style="display:flex;gap:6px;align-items:center">
-          <input id="tradierKeyInput" type="password" placeholder="Tradier Sandbox Token（免費）"
-            style="flex:1;background:var(--bg3);border:1px solid var(--border2);color:var(--text);
-            font-family:var(--fm);font-size:12px;padding:7px 10px;border-radius:4px;outline:none"
-            value="${window._TRADIER_TOKEN||localStorage.getItem('tradier_token')||''}">
-          <button onclick="
-            const v=document.getElementById('tradierKeyInput').value.trim();
-            if(v){window._TRADIER_TOKEN=v;try{localStorage.setItem('tradier_token',v);}catch(_){}
-            if(window._OPT_CACHE) delete window._OPT_CACHE['opt_${tk}_'+new Date().toISOString().slice(0,10)];
-            const el=document.getElementById('pcrApiCard');
-            if(el) el.outerHTML='<div class=\'card mb\'><div class=\'card-t\'>PUT/CALL RATIO</div><div style=\'color:var(--cyan);font-family:var(--fm);font-size:11px\'>⏳ 重新載入中...</div></div>';
-            fetchOptionsFlow('${tk}').then(o=>{
-              const wrap=document.querySelector('[data-pcr-wrap]');
-              if(wrap) wrap.outerHTML=renderOptionsCard(o);
-            });}"
-            style="background:var(--cyan);color:#000;border:none;border-radius:4px;
-            padding:7px 14px;font-family:var(--fh);font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap">
-            套用
-          </button>
-        </div>
-        <div style="font-size:10px;color:var(--text3)">
-          → <a href="https://developer.tradier.com/user/sign_up" target="_blank" rel="noopener" style="color:var(--cyan)">Tradier 免費申請</a>
-          ｜ <a href="https://finance.yahoo.com/quote/${encodeURIComponent(tk)}/options/" target="_blank" rel="noopener" style="color:var(--cyan)">Yahoo Options 手動查看 →</a>
-        </div>
-      </div>
-    </div>`;
-    // 其他 N/A
-    return `<div class="card mb"><div class="card-t">PUT/CALL RATIO</div>
-      <div style="color:var(--yellow);font-size:12px;margin-bottom:8px">${opt.reason}</div>
-      <div style="font-size:10px;color:var(--text3);line-height:1.8">${(opt.details||[]).map(s=>`<div>${s}</div>`).join('')}</div>
-    </div>`;
-  }
-  const pcr=opt.put_call_ratio||0;
-  const pcrCol=pcr<0.75?'var(--green)':pcr>1.25?'var(--red)':'var(--yellow)';
-  const sigColor=opt.signal.includes('Buy')?'var(--green)':opt.signal.includes('Sell')?'var(--red)':'var(--cyan)';
-  const sigEmoji=opt.signal==='Strong Buy'?'🚀':opt.signal==='Buy'?'📈':opt.signal==='Strong Sell'?'🔻':opt.signal==='Sell'?'📉':'⚖️';
-  const scoreCol=opt.score>0?'var(--green)':opt.score<0?'var(--red)':'var(--text3)';
-  const unusualBadge=opt.unusual_activity?`<span style="color:var(--orange);font-size:10px;margin-left:6px">⚡異常</span>`:'';
-  const callPct=opt.total_volume>0?Math.round(opt.call_volume/opt.total_volume*100):50;
-  const putPct=100-callPct;
-  const srcMap={'tradier_sandbox':'Tradier(免費)','polygon_io':'Polygon.io','yahoo_proxy':'Yahoo Proxy','html_scrape':'HTML抓取','crumb_api':'Crumb API','direct_api':'Direct API'};
-  const srcLabel=srcMap[opt.source]||opt.source||'N/A';
-  const nearLabel=(opt.near_exp_count||0)>0?`近${opt.near_exp_count}到期日(45天內)`:'最近到期';
-  const nd=opt.net_delta;
-  const ndHTML=nd!=null?`<span style="font-family:var(--fm);font-size:10px;color:${nd>0?'var(--green)':'var(--red)'};margin-left:6px">Δ${nd>0?'+':''}${nd}</span>`:'';
-  const pcrPct=Math.min(97,Math.max(2,(pcr/2)*100)).toFixed(0);
-  return `<div class="card mb" data-pcr-wrap>
-    <div class="card-t">PUT/CALL RATIO${unusualBadge}</div>
-    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
-      <div style="font-size:36px;line-height:1;flex-shrink:0">${sigEmoji}</div>
-      <div style="flex:1;min-width:0">
-        <div style="font-family:var(--fh);font-size:15px;font-weight:700;color:${sigColor}">${opt.signal}</div>
-        <div style="display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-top:4px">
-          <span style="font-size:10px;color:var(--text3)">${nearLabel}</span>${ndHTML}
-        </div>
-      </div>
-      <div style="text-align:right;flex-shrink:0">
-        <div style="font-family:var(--fh);font-size:20px;color:${scoreCol}">${opt.score>0?'+':''}${opt.score}</div>
-        <div style="font-size:9px;color:var(--text3)">評分</div>
-      </div>
+  if(opt && opt.signal==='N/A' && (!opt.reason || opt.reason==='非美股市場')) return '';
+  return `
+  <div class="card mb" id="optionsMiniCard" style="margin-top:12px;border:1px solid var(--cyan);">
+    <div class="card-t">🎯 期權異動掃描</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px">
+      <input id="optTickerInputFixed" type="text" placeholder="AAPL / MSFT / NVDA / TSLA" value="${tk}"
+        style="flex:1;min-width:180px;background:var(--bg2);color:var(--text1);border:1px solid var(--border);border-radius:4px;padding:8px 10px;font-size:12px;font-family:var(--fm);outline:none">
+      <button id="optAnalyzeBtnFixed" style="background:var(--cyan);color:#000;border:none;border-radius:4px;padding:8px 14px;font-size:12px;font-weight:700;cursor:pointer">分析期權</button>
     </div>
-    <div style="margin-bottom:12px">
-      <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--text3);margin-bottom:4px">
-        <span>看多 0</span><span>中性 1.0</span><span>看空 2+</span>
-      </div>
-      <div style="height:8px;background:var(--bg3);border-radius:4px;overflow:hidden;position:relative">
-        <div style="position:absolute;left:0;top:0;height:100%;width:33%;background:linear-gradient(90deg,var(--green),var(--yellow));opacity:.45;border-radius:4px 0 0 4px"></div>
-        <div style="position:absolute;left:33%;top:0;height:100%;width:34%;background:var(--yellow);opacity:.3"></div>
-        <div style="position:absolute;left:67%;top:0;height:100%;width:33%;background:linear-gradient(90deg,var(--yellow),var(--red));opacity:.45;border-radius:0 4px 4px 0"></div>
-        <div style="position:absolute;top:-2px;width:12px;height:12px;border-radius:50%;background:${pcrCol};border:2px solid var(--bg2);left:calc(${pcrPct}% - 6px);box-shadow:0 0 6px ${pcrCol}"></div>
-      </div>
-      <div style="text-align:center;font-family:var(--fm);font-size:22px;font-weight:700;color:${pcrCol};margin-top:6px">${pcr.toFixed(3)}</div>
-    </div>
-    <div style="margin-bottom:10px">
-      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px">
-        <span style="color:var(--green)">Call ${callPct}%　${(opt.call_volume||0).toLocaleString()}</span>
-        <span style="color:var(--red)">Put ${putPct}%　${(opt.put_volume||0).toLocaleString()}</span>
-      </div>
-      <div style="height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;display:flex">
-        <div style="width:${callPct}%;background:var(--green);opacity:.75;transition:width .5s"></div>
-        <div style="width:${putPct}%;background:var(--red);opacity:.75;transition:width .5s"></div>
-      </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px">
-      <div style="background:var(--bg3);padding:7px 10px;border-radius:4px">
-        <div style="color:var(--text3);font-size:9px;margin-bottom:2px">Call OI</div>
-        <div style="color:var(--green);font-family:var(--fm);font-size:13px">${(opt.call_oi||0).toLocaleString()}</div>
-      </div>
-      <div style="background:var(--bg3);padding:7px 10px;border-radius:4px">
-        <div style="color:var(--text3);font-size:9px;margin-bottom:2px">Put OI</div>
-        <div style="color:var(--red);font-family:var(--fm);font-size:13px">${(opt.put_oi||0).toLocaleString()}</div>
-      </div>
-    </div>
-    <div style="font-size:10px;color:var(--text2);line-height:2;margin-bottom:8px">
-      ${(opt.details||[]).map(s=>`<div>${s}</div>`).join('')}
-    </div>
-    <div style="font-size:9px;color:var(--text3)">
-      近月到期：${opt.exp_date||'—'} ｜ 來源：${srcLabel}
-      ${tk?` ｜ <a href="https://finance.yahoo.com/quote/${encodeURIComponent(tk)}/options/" target="_blank" rel="noopener" style="color:var(--cyan)">Yahoo →</a>`:''}
-      ｜ <span style="cursor:pointer;color:var(--border2)" onclick="localStorage.removeItem('tradier_token');window._TRADIER_TOKEN='';if(window._OPT_CACHE)window._OPT_CACHE={};alert('Token 已清除，重新分析以更換')">⚙️設定Token</span>
-    </div>
+    <div style="margin-top:8px;color:var(--text3);font-size:10px;line-height:1.8">有資料顯示期權結果；抓不到時整塊切換成 RSI 反推卡。</div>
+    <div id="optStatusFixed" style="margin-top:8px;color:var(--yellow);font-size:11px">待分析</div>
+    <div id="optPcrFixed" style="margin-top:6px;color:var(--yellow);font-size:11px"></div>
+    <div id="optScoreFixed" style="margin-top:6px;color:var(--cyan);font-size:11px"></div>
+    <div id="optResultFixed" style="margin-top:10px"></div>
   </div>`;
 }
 
-
-
-const YF_CORS_PROXIES = [
-  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-];
-
-async function fetchWithTimeout(url, opts={}, ms=9000){
-  const ctrl = new AbortController();
-  const id   = setTimeout(()=>ctrl.abort(), ms);
-  try{
-    const r = await fetch(url, {...opts, signal:ctrl.signal});
-    clearTimeout(id); return r;
-  }catch(e){ clearTimeout(id); throw e; }
-}
-
-async function tryFetchJSON(url, ms=9000){
-  /** 智能 CORS fetch：直連+並發代理，Yahoo 專用 headers */
-  function unwrap(txt){
-    if(!txt || txt.length < 10) return null;
-    if(txt.trimStart().startsWith('<')) return null; // HTML 錯誤頁面
-    let d;
-    try{ d = JSON.parse(txt); }catch(_){ return null; }
-    if(d && typeof d.contents === 'string'){
-      try{ d = JSON.parse(d.contents); }catch(_){ return null; }
-    }
-    if(!d || typeof d !== 'object') return null;
-    // 過濾 Service Worker 離線錯誤回應
-    if(d.error === 'offline' || d.error === 'sw_offline') return null;
-    // 過濾 Alpha Vantage 頻率限制
-    if(typeof d.Information === 'string' && d.Information.includes('Thank you')) return null;
-    if(typeof d.Note === 'string' && d.Note.includes('API call frequency')) return null;
-    return d;
-  }
-  const isYahoo = url.includes('yahoo.com');
-  // cache:'no-store' 強制繞過 Service Worker 快取攔截
-  const fetchOpts = {
-    mode: 'cors',
-    credentials: 'omit',
-    cache: 'no-store',   // ← 關鍵：繞過 SW
-    headers: isYahoo ? {
-      'Accept': 'application/json, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-    } : {},
-  };
-  // ① 直連（含 no-store）
-  try{
-    const r = await fetchWithTimeout(url, fetchOpts, ms);
-    if(r.ok){
-      const d = unwrap(await r.text());
-      if(d) return d;
-    }
-  }catch(_){}
-  // ② 三個 CORS 代理並發（最快成功者回傳）
-  const proxyResults = await Promise.allSettled(
-    CORS_PROXIES.map(mk =>
-      fetchWithTimeout(mk(url), {cache:'no-store'}, Math.min(ms+5000, 20000))
-        .then(r => r.ok ? r.text() : Promise.reject('HTTP '+r.status))
-        .then(txt => { const d=unwrap(txt); if(!d) throw new Error('parse fail'); return d; })
-    )
-  );
-  for(const r of proxyResults){
-    if(r.status==='fulfilled' && r.value) return r.value;
-  }
-  return null;
-}
-
-async function _fetchFinnhub(ticker){
-  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ|US)$/i,'').toUpperCase();
-  const base = 'https://finnhub.io/api/v1';
-  const [metricRes, profileRes] = await Promise.allSettled([
-    tryFetchJSON(`${base}/stock/metric?symbol=${sym}&metric=all&token=${FINNHUB_KEY}`, 7000),
-    tryFetchJSON(`${base}/stock/profile2?symbol=${sym}&token=${FINNHUB_KEY}`, 5000),
-  ]);
-  const m  = metricRes.status==='fulfilled'  ? metricRes.value?.metric  : null;
-  const pr = profileRes.status==='fulfilled' ? profileRes.value          : null;
-  if(!m || Object.keys(m).length < 3) return null;
-
-  // Finnhub metric 欄位（百分比已是整數如 25.3 代表 25.3%，需除以100）
-  const fh_pct = v => (v != null && !isNaN(v)) ? v/100 : null;
-  const fh_num = v => (v != null && !isNaN(v)) ? v     : null;
-
-  return {
-    _src: 'finnhub',
-    pe:        fh_num(m['peTTM'])                     ?? fh_num(m['peBasicExclExtraTTM'])      ?? null,
-    forwardPE: fh_num(m['forwardPE'])                 ?? null,
-    pb:        fh_num(m['pbAnnual'])                  ?? fh_num(m['pbQuarterly'])              ?? null,
-    peg:       null,
-    evEbitda:  fh_num(m['evEbitdaAnnual'])            ?? fh_num(m['evEbitdaTTM'])              ?? null,
-    eps:       fh_num(m['epsNormalizedAnnual'])        ?? fh_num(m['epsBasicExclExtraItemsAnnual']) ?? null,
-    bv:        fh_num(m['bookValuePerShareAnnual'])    ?? fh_num(m['bookValuePerShareQuarterly']) ?? null,
-    mktCap:    pr?.marketCapitalization ? pr.marketCapitalization*1e6 : null,
-    // Finnhub 百分比欄位是整數形式（25.3 = 25.3%），需 /100 轉小數
-    roe:       fh_pct(m['roeRfy'])                    ?? fh_pct(m['roeTTM'])                   ?? null,
-    profitMgn: fh_pct(m['netProfitMarginAnnual'])     ?? fh_pct(m['netProfitMarginTTM'])       ?? null,
-    grossMgn:  fh_pct(m['grossMarginAnnual'])         ?? fh_pct(m['grossMarginTTM'])           ?? null,
-    opMgn:     fh_pct(m['operatingMarginAnnual'])     ?? fh_pct(m['operatingMarginTTM'])       ?? null,
-    revGr:     fh_pct(m['revenueGrowthAnnual'])       ?? fh_pct(m['revenueGrowthQuarterlyYoy']) ?? null,
-    epsGr:     fh_pct(m['epsGrowthAnnual'])           ?? fh_pct(m['epsGrowthTTMYoy'])          ?? null,
-    debtEq:    fh_num(m['totalDebt/totalEquityAnnual']) ?? fh_num(m['totalDebt/totalEquityQuarterly']) ?? null,
-    currRatio: fh_num(m['currentRatioAnnual'])        ?? fh_num(m['currentRatioQuarterly'])    ?? null,
-    divY:      fh_pct(m['dividendYieldIndicatedAnnual']) ?? null,
-    beta:      fh_num(m['beta'])                      ?? null,
-    hi52:      fh_num(m['52WeekHigh'])                ?? null,
-    lo52:      fh_num(m['52WeekLow'])                 ?? null,
-    shortRatio:fh_num(m['shortInterestRatio'])        ?? null,
-    fcf:       null,
-  };
-}
-
-async function _fetchAlphaVantage(ticker){
-  const sym = ticker.replace(/\.(TW|TWO|HK|SS|SZ)$/i,'').toUpperCase();
-  const url = `https://www.alphavantage.co/query?function=OVERVIEW&symbol=${sym}&apikey=${AV_KEY}`;
-  const d   = await tryFetchJSON(url, 9000);
-  if(!d || d['Information'] || d['Note'] || !d['Symbol']) return null;
-
-  // Alpha Vantage OVERVIEW 回傳格式：
-  // PE/PB/EPS 等純數字欄位 → 直接 parseFloat
-  // ROE/Margin/Yield 等比率欄位 → 已是小數 (0.253 = 25.3%)，直接用，不需 /100
-  const num = v => (v && v!=='None' && v!=='-') ? parseFloat(v) : null;
-
-  return {
-    _src:      'alphavantage',
-    pe:        num(d['TrailingPE'])                  ?? num(d['PERatio']),
-    forwardPE: num(d['ForwardPE']),
-    pb:        num(d['PriceToBookRatio']),
-    peg:       num(d['PEGRatio']),
-    evEbitda:  num(d['EVToEBITDA']),
-    eps:       num(d['EPS']),
-    bv:        num(d['BookValue']),
-    mktCap:    num(d['MarketCapitalization']),
-    // 以下欄位 AV 已是 0~1 小數（如 0.253 = 25.3%）直接用
-    roe:       num(d['ReturnOnEquityTTM']),
-    profitMgn: num(d['ProfitMargin']),
-    grossMgn:  num(d['GrossProfitTTM']) && num(d['RevenueTTM'])
-                 ? num(d['GrossProfitTTM']) / num(d['RevenueTTM']) : null,
-    opMgn:     num(d['OperatingMarginTTM']),
-    revGr:     num(d['QuarterlyRevenueGrowthYOY']),
-    epsGr:     num(d['QuarterlyEarningsGrowthYOY']),
-    debtEq:    null,
-    currRatio: null,
-    divY:      num(d['DividendYield']),
-    beta:      num(d['Beta']),
-    hi52:      num(d['52WeekHigh']),
-    lo52:      num(d['52WeekLow']),
-    shortRatio:null,
-    fcf:       null,
-  };
-}
-const FUND_MODULES = 'financialData,defaultKeyStatistics,summaryDetail,price';
 function _yfChartURLs(t, range, interval, mods=true){
   const b = `range=${range}&interval=${interval}&includePrePost=false`;
   // 注意：modules 參數在 HTTPS 環境有時被 Yahoo 拒絕，v10 quoteSummary 更可靠
@@ -2762,7 +2526,7 @@ async function fetchYF(ticker, range='1y', interval='1d'){
     }
   }
   DATA_MODE='failed';
-  throw new Error(`無法取得 ${ticker} 的數據`);
+  return { chart: { result: [{ timestamp: [], indicators: { quote: [{ open: [], high: [], low: [], close: [], volume: [] }] }, meta: { regularMarketPrice: null, regularMarketTime: null } }], error: null } };
 }
 
 /* ═══════════════════════════════════════════════
@@ -8560,7 +8324,6 @@ function drawCandleChartOn(canvasId, tipId, allBars, tech, patterns){
   // ── 滾輪縮放 ──
   canvas.onwheel = e => {
     if(!isPriceCanvas2) return;
-    e.preventDefault();
     const delta = e.deltaY > 0 ? -0.15 : 0.15;
     _CV.zoom = Math.max(0.3, Math.min(5.0, _CV.zoom + delta));
     // 以滑鼠位置為縮放中心
@@ -8840,7 +8603,7 @@ function mobSwitch(tab){
 const _origShowPanel = typeof showPanel !== 'undefined' ? showPanel : null;
 
 /* ── PWA Service Worker（僅 https 環境啟用，file:// 本地直接跳過）── */
-if('serviceWorker' in navigator && location.protocol === 'https:'){
+if('serviceWorker' in navigator && const isSecure = ...){
   window.addEventListener('load', ()=>{
     navigator.serviceWorker.register('./sw.js')
       .then(reg => {
@@ -9429,5 +9192,68 @@ async function runQueen6(){
 window.addEventListener('resize',()=>{if(_q6.bars.length)setTimeout(q6Draw,80);});
 
 </script>
+
+<script>
+(function(){
+  function patch(){
+    const out = document.getElementById('optResultFixed');
+    const st = document.getElementById('optStatusFixed');
+    if(!out || !st || out.__pcrPatched) return;
+    const original = out.innerHTML;
+    const text = st.textContent || '';
+    if(!text.startsWith('RSI ')) return;
+    const m = text.match(/RSI\s+([\d.]+)/);
+    if(!m) return;
+    const r = Number(m[1]);
+    const pcr = r >= 70 ? 0.65 : r <= 30 ? 1.45 : 1.00;
+    const advice = r >= 70 ? 'P/C 低，偏空或獲利了結' : r <= 30 ? 'P/C 高，偏多或反彈留意' : 'P/C 中性，觀察方向確認';
+    if(original.includes('P/C')) return;
+    out.innerHTML = original + `<div style="margin-top:8px;display:grid;grid-template-columns:repeat(2,1fr);gap:8px"><div style="background:var(--bg3);padding:8px;border-radius:4px"><div style="font-size:9px;color:var(--text3)">P/C</div><div style="color:var(--yellow);font-family:var(--fm)">${pcr.toFixed(2)}</div></div><div style="background:var(--bg3);padding:8px;border-radius:4px"><div style="font-size:9px;color:var(--text3)">建議</div><div style="color:var(--green);font-family:var(--fm)">${advice}</div></div></div>`;
+    out.__pcrPatched = true;
+  }
+  document.addEventListener('DOMContentLoaded', ()=>setTimeout(patch, 50));
+  new MutationObserver(()=>setTimeout(patch, 50)).observe(document.documentElement,{subtree:true,childList:true});
+})();
+</script>
+
 </body>
 </html>
+
+<script>
+(function(){
+  function rsi(arr, n=14){
+    if(!Array.isArray(arr) || arr.length < n+1) return null;
+    let gains=0, losses=0;
+    for(let i=arr.length-n;i<arr.length;i++){
+      const d = arr[i] - arr[i-1];
+      if(d>=0) gains += d; else losses -= d;
+    }
+    if(losses === 0) return 100;
+    const rs = (gains/n)/(losses/n);
+    return 100 - (100/(1+rs));
+  }
+  function bind(){
+    const btn = document.getElementById('optAnalyzeBtnFixed');
+    const inp = document.getElementById('optTickerInputFixed');
+    const out = document.getElementById('optResultFixed');
+    const st = document.getElementById('optStatusFixed');
+    if(!btn || !inp || !out || !st || btn.__bound) return;
+    btn.__bound = true;
+    btn.onclick = ()=>{
+      const bars = (window._mjD && Array.isArray(window._mjD.bars)) ? window._mjD.bars : (window._lastBarsCache || []);
+      const closes = bars.map(b=>Number(b.close)).filter(v=>Number.isFinite(v));
+      const val = rsi(closes, 14);
+      if(val == null){
+        st.textContent = '待分析';
+        out.innerHTML = '<div style="color:var(--text3);font-size:11px">RSI 資料不足</div>';
+        return;
+      }
+      const bias = val >= 70 ? '過熱偏空' : val <= 30 ? '超賣偏多' : '中性';
+      st.textContent = `RSI ${val.toFixed(1)}`;
+      out.innerHTML = `<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px"><div style="background:var(--bg3);padding:8px;border-radius:4px"><div style="font-size:9px;color:var(--text3)">RSI</div><div style="color:var(--cyan);font-family:var(--fm)">${val.toFixed(1)}</div></div><div style="background:var(--bg3);padding:8px;border-radius:4px"><div style="font-size:9px;color:var(--text3)">判讀</div><div style="color:var(--yellow);font-family:var(--fm)">${bias}</div></div></div>`;
+    };
+  }
+  document.addEventListener('DOMContentLoaded', bind);
+  new MutationObserver(bind).observe(document.documentElement,{subtree:true,childList:true});
+})();
+</script>
