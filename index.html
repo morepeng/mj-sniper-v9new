@@ -4568,10 +4568,17 @@ function analyze(bars, ticker, quoteData){
       consolidation: isConsolidation,
     },
     market:{
-      vol_regime:hv>50?'High Vol':hv>25?'Normal':'Low Vol',
-      trend_state:chop<38.2?'趨勢市':chop>61.8?'震盪市':'過渡期',
-      sniper_signal:(stDir[n-1]===1&&macdJustCross&&obvTrend==='Bullish')?'✅ 狙擊就緒':'⏳ 等待確認',
-    },
+          vol_regime:hv>50?'High Vol':hv>25?'Normal':'Low Vol',
+          trend_state:chop<38.2?'趨勢市':chop>61.8?'震盪市':'過渡期',
+          // ▼ 升級版狙擊信號邏輯
+          sniper_signal: 
+            (stDir[n-1]===1 && macdJustCross && obvTrend==='Bullish') ? '🚀 狙擊就緒(多)' :
+            (stDir[n-1]===-1 && macdV<sigV && macdPrev>=sigPrev && obvTrend==='Bearish') ? '🚨 狙擊就緒(空)' :
+            (stDir[n-1]===1 && macdV>sigV && obvTrend==='Bullish') ? '📈 多方優勢' :
+            (stDir[n-1]===-1 && macdV<sigV && obvTrend==='Bearish') ? '📉 空方優勢' : 
+            '⏳ 等待確認',
+        },
+        
     chart_data:    chartBars.slice(-60),
     all_chart_data:chartBars,  // full history for K-line tab
     patterns,
@@ -6109,7 +6116,7 @@ function renderOverview(d){
     ['ATR%',fn(tech.atr_pct)+'%',''],
     ['歷史波動',fn(tech.hist_vol)+'%', tech.hist_vol>50?'warn':''],
     ['趨勢狀態',d.market?.trend_state||'N/A','info'],
-    ['狙擊信號',d.market?.sniper_signal||'N/A',(d.market?.sniper_signal||'').includes('就緒')?'pos':''],
+    ['狙擊信號',d.market?.sniper_signal||'N/A',(d.market?.sniper_signal||'').match(/多|🚀|📈/)?'pos':(d.market?.sniper_signal||'').match(/空|🚨|📉/)?'neg':''], 
   ].map(([l,v,c])=>`<div class="mc"><div class="mc-l">${l}</div><div class="mc-v ${c}">${v}</div></div>`).join('');
 }
 
