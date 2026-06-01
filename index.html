@@ -8578,27 +8578,37 @@ function wySig(l,active,type){
 
 <script>
 /* ── 手機 Tab 切換 ── */
-const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday','tx'];
+// ★ 修正1：將 'queen6' 加入陣列中，讓六大技巧按鈕點擊時能正確反白
+const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday','tx','queen6'];
 let _curMobTab = 'overview';
 
 function mobSwitch(tab){
   _curMobTab = tab;
+  
   // 更新 active tab button
   _MOB_TABS.forEach(t => {
     const btn = document.getElementById('mtab-'+t);
     if(btn) btn.classList.toggle('active', t===tab);
   });
-  // 滾動到 active tab（橫向滾動 tab bar）
-  const activeBtn = document.getElementById('mtab-'+tab);
-  if(activeBtn){
-    activeBtn.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
-  }
-  // 用全域 showPanel 切換（統一入口）
-  showPanel(tab);
-  // 滾回頁面頂部
-  window.scrollTo({top:0, behavior:'smooth'});
-}
 
+  // ★ 修正2：先強制切換模組內容，確保即便滾動報錯，畫面依然能成功切換
+  if(typeof showPanel === 'function') {
+    showPanel(tab);
+  }
+
+  // ★ 修正3：加入 try...catch 包覆滾動語法，防止舊版手機瀏覽器因為不支援而造成整個腳本當機
+  try {
+    const activeBtn = document.getElementById('mtab-'+tab);
+    if(activeBtn){
+      activeBtn.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
+    }
+    // 滾回頁面頂部
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  } catch(e) {
+    // 遇到不支援平滑滾動的手機瀏覽器時的備用方案
+    window.scrollTo(0, 0);
+  }
+}
 // 攔截 showPanel 以同步手機 tab
 const _origShowPanel = typeof showPanel !== 'undefined' ? showPanel : null;
 
