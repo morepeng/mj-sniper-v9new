@@ -8578,7 +8578,7 @@ function wySig(l,active,type){
 
 <script>
 /* ── 手機 Tab 切換 ── */
-// ★ 修正1：將 'queen6' 加入陣列中，讓六大技巧按鈕點擊時能正確反白
+// 確保 'queen6' 在陣列中
 const _MOB_TABS = ['overview','kline','tech','factors','dow','smc','leading','risk','scan','nextday','tx','queen6'];
 let _curMobTab = 'overview';
 
@@ -8591,21 +8591,20 @@ function mobSwitch(tab){
     if(btn) btn.classList.toggle('active', t===tab);
   });
 
-  // ★ 修正2：先強制切換模組內容，確保即便滾動報錯，畫面依然能成功切換
+  // ★ 關鍵修正：先切換面板，保證核心功能絕對能運作
   if(typeof showPanel === 'function') {
     showPanel(tab);
   }
 
-  // ★ 修正3：加入 try...catch 包覆滾動語法，防止舊版手機瀏覽器因為不支援而造成整個腳本當機
+  // ★ 關鍵修正：用 try...catch 包覆所有滾動特效，就算手機不支援也不會當機
   try {
     const activeBtn = document.getElementById('mtab-'+tab);
     if(activeBtn){
       activeBtn.scrollIntoView({behavior:'smooth', block:'nearest', inline:'center'});
     }
-    // 滾回頁面頂部
     window.scrollTo({top: 0, behavior: 'smooth'});
   } catch(e) {
-    // 遇到不支援平滑滾動的手機瀏覽器時的備用方案
+    // 遇到舊版手機瀏覽器時的備用方案（瞬間跳轉）
     window.scrollTo(0, 0);
   }
 }
