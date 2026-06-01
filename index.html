@@ -7430,6 +7430,7 @@ function evalNextDayConditions(d){
   };
 }
 
+
 function renderNextDay(d){
   if(!d||!d.ticker){document.getElementById('nextdayContent')&&(document.getElementById('nextdayContent').innerHTML=_noDataHtml(_tabNames['nextday']||'此模組'));return;}
   const el = document.getElementById('nextdayContent');
@@ -7560,8 +7561,9 @@ function renderNextDay(d){
         ${nd.obvReasons.map(r=>`<div style="font-size:11px;color:var(--text2);padding:2px 0">${r}</div>`).join('')}
       </div>`:'<div style="font-size:11px;color:var(--text3)">未觸發OBV秘訣</div>'}
       <div style="margin-top:8px;display:grid;grid-template-columns:1fr 1fr;gap:4px">
-        ${[['EMA3',fn(nd.tech?.obv_ema3,0)],['EMA30',fn(nd.tech?.obv_ema30,0)],
-           ['百分位',fn(nd.tech?.obv_rank_pct,1)+'%'],['共振',fn(nd.tech?.obv_4secrets||0,0)+'/4']
+        <!-- ★ 這裡就是被修復的地方！從 nd.tech 改成 d.technical ★ -->
+        ${[['EMA3',fn(d.technical?.obv_ema3,0)],['EMA30',fn(d.technical?.obv_ema30,0)],
+           ['百分位',fn(d.technical?.obv_rank_pct,1)+'%'],['共振',fn(d.technical?.obv_4secrets||0,0)+'/4']
           ].map(([l,v])=>`<div class="mc"><div class="mc-l">${l}</div><div class="mc-v">${v}</div></div>`).join('')}
       </div>
     </div>
