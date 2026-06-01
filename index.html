@@ -8591,12 +8591,12 @@ function mobSwitch(tab){
     if(btn) btn.classList.toggle('active', t===tab);
   });
 
-  // ★ 關鍵修正：先切換面板，保證核心功能絕對能運作
+  // 先切換面板，保證核心功能絕對能運作
   if(typeof showPanel === 'function') {
     showPanel(tab);
   }
 
-  // ★ 關鍵修正：用 try...catch 包覆所有滾動特效，就算手機不支援也不會當機
+  // 用 try...catch 包覆所有滾動特效，就算手機不支援也不會當機
   try {
     const activeBtn = document.getElementById('mtab-'+tab);
     if(activeBtn){
@@ -8623,7 +8623,6 @@ if (_origShowPanel) {
 }
 
 /* ── PWA Service Worker（僅 https 環境啟用，file:// 本地直接跳過）── */
-// ★ 重大語法錯誤修正：將變數宣告移出 if 條件式之外
 const isSecureEnvironment = location.protocol === 'https:' || location.hostname === 'localhost';
 
 if('serviceWorker' in navigator && isSecureEnvironment){
@@ -8673,7 +8672,8 @@ window.addEventListener('resize', () => {
     document.querySelectorAll('.mob-tabbar').forEach(el => el.style.display='flex');
   }
 });
-</script>
+
+
 // ═══════════════════════════════════════════════════════════
 // 👑 Queen怜 六大技巧實戰分析引擎 v2.0
 // 修正：台股/美股/港股/指數 多端點自動切換
